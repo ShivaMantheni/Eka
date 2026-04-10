@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Eka Automation</title>
+    <meta name="description"
+        content="Eka Automation — Network Test Execution Platform. Manage DUTs, VMs, topology, spytest scripts, and stream real-time logs.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <link rel="stylesheet" href="/static/style.css?v=28">
+</head>
+
+<body>
+    <!-- Sticky top: header + tabs move as one unit -->
+    <div class="sticky-header">
+    <!-- Header -->
+    <header class="app-header">
+        <div class="header-left">
+            <span class="material-icons-round header-icon">router</span>
+            <div>
+                <h1 style="background:var(--header-title);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text">Eka Automation</h1>
+                <p class="subtitle">Network Test Execution Platform</p>
+            </div>
+        </div>
+        <div class="header-right">
+            <!-- Theme toggle button (single icon that switches) -->
+            <div class="theme-switcher" style="margin-right:16px;">
+                <button class="theme-icon-btn" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle Theme">
+                    <span class="material-icons-round" id="theme-icon">light_mode</span>
+                </button>
+            </div>
+            <div class="stat-pill" id="stat-duts"><span class="material-icons-round">dns</span> <span>0</span> Devices
+            </div>
+            <div class="stat-pill" id="stat-online"><span class="material-icons-round">wifi</span> <span>0</span> Online
+            </div>
+            <div class="stat-pill running" id="stat-running" style="display:none"><span
+                    class="material-icons-round spin">sync</span> <span>0</span> Running</div>
+            <div class="health-dot" id="health-dot" title="API Health"></div>
+        </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="tab-bar">
+        <button class="tab active" data-tab="dashboard" onclick="switchTab('dashboard')">
+            <span class="material-icons-round">dashboard</span> Dashboard
+        </button>
+        <button class="tab" data-tab="devices" onclick="switchTab('devices')">
+            <span class="material-icons-round">devices_other</span> Devices
+        </button>
+        <button class="tab" data-tab="execute" onclick="switchTab('execute')">
+            <span class="material-icons-round">play_circle</span> Execute
+        </button>
+        <button class="tab" data-tab="vs" onclick="switchTab('vs')">
+            <span class="material-icons-round">memory</span> VS Manager
+        </button>
+        <button class="tab" data-tab="logs" onclick="switchTab('logs')">
+            <span class="material-icons-round">article</span> Logs
+        </button>
+        <button class="tab" data-tab="terminal" onclick="switchTab('terminal')">
+            <span class="material-icons-round">terminal</span> Terminal
+        </button>
+    </nav>
+    </div><!-- /sticky-header -->
+
+    <main class="main-content">
+
+        <!-- ============ DASHBOARD TAB ============ -->
+        <section id="tab-dashboard" class="tab-content active">
+            <div class="grid-4">
+                <div class="stat-card glass">
+                    <span class="material-icons-round stat-icon blue">dns</span>
+                    <div>
+                        <div class="stat-value" id="dash-total-duts">0</div>
+                        <div class="stat-label">Total Devices</div>
+                    </div>
+                </div>
+                <div class="stat-card glass">
+                    <span class="material-icons-round stat-icon green">wifi</span>
+                    <div>
+                        <div class="stat-value" id="dash-online-duts">0</div>
+                        <div class="stat-label">Online</div>
+                    </div>
+                </div>
+                <div class="stat-card glass">
+                    <span class="material-icons-round stat-icon purple">description</span>
+                    <div>
+                        <div class="stat-value" id="dash-scripts">0</div>
+                        <div class="stat-label">Scripts</div>
+                    </div>
+                </div>
+                <div class="stat-card glass">
+                    <span class="material-icons-round stat-icon orange">history</span>
+                    <div>
+                        <div class="stat-value" id="dash-executions">0</div>
+                        <div class="stat-label">Executions</div>
+                    </div>
+                </div>
+            </div>
+            <div class="grid-2" style="margin-top:24px;">
+                <div class="card glass">
+                    <div class="card-header">
+                        <h3><span class="material-icons-round">devices_other</span> Devices</h3>
+                    </div>
+                    <div class="card-body" id="dash-devices-list">
+                        <p class="muted">Loading...</p>
+                    </div>
+                </div>
+                <div class="card glass">
+                    <div class="card-header">
+                        <h3><span class="material-icons-round">history</span> Recent Executions</h3>
+                    </div>
+                    <div class="card-body" id="dash-recent-exec">
+                        <p class="muted">Loading...</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============ DEVICES TAB ============ -->
+        <section id="tab-devices" class="tab-content">
+            <div class="card glass">
+                <div class="card-header">
+                    <h3><span class="material-icons-round">add_circle</span> Add New Device</h3>
+                </div>
+                <div class="card-body">
+                    <form id="add-dut-form" class="form-row" onsubmit="addDUT(event)">
+                        <input type="text" id="dut-name" placeholder="Device Name" required>
+                        <input type="text" id="dut-ip" placeholder="IP Address" required>
+                        <input type="number" id="dut-port" placeholder="Port" value="22" min="1" max="65535">
+                        <input type="text" id="dut-user" placeholder="Username" value="admin">
+                        <input type="password" id="dut-pass" placeholder="Password">
+                        <select id="dut-type">
+                            <option value="VM">VM (Host)</option>
+                            <option value="DUT">DUT</option>
+                            <option value="Switch">Switch</option>
+                            <option value="Router">Router</option>
+                        </select>
+                        <button type="submit" class="btn primary"><span class="material-icons-round">add</span>
+                            Add</button>
+                    </form>
+                </div>
+            </div>
+            <div class="card glass" style="margin-top:16px;">
+                <div class="card-header">
+                    <h3><span class="material-icons-round">dns</span> Device Inventory</h3>
+                    <button class="btn outline small" onclick="loadDUTs()"><span
+                            class="material-icons-round">refresh</span> Refresh</button>
+                </div>
+                <div class="card-body">
+                    <table class="data-table" id="duts-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>IP Address</th>
+                                <th>Port</th>
+                                <th>Type</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="duts-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============ EXECUTE TAB ============ -->
+        <section id="tab-execute" class="tab-content">
+
+            <!-- Row 1: VM Selection + Git (single row) -->
+            <div class="card glass">
+                <div class="card-header">
+                    <h3><span class="material-icons-round">computer</span> VM Selection & Git</h3>
+                    <span id="git-status-badge" class="badge offline" style="font-size:11px">Disconnected</span>
+                </div>
+                <div class="card-body">
+                    <div style="display:grid;grid-template-columns:1fr 2fr;gap:16px;align-items:start">
+                        <!-- Left: VM Selector -->
+                        <div>
+                            <label class="field-label"><span class="material-icons-round"
+                                    style="font-size:16px;vertical-align:middle">dns</span> VM (Host Server)</label>
+                            <select id="spy-vm-select" class="select-full" onchange="onSpyVMChange()">
+                                <option value="">-- Select VM Host --</option>
+                            </select>
+                        </div>
+                        <!-- Right: Git Section (inline) -->
+                        <div>
+                            <div
+                                style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr auto;gap:8px;align-items:end">
+                                <div>
+                                    <label class="field-label">Repo URL</label>
+                                    <input type="text" id="git-repo-url" class="input-full"
+                                        placeholder="https://github.com/user/repo.git">
+                                </div>
+                                <div>
+                                    <label class="field-label">Username</label>
+                                    <input type="text" id="git-username" class="input-full" placeholder="username">
+                                </div>
+                                <div>
+                                    <label class="field-label">Token</label>
+                                    <input type="password" id="git-token" class="input-full" placeholder="ghp_xxxxx">
+                                </div>
+                                <div>
+                                    <label class="field-label">Branch</label>
+                                    <input type="text" id="git-branch" class="input-full" placeholder="master"
+                                        value="master">
+                                </div>
+                                <div style="display:flex;gap:4px">
+                                    <button class="btn primary" id="btn-git-connect" onclick="connectGitRepo()"
+                                        style="white-space:nowrap;padding:8px 12px">
+                                        <span class="material-icons-round" style="font-size:16px">sync</span> Pull
+                                    </button>
+                                    <button class="btn outline" id="btn-git-disconnect" onclick="disconnectGitRepo()"
+                                        style="display:none;padding:8px 12px">
+                                        <span class="material-icons-round" style="font-size:16px">link_off</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <!-- Git Progress + Info -->
+                            <div id="git-progress"
+                                style="display:none;margin-top:8px;padding:6px 10px;background:var(--bg-tertiary);border-radius:6px;font-size:11px">
+                            </div>
+                            <div id="git-info"
+                                style="display:none;margin-top:6px;padding:6px 10px;background:var(--bg-tertiary);border-radius:6px;font-size:11px;color:var(--text-secondary)">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Row 2: 3-Column Grid — DUTs+Topology | Categories+Scripts | Testbed -->
+            <div style="display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:16px;margin-top:16px">
+
+                <!-- Column 1: DUTs & Topology Canvas -->
+                <div class="card glass">
+                    <div class="card-header">
+                        <h3><span class="material-icons-round">share</span> DUTs &amp; Topology</h3>
+                        <div style="display:flex;gap:6px;align-items:center">
+                            <span class="muted" style="font-size:11px" id="dut-selection-count"></span>
+                            <button class="btn outline small" onclick="addDUTConnection()"
+                                style="padding:2px 8px;font-size:11px" title="Add connection between DUTs">
+                                <span class="material-icons-round" style="font-size:14px">add_link</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body" style="padding:0">
+                        <!-- DUT checklist -->
+                        <div id="exec-dut-checklist"
+                            style="padding:8px;max-height:130px;overflow-y:auto;border-bottom:1px solid var(--border)">
+                            <p class="muted" style="padding:4px;font-size:12px;margin:0">No DUTs. Add devices with type
+                                "DUT" in Devices tab.</p>
+                        </div>
+                        <!-- Canvas toolbar -->
+                        <div
+                            style="padding:4px 10px 4px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-secondary);display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border)">
+                            <span><span class="material-icons-round"
+                                    style="font-size:12px;vertical-align:middle">device_hub</span> Topology
+                                Canvas</span>
+                            <div style="display:flex;gap:6px;align-items:center">
+                                <button id="btn-cable-mode" onclick="toggleCableMode()"
+                                    style="background:none;border:1px solid var(--border);color:var(--text-secondary);cursor:pointer;font-size:10px;padding:2px 8px;border-radius:4px;display:flex;align-items:center;gap:4px;transition:all .2s"
+                                    title="Cable Mode: click port then port to connect DUTs">
+                                    <span class="material-icons-round" style="font-size:12px">cable</span> Cable Mode
+                                </button>
+                                <button onclick="clearConnections()"
+                                    style="background:none;border:none;color:var(--text-secondary);cursor:pointer;font-size:10px;padding:1px 6px;border-radius:3px"
+                                    title="Clear all connections">
+                                    <span class="material-icons-round"
+                                        style="font-size:12px;vertical-align:middle">delete_sweep</span> Clear
+                                </button>
+                            </div>
+                        </div>
+                        <!-- SVG Topology Canvas -->
+                        <div style="position:relative" id="topology-canvas-container">
+                            <svg id="topology-canvas" width="100%" height="480"
+                                style="display:block;background:var(--bg-primary)">
+                                <defs>
+                                    <filter id="node-shadow" x="-20%" y="-20%" width="140%" height="140%">
+                                        <feDropShadow dx="1" dy="2" stdDeviation="2" flood-opacity="0.25" />
+                                    </filter>
+                                    <marker id="conn-arrow" markerWidth="7" markerHeight="5" refX="7" refY="2.5"
+                                        orient="auto">
+                                        <polygon points="0 0, 7 2.5, 0 5" fill="var(--primary)" opacity="0.6" />
+                                    </marker>
+                                </defs>
+                                <g id="topo-connections"></g>
+                                <g id="topo-nodes"></g>
+                            </svg>
+                            <div id="topo-empty"
+                                style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:var(--text-secondary);pointer-events:none">
+                                <span class="material-icons-round"
+                                    style="font-size:32px;display:block;opacity:0.2;margin-bottom:4px">device_hub</span>
+                                <span style="font-size:11px;opacity:0.45">Select DUTs above to build topology</span>
+                            </div>
+                        </div>
+                        <!-- Inline Connection Editor (shown when a link is clicked) -->
+                        <div id="conn-editor"
+                            style="display:none;border-top:1px solid var(--border);padding:8px;font-size:11px;background:var(--bg-tertiary)">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Column 2: Categories + Test Scripts -->
+                <div class="card glass">
+                    <div class="card-header">
+                        <h3><span class="material-icons-round">folder</span> Categories &amp; Scripts</h3>
+                        <button class="btn outline small" onclick="onSpyVMChange()" title="Refresh">
+                            <span class="material-icons-round" style="font-size:16px">refresh</span>
+                        </button>
+                    </div>
+                    <div class="card-body" style="overflow:visible">
+                        <!-- Breadcrumb Navigation -->
+                        <label class="field-label"><span class="material-icons-round"
+                                style="font-size:16px;vertical-align:middle">folder_open</span> Current Path</label>
+                        <div class="breadcrumb-nav" id="category-breadcrumb">
+                            <span class="breadcrumb-item" onclick="navigateToPath('')" title="Go to root">
+                                <span class="material-icons-round" style="font-size:14px;vertical-align:middle">home</span>
+                                Home
+                            </span>
+                        </div>
+
+                        <!-- Subfolders -->
+                        <div id="subfolders-container" style="margin-top:12px;">
+                            <label class="field-label"><span class="material-icons-round"
+                                    style="font-size:16px;vertical-align:middle">folder</span> Subfolders (<span id="subfolder-count">0</span>)</label>
+                            <div id="subfolders-list">
+                                <p class="muted" style="padding:8px;font-size:12px;margin:0">Select VM to load folders.</p>
+                            </div>
+                        </div>
+
+                        <!-- Test Scripts -->
+                        <label class="field-label" style="margin-top:12px"><span class="material-icons-round"
+                                style="font-size:16px;vertical-align:middle">description</span> Test Scripts (<span id="scripts-count">0</span>)</label>
+                        <div class="multi-select" id="script-multi-select">
+                            <div class="multi-select-trigger" onclick="toggleMultiSelect('script-multi-select')">
+                                <span class="multi-select-text">-- Select a category first --</span>
+                                <span class="material-icons-round" style="font-size:18px">expand_more</span>
+                            </div>
+                            <div class="multi-select-dropdown" id="script-dropdown-list">
+                                <p class="muted" style="padding:8px;font-size:12px;margin:0">Select a category to load
+                                    scripts.</p>
+                            </div>
+                        </div>
+
+                        <!-- Script Inspector Panel -->
+                        <div id="script-inspector"
+                            style="display:none;margin-top:10px;padding:8px 10px;background:var(--bg-tertiary);border-radius:8px;border-left:3px solid var(--primary);font-size:12px">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Column 3: Testbed YAML -->
+                <div class="card glass">
+                    <div class="card-header">
+                        <h3><span class="material-icons-round">settings_suggest</span> Testbed YAML</h3>
+                    </div>
+                    <div class="card-body" style="max-height:440px;overflow-y:auto">
+                        <label class="field-label"><span class="material-icons-round"
+                                style="font-size:16px;vertical-align:middle">insert_drive_file</span> Testbed
+                            File</label>
+                        <select id="spy-testbed" class="select-full" onchange="onTestbedChange()" disabled>
+                            <option value="">-- Select VM first --</option>
+                        </select>
+
+                        <!-- Testbed Info Panel -->
+                        <div id="testbed-info-panel" style="display:none;margin-top:12px">
+                            <div
+                                style="padding:10px;background:var(--bg-tertiary);border-radius:8px;font-size:12px;line-height:1.6">
+                                <div id="testbed-info-content"></div>
+                            </div>
+                        </div>
+
+                        <!-- Advanced Options -->
+                        <details style="margin-top:14px">
+                            <summary style="cursor:pointer;font-size:13px;color:var(--text-secondary)"><span
+                                    class="material-icons-round"
+                                    style="font-size:14px;vertical-align:middle">tune</span> Advanced Options</summary>
+                            <div style="padding:10px 0">
+                                <label class="field-label">Log Level</label>
+                                <select id="spy-log-level" class="select-full">
+                                    <option value="debug">Debug</option>
+                                    <option value="info" selected>Info</option>
+                                    <option value="warning">Warning</option>
+                                </select>
+                                <label
+                                    style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--text-secondary)">
+                                    <input type="checkbox" id="spy-skip-init" checked> Skip Init Config
+                                </label>
+                            </div>
+                        </details>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Row 3: Execute Button + Allocation Preview -->
+            <div style="margin-top:16px;display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap">
+                <button class="btn primary big" id="btn-start-exec" onclick="startExecution()" disabled>
+                    <span class="material-icons-round">play_arrow</span> Start Execution
+                </button>
+                <button class="btn danger big" id="btn-stop-exec" onclick="stopExecution()" style="display:none">
+                    <span class="material-icons-round">stop</span> Stop
+                </button>
+                <div id="exec-allocation-info" style="margin-left:4px;flex:1;min-width:0"></div>
+            </div>
+
+            <!-- Row 3b: Queue & Status Panel (separate from logs) -->
+            <div class="card glass" id="queue-status-panel" style="margin-top:16px;display:none">
+                <div class="card-header">
+                    <h3><span class="material-icons-round">queue</span> Queue &amp; Status</h3>
+                    <span id="queue-exec-badge" class="badge running" style="font-size:11px">Running</span>
+                </div>
+                <div class="card-body" style="padding:12px 16px">
+                    <div style="display:grid;grid-template-columns:220px 1fr;gap:16px">
+                        <!-- Left: Free DUTs -->
+                        <div>
+                            <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-secondary);margin-bottom:8px;font-weight:600">
+                                <span class="material-icons-round" style="font-size:13px;vertical-align:middle;color:var(--green)">dns</span> Free DUTs
+                            </div>
+                            <div id="queue-free-duts" style="display:flex;flex-wrap:wrap;gap:6px">
+                                <span class="muted" style="font-size:12px">–</span>
+                            </div>
+                            <div style="margin-top:12px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-secondary);margin-bottom:8px;font-weight:600">
+                                <span class="material-icons-round" style="font-size:13px;vertical-align:middle;color:var(--red)">lock</span> In Use
+                            </div>
+                            <div id="queue-busy-duts" style="display:flex;flex-wrap:wrap;gap:6px">
+                                <span class="muted" style="font-size:12px">–</span>
+                            </div>
+                        </div>
+                        <!-- Right: Script Queue -->
+                        <div>
+                            <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-secondary);margin-bottom:8px;font-weight:600">
+                                <span class="material-icons-round" style="font-size:13px;vertical-align:middle;color:var(--accent)">list</span> Scripts
+                            </div>
+                            <div id="queue-scripts-list" style="display:flex;flex-direction:column;gap:6px">
+                                <span class="muted" style="font-size:12px">–</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Row 4: Live Logs (full width) -->
+            <div class="card glass" style="margin-top:16px">
+                <div class="card-header">
+                    <h3><span class="material-icons-round">article</span> Live Execution Logs</h3>
+                    <button class="btn outline small" onclick="downloadLogs()" id="btn-download-logs"
+                        style="display:none">
+                        <span class="material-icons-round">download</span> Download
+                    </button>
+                </div>
+                <div class="card-body">
+                    <div class="log-container" id="exec-log-container">
+                        <div class="log-placeholder">
+                            <span class="material-icons-round">terminal</span>
+                            <p>Logs will appear here when an execution starts...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============ VS MANAGER TAB ============ -->
+        <section id="tab-vs" class="tab-content">
+            <div class="grid-2">
+                <!-- Left: VS Controls -->
+                <div>
+                    <!-- Host Selection -->
+                    <div class="card glass">
+                        <div class="card-header">
+                            <h3><span class="material-icons-round">dns</span> Host Device</h3>
+                        </div>
+                        <div class="card-body">
+                            <div class="form-row">
+                                <select id="vs-host" class="select-full" onchange="onVSHostChange()">
+                                    <option value="">-- Select Host Device --</option>
+                                </select>
+                                <button class="btn outline small" onclick="refreshVSList()" title="Refresh VM list">
+                                    <span class="material-icons-round">refresh</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- VM Table -->
+                    <div class="card glass" style="margin-top:16px">
+                        <div class="card-header">
+                            <h3><span class="material-icons-round">view_list</span> Virtual Machines</h3>
+                            <span id="vs-selection-count" class="muted" style="font-size:12px"></span>
+                        </div>
+                        <div class="card-body" style="padding:0;overflow:auto;max-height:420px">
+                            <div id="vs-vm-list">
+                                <p class="muted" style="padding:16px;text-align:center">Select a host device to see VMs
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right: Update Form + Progress & Logs -->
+                <div>
+                    <!-- Image Update Form (moved here) -->
+                    <div class="card glass">
+                        <div class="card-header">
+                            <h3><span class="material-icons-round">system_update_alt</span> Update VS Image</h3>
+                        </div>
+                        <div class="card-body">
+                            <label class="field-label">Source Image Path <span class="muted">(shared for all selected
+                                    VMs)</span></label>
+                            <input type="text" id="vs-source-image"
+                                value="/home/hp/anuradha_build_imgs/target/sonic-vs.img" class="input-full">
+
+                            <button class="btn primary big" id="btn-vs-update" onclick="startVSUpdate()"
+                                style="margin-top:16px" disabled>
+                                <span class="material-icons-round">rocket_launch</span> Update Image &amp; Restart
+                                Selected VMs
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Progress & Logs -->
+                    <div class="card glass" style="margin-top:16px">
+                        <div class="card-header">
+                            <h3><span class="material-icons-round">engineering</span> Update Progress</h3>
+                        </div>
+                        <div class="card-body">
+                            <!-- Step Progress -->
+                            <div class="vs-progress" id="vs-progress" style="display:none">
+                                <div class="vs-step" data-step="1"><span class="step-num">1</span> Destroy VM</div>
+                                <div class="vs-step" data-step="2"><span class="step-num">2</span> Remove Old Image
+                                </div>
+                                <div class="vs-step" data-step="3"><span class="step-num">3</span> Copy New Image</div>
+                                <div class="vs-step" data-step="4"><span class="step-num">4</span> Start VM</div>
+                            </div>
+                            <!-- Live Logs -->
+                            <div class="log-container" id="vs-log-container" style="margin-top:12px">
+                                <div class="log-placeholder">
+                                    <span class="material-icons-round">memory</span>
+                                    <p>Select VMs, set target image names, then click Update.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+
+        <!-- ============ LOGS TAB ============ -->
+        <section id="tab-logs" class="tab-content">
+            <div class="card glass">
+                <div class="card-header">
+                    <h3><span class="material-icons-round">history</span> Execution History</h3>
+                    <button class="btn outline small" onclick="loadExecutions()"><span
+                            class="material-icons-round">refresh</span> Refresh</button>
+                </div>
+                <div class="card-body">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Name</th>
+                                <th>Type</th>
+                                <th>Status</th>
+                                <th>Devices</th>
+                                <th>Duration</th>
+                                <th>Created</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="exec-history-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card glass" style="margin-top:16px" id="log-detail-card" hidden>
+                <div class="card-header">
+                    <h3><span class="material-icons-round">description</span> Execution Logs — <span
+                            id="log-detail-title"></span></h3>
+                </div>
+                <div class="card-body">
+                    <div class="log-container" id="log-detail-container"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============ TERMINAL TAB ============ -->
+        <section id="tab-terminal" class="tab-content">
+            <div class="card glass">
+                <div class="card-header">
+                    <h3><span class="material-icons-round">terminal</span> Remote Terminal</h3>
+                </div>
+                <div class="card-body">
+                    <div class="form-row" style="margin-bottom:12px">
+                        <select id="term-dut" class="select-full" style="max-width:300px">
+                            <option value="">-- Select Device --</option>
+                        </select>
+                        <input type="text" id="term-cmd" placeholder="Enter command..." style="flex:1"
+                            onkeydown="if(event.key==='Enter')termExec()">
+                        <button class="btn primary" onclick="termExec()"><span class="material-icons-round">send</span>
+                            Execute</button>
+                    </div>
+                    <div class="terminal-output" id="term-output">
+                        <div class="log-placeholder">
+                            <span class="material-icons-round">terminal</span>
+                            <p>Select a device and enter a command to execute remotely via SSH.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Toast container -->
+    <div id="toast-container"></div>
+
+    <!-- Results Modal -->
+    <div class="modal-overlay" id="modal-overlay" onclick="closeModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3 id="modal-title">Execution Results</h3>
+                <button class="btn-icon" onclick="closeModal()"><span class="material-icons-round">close</span></button>
+            </div>
+            <div class="modal-body" id="modal-body"></div>
+            <div class="modal-footer">
+                <button class="btn outline" onclick="closeModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=28"></script>
+</body>
+
+</html>

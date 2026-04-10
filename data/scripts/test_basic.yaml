@@ -1,0 +1,41 @@
+# scripts/test_basic.yaml
+name: basic_connectivity_test
+version: "1.0"
+description: Test basic device connectivity and interfaces
+
+metadata:
+  author: Test Team
+  created: 2026-02-24
+
+test_cases:
+  - name: system_info
+    description: Get system information
+    timeout: 30
+    commands:
+      - uname -a
+      - uptime
+      - hostname
+
+  - name: network_check
+    description: Verify network configuration
+    timeout: 60
+    commands:
+      - ip addr show 2>/dev/null || ifconfig
+      - ip route show 2>/dev/null || route -n
+      - cat /etc/resolv.conf
+
+  - name: connectivity_test
+    description: Ping external host
+    timeout: 30
+    commands:
+      - ping -c 3 8.8.8.8
+
+  - name: service_check
+    description: Check running services
+    timeout: 30
+    commands:
+      - systemctl list-units --state=running --type=service 2>/dev/null || service --status-all 2>/dev/null || echo "Service check not available"
+
+parameters:
+  ping_count: 3
+  timeout_ms: 5000

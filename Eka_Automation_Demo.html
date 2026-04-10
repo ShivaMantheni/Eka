@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+		<title>Eka Automation Application Demo</title>
+
+		<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reset.min.css">
+		<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.css">
+		<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/theme/night.min.css">
+        <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
+        <style>
+            /* Dynamic Waves Background - BRIGHTENED */
+            body {
+                background: #1e293b; /* Brighter background */
+                height: 100vh;
+                margin: 0;
+                overflow: hidden;
+            }
+            .ocean { 
+                height: 5%;
+                width: 100%;
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                z-index: -1;
+            }
+            .wave {
+                background: url(https://s3-us-west-2.amazonaws.com/s.cdpn.io/85486/wave.svg) repeat-x; 
+                position: absolute;
+                top: -198px;
+                width: 6400px;
+                height: 198px;
+                animation: wave 7s cubic-bezier( 0.36, 0.45, 0.63, 0.53) infinite;
+                transform: translate3d(0, 0, 0);
+                opacity: 0.15; 
+            }
+            .wave:nth-of-type(2) {
+                top: -175px;
+                animation: wave 7s cubic-bezier( 0.36, 0.45, 0.63, 0.53) -.125s infinite, swell 7s ease -1.25s infinite;
+                opacity: 0.25;
+            }
+            @keyframes wave {
+                0% { transform: translateX(0); }
+                100% { transform: translateX(-1600px); }
+            }
+            @keyframes swell {
+                0%, 100% { transform: translate3d(0,-25px,0); }
+                50% { transform: translate3d(0,5px,0); }
+            }
+
+            .reveal h1, .reveal h2, .reveal h3 {
+                text-transform: none;
+                text-shadow: 0 0 10px rgba(255,255,255,0.3);
+            }
+            .reveal h1 {
+                font-weight: 700;
+                background: -webkit-linear-gradient(#fff, #99c2ff);
+                -webkit-background-clip: text;
+                background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }
+            .reveal ul {
+                font-size: 0.85em;
+                line-height: 1.4;
+            }
+            .reveal li {
+                margin-bottom: 15px;
+            }
+            
+            .two-column {
+                display: flex;
+                flex-direction: row;
+                align-items: center;
+                gap: 40px;
+                text-align: left;
+            }
+            .col-text {
+                flex: 1;
+                font-size: 0.55em; 
+            }
+            .col-text li {
+                margin-bottom: 15px;
+            }
+            
+            .col-img-container {
+                flex: 1.2; 
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: 550px; 
+            }
+            
+            /* The base full screenshot */
+            .base-screenshot {
+                width: 100%;
+                max-height: 100%;
+                object-fit: contain;
+                border-radius: 12px;
+                box-shadow: 0 5px 25px rgba(0,0,0,0.5); /* Lighter shadow */
+            }
+
+            /* Zoomed Image styling */
+            .zoomed-image {
+                width: 100%;
+                max-height: 100%;
+                object-fit: contain;
+                border-radius: 12px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.9);
+                border: 2px solid #8bb0ff;
+                margin-bottom: 10px;
+            }
+            
+            /* Highlighting textual elements */
+            .highlight-text { color: #99c2ff; font-weight: bold; }
+            .material-icons-round { vertical-align: middle; margin-right: 5px; color: #66b3ff; }
+            
+            /* For the list structure */
+            .detail-list {
+                margin-top: 5px;
+                list-style-type: circle;
+                margin-left: 20px;
+                color: #eaeaea; /* Lighter text */
+                font-size: 0.9em;
+            }
+            .detail-list li { margin-bottom: 5px; }
+            
+            .instruction-text {
+                font-size: 0.6em;
+                color: #aaa;
+                text-align: center;
+                margin-top: 20px;
+                font-style: italic;
+            }
+
+        </style>
+	</head>
+	<body>
+        <div class="ocean">
+            <div class="wave"></div>
+            <div class="wave"></div>
+        </div>
+		<div class="reveal">
+			<div class="slides">
+				
+                <!-- Title Slide -->
+                <section>
+                    <h1>Eka Automation</h1>
+                    <h3>User Guide & Demo Walkthrough</h3>
+                    <p style="opacity: 0.8; font-size: 0.7em; margin-top: 40px;">Use Left/Right arrow keys or swipe to navigate sideways.</p>
+                </section>
+                
+                <!-- Overview -->
+                <section>
+                    <h2><span class="material-icons-round">rocket_launch</span> Overview</h2>
+                    <p style="font-size: 0.7em; text-align: left;">The Eka Automation Application is designed to significantly reduce repetitive engineering workload through intelligent, centralized automation.</p>
+                    <ul style="font-size: 0.65em; list-style-type: none; padding: 0;">
+                        <li><span class="material-icons-round">image</span> <strong>Daily Image Loading</strong> — Automated, zero-touch batch processing of VS testing images replacing manual CLI operations.</li>
+                        <li><span class="material-icons-round">dynamic_feed</span> <strong>Batch Runs</strong> — Streamlined execution of multiple test configurations defined via YAML testbeds.</li>
+                        <li><span class="material-icons-round">speed</span> <strong>Advanced Regression Testing:</strong>
+                            <ul class="detail-list" style="margin-left: 30px;">
+                                <li><strong>Parallel Execution:</strong> Run multiple SpyTest scripts simultaneously against discrete topologies.</li>
+                                <li><strong>Optimized DUT Usage:</strong> The system automatically manages Device Under Test (DUT) allocation and prevents resource conflicts.</li>
+                                <li><strong>Centralized Logging:</strong> Real-time streaming and storage of raw execution logs for rapid debugging and RCA.</li>
+                            </ul>
+                        </li>
+                    </ul>
+                </section>
+
+                <!-- Dashboard 1 -->
+                <section>
+                    <h2><span class="material-icons-round">dashboard</span> Dashboard</h2>
+                    <div class="two-column">
+                        <div class="col-text">
+                            <ul>
+                                <li><span class="highlight-text">Total Devices Dashboard:</span> The central control plane landing page providing an immediate pulse check on your lab infrastructure.</li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="screenshot_dashboard.png" class="base-screenshot" alt="Dashboard Full">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Dashboard 2 -->
+                <section>
+                    <h2>Dashboard: Core Metrics</h2>
+                    <div class="two-column">
+                        <div class="col-text">
+                            <ul>
+                                <li><span class="highlight-text">4 Core Metrics:</span>
+                                    <ul class="detail-list">
+                                        <li><strong>Total Devices:</strong> Total sum of registered IPs/Hostnames in the application database.</li>
+                                        <li><strong>Online:</strong> Result of the live background heartbeat ping checking node reachability.</li>
+                                        <li><strong>Scripts:</strong> Total test case scripts discovered from the connected Git Spytest repositories.</li>
+                                        <li><strong>Executions:</strong> Lifelong test runs triggered through the platform.</li>
+                                    </ul>
+                                </li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="spotlight_dashboard_1.png" class="zoomed-image" alt="Dashboard Metrics Spotlight">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Devices 1 -->
+                <section>
+                    <h2><span class="material-icons-round">devices_other</span> Devices</h2>
+                    <div class="two-column">
+                        <div class="col-text">
+                            <ul>
+                                <li>Manage the entire testing infrastructure inventory from this single pane of glass.</li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="screenshot_devices.png" class="base-screenshot" alt="Devices Full">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Devices 2 -->
+                <section>
+                    <h2>Devices: Provisioning</h2>
+                    <div class="two-column">
+                        <div class="col-text" style="font-size: 0.5em;">
+                            <p style="font-size: 1.2em; margin-bottom: 10px; color: #fff;"><span class="highlight-text">Adding a New Device:</span></p>
+                            <ul>
+                                <li>This top section handles the secure ingestion of new testbed members into the database.</li>
+                                <li><span class="highlight-text">Name / IP / Port:</span> 
+                                    <ul class="detail-list">
+                                        <li>The system requires a unique <code>Device Name</code> string.</li>
+                                        <li>The <code>IP Address</code> will be aggressively validated.</li>
+                                        <li><strong>Important:</strong> The <code>Port</code> field auto-defaults to <code>22</code> (Standard SSH). You should explicitly override this for custom reverse proxy routing.</li>
+                                    </ul>
+                                </li>
+                                <li><span class="highlight-text">Credentials:</span> Standard login parameters (defaults to <code>admin</code>). Passwords are encrypted at rest.</li>
+                                <li><span class="highlight-text">Type Selection Dropdown:</span> 
+                                    <ul class="detail-list">
+                                        <li><strong>VM (Host):</strong> Crucial! These are simulation servers that run containers. They are treated differently by the engine.</li>
+                                        <li><strong>DUT:</strong> Primary test subjects.</li>
+                                        <li><strong>Switch/Router:</strong> Secondary infrastructure elements.</li>
+                                    </ul>
+                                </li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="spotlight_devices_1.png" class="zoomed-image" alt="Devices Add Form Spotlight">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Devices 3 -->
+                <section>
+                    <h2>Devices: Management</h2>
+                    <div class="two-column">
+                        <div class="col-text" style="font-size: 0.5em;">
+                            <p style="font-size: 1.2em; margin-bottom: 10px; color: #fff;"><span class="highlight-text">Inventory & Operations:</span></p>
+                            <ul>
+                                <li>The lower grid provides a comprehensive, filtered layout of the entire mapped lab topology.</li>
+                                <li><span class="highlight-text">Live Status Checks:</span>
+                                    <ul class="detail-list">
+                                        <li>The <code>Status</code> column represents the last known heartbeat.</li>
+                                        <li>The <strong>Wi-Fi Icon Button <span class="material-icons-round" style="font-size: 14px;">wifi</span></strong> under Actions triggers an on-demand, blocking SSH negotiation attempt to definitively prove reachability and auth validity before running tests.</li>
+                                    </ul>
+                                </li>
+                                <li><span class="highlight-text">Decommissioning:</span> 
+                                    <ul class="detail-list">
+                                        <li>The <strong>Trash Bin Icon <span class="material-icons-round" style="font-size: 14px; color: #ff4d4d;">delete</span></strong> instantly purges the device records.</li>
+                                        <li><strong>Warning:</strong> Deleting a VM Host that is currently running a background script will forcefully terminate its connections.</li>
+                                    </ul>
+                                </li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="spotlight_devices_2.png" class="zoomed-image" alt="Devices Table Spotlight">
+                        </div>
+                    </div>
+                </section>
+                
+                <!-- Execution 1 -->
+                <section>
+                    <h2><span class="material-icons-round">play_circle</span> Execution</h2>
+                    <div class="two-column">
+                        <div class="col-text">
+                            <ul>
+                                <li>The core engine room. Configure, map, and dispatch complex testing pipelines.</li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="screenshot_execute.png" class="base-screenshot" alt="Execution Full">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Execution 2 -->
+                <section>
+                    <h2>Execution: Git Sync</h2>
+                    <div class="two-column">
+                        <div class="col-text" style="font-size: 0.5em;">
+                            <ul>
+                                <li><span class="highlight-text">Step 1: The Context Matrix</span> is the crucial first layer of any execution. You must bind the script to a physical host before proceeding.</li>
+                                <li><span class="highlight-text">Host Server Selection:</span> The dropdown auto-populates only with devices explicitly tagged with type <code>"VM (Host)"</code> in the Devices tab.</li>
+                                <li><span class="highlight-text">Git Orchestration Layer:</span> 
+                                    <ul class="detail-list">
+                                        <li>Provide the exact <code>HTTPS Git Clone URL</code> for the SpyTest repository.</li>
+                                        <li>Enter a valid <strong>GitHub/Bitbucket Access Token</strong> (Classic PAT) instead of an account password.</li>
+                                        <li>Change the target checkout <code>Branch</code> as needed.</li>
+                                        <li>Clicking <strong>Pull <span class="material-icons-round" style="font-size: 14px;">sync</span></strong> triggers the backend worker to SSH into the VM, execute git clone/fetch strategies, and index all python scripts on the remote disk.</li>
+                                    </ul>
+                                </li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="spotlight_execute_1.png" class="zoomed-image" alt="Execute VM Sync Spotlight">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Execution 3 -->
+                <section>
+                    <h2>Execution: Topologies</h2>
+                    <div class="two-column">
+                        <div class="col-text" style="font-size: 0.5em;">
+                            <ul>
+                                <li><span class="highlight-text">Step 2: Topology Canvas</span> is the interactive SVG space located in the lower-left pane.</li>
+                                <li><span class="highlight-text">Dynamic Mapping:</span> Once DUTs are selected, they spawn as draggable interface nodes on the canvas.</li>
+                                <li><span class="highlight-text">Cable Mode Routing:</span> 
+                                    <ul class="detail-list">
+                                        <li>Toggle the <code>Cable Mode</code> button to enter linking state.</li>
+                                        <li>Click on a source node's port, drag, and drop onto a destination node's port to draw a physical link line.</li>
+                                        <li>This generates the underlying interconnect mapping automatically.</li>
+                                        <li>Use the <code>Clear</code> sweep button to reset broken maps.</li>
+                                    </ul>
+                                </li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="spotlight_execute_2.png" class="zoomed-image" alt="Execution Canvas Spotlight">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Execution 4 -->
+                <section>
+                    <h2>Execution: Target Setup</h2>
+                    <div class="two-column">
+                        <div class="col-text" style="font-size: 0.5em;">
+                            <ul>
+                                <li><span class="highlight-text">Step 3: Script Selection (Center Panel)</span>
+                                    <ul class="detail-list">
+                                        <li>Once Git is synchronized, the <code>Category</code> dropdown populates dynamically by parsing the remote file directory trees.</li>
+                                        <li>Select a Category to auto-fill the <code>Test Scripts</code> multi-select widget below it.</li>
+                                        <li>Check multiple individual Python test scripts to batch them directly into a single massive regression run queue.</li>
+                                    </ul>
+                                </li>
+                                <li><span class="highlight-text">Step 4: Testbed Definition (Right Panel)</span>
+                                    <ul class="detail-list">
+                                        <li>Select the correct <code>YAML Testbed file</code> located within the VM.</li>
+                                        <li>This instructs the SpyTest engine on exactly how to address the hardware layout when the execution triggers.</li>
+                                    </ul>
+                                </li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="spotlight_execute_3.png" class="zoomed-image" alt="Execute Scripts Spotlight" style="max-height: 48%;">
+                            <img src="spotlight_execute_4.png" class="zoomed-image" alt="Execute Testbed Spotlight" style="max-height: 48%;">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- VS Manager 1 -->
+                <section>
+                    <h2><span class="material-icons-round">memory</span> VS Manager</h2>
+                    <div class="two-column">
+                        <div class="col-text">
+                            <ul>
+                                <li>Automates the painful process of updating firmware images across massive virtual simulation banks.</li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="screenshot_vs.png" class="base-screenshot" alt="VS Manager Full">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- VS Manager 2 -->
+                <section>
+                    <h2>VS Manager: Update Workflow</h2>
+                    <div class="two-column">
+                        <div class="col-text" style="font-size: 0.5em;">
+                            <ul>
+                                <li><span class="highlight-text">Discovery & Targeting:</span>
+                                    <ul class="detail-list">
+                                        <li>Select a <code>Host Device</code> from the dropdown.</li>
+                                        <li>The app queries the server and spins up a list of all active Virtual Machines detected on that specific Linux host.</li>
+                                        <li>Click the checkboxes next to the specific VMs you want to target for upgrading, enabling parallel processing.</li>
+                                    </ul>
+                                </li>
+                                <li><span class="highlight-text">The Update Lifecycle Workflow:</span>
+                                    <ul class="detail-list">
+                                        <li>Paste the exact absolute file path to the fresh <code>sonic-vs.img</code> on the server into the input field.</li>
+                                        <li>Upon pressing Update, the background worker handles the complicated Linux choreography: <br>1. Halting/Destroying the VM Instance. <br>2. Deleting the corrupted/old image volume. <br>3. Block-copying the new source image payload into the VM namespace. <br>4. Re-initializing and spinning up the KVM/Docker target securely.</li>
+                                    </ul>
+                                </li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="spotlight_vs_1.png" class="zoomed-image" alt="VS Host Grid Spotlight" style="max-height: 48%;">
+                            <img src="spotlight_vs_2.png" class="zoomed-image" alt="VS Workflow Spotlight" style="max-height: 48%;">
+                        </div>
+                    </div>
+                </section>
+                
+                <!-- Logs 1 -->
+                <section>
+                    <h2><span class="material-icons-round">article</span> Logs</h2>
+                    <div class="two-column">
+                        <div class="col-text">
+                            <ul>
+                                <li>The permanent system-of-record for every automated event in the platform.</li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="screenshot_logs.png" class="base-screenshot" alt="Logs Full">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Logs 2 -->
+                <section>
+                    <h2>Logs: Forensic Inspection</h2>
+                    <div class="two-column">
+                        <div class="col-text" style="font-size: 0.5em;">
+                            <ul>
+                                <li><span class="highlight-text">Execution History Matrix:</span>
+                                    <ul class="detail-list">
+                                        <li>A complete chronological grid of execution iterations.</li>
+                                        <li>Tracks total run duration, target devices hit, start/end timestamps, and final pass/fail outcomes.</li>
+                                    </ul>
+                                </li>
+                                <li><span class="highlight-text">Deep Dive Inspection:</span>
+                                    <ul class="detail-list">
+                                        <li>Clicking anywhere on a row instantly queries the backend to pull the raw console output trace for that specific job id.</li>
+                                        <li>Crucial for Engineering RCA (Root Cause Analysis).</li>
+                                    </ul>
+                                </li>
+                                <li><span class="highlight-text">Export Utility:</span> The <code>Download</code> button packages the raw text logs into a file to safely attach to external Jira tickets or emails.</li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="spotlight_logs_1.png" class="zoomed-image" alt="Logs Table Spotlight">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Terminal 1 -->
+                <section>
+                    <h2><span class="material-icons-round">terminal</span> Terminal Integration</h2>
+                    <div class="two-column">
+                        <div class="col-text">
+                            <ul>
+                                <li>Integrated Remote bash Web CLI bridges the gap without breaking workflow.</li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="screenshot_terminal.png" class="base-screenshot" alt="Terminal Full">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Terminal 2 -->
+                <section>
+                    <h2>Terminal: Direct Dispatch</h2>
+                    <div class="two-column">
+                        <div class="col-text" style="font-size: 0.5em;">
+                            <ul>
+                                <li><span class="highlight-text">Direct Routing:</span>
+                                    <ul class="detail-list">
+                                        <li>Instead of alt-tabbing to PuTTY or native CMD, select the target device from the dropdown.</li>
+                                        <li>The system brokers a direct SSH tunnel asynchronously on your behalf.</li>
+                                    </ul>
+                                </li>
+                                <li><span class="highlight-text">Command Dispatch:</span>
+                                    <ul class="detail-list">
+                                        <li>Type raw shell statements (e.g. <code>ifconfig</code>, <code>show run</code>, <code>cat /var/log/syslog</code>).</li>
+                                        <li>The stdout pipeline returns near instantaneous results directly into the black web console frame.</li>
+                                        <li>Allows engineers to rapidly verify physical switch states before triggering a 2-hour software execution run.</li>
+                                    </ul>
+                                </li>
+                            </ul>
+                        </div>
+                        <div class="col-img-container">
+                            <img src="spotlight_term_1.png" class="zoomed-image" alt="Terminal Input Spotlight" style="max-height: 48%;">
+                            <img src="spotlight_term_2.png" class="zoomed-image" alt="Terminal Output Spotlight" style="max-height: 48%;">
+                        </div>
+                    </div>
+                </section>
+
+                <!-- End -->
+                <section>
+                    <h1>Thank You!</h1>
+                    <p style="opacity: 0.8;">Ready for Automation Execution</p>
+                </section>
+
+			</div>
+		</div>
+
+		<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.js"></script>
+		<script>
+			Reveal.initialize({
+				hash: true,
+                slideNumber: 'c/t',
+                progress: true,
+                center: true,
+                width: 1400, 
+                height: 800,
+                transition: 'slide', 
+			});
+		</script>
+	</body>
+</html>
