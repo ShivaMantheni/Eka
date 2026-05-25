@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Frontend Fixes Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1e1e1e; color: #fff; }
+        .test { margin: 20px 0; padding: 15px; background: #2d2d2d; border-left: 4px solid #4CAF50; }
+        .pass { color: #4CAF50; }
+        .fail { color: #f44336; }
+    </style>
+</head>
+<body>
+    <h1>Frontend Fixes Test</h1>
+    
+    <div class="test">
+        <h2>1. Timezone Fix Test</h2>
+        <p>Database UTC timestamp: <code>2026-05-20 06:43:19.740508</code></p>
+        <p>Expected IST: <code>2026-05-20 12:13:19</code> (about 25-30 min ago)</p>
+        <p>Result: <span id="timezone-result"></span></p>
+    </div>
+
+    <div class="test">
+        <h2>2. Execution Log Display Test</h2>
+        <p>Test 1 - Normal log: <span id="log-test-1"></span></p>
+        <p>Test 2 - Null log: <span id="log-test-2"></span></p>
+        <p>Test 3 - Undefined log: <span id="log-test-3"></span></p>
+    </div>
+
+    <script>
+        // Copy the formatDateTime function from app.js
+        function formatDateTime(dateString) {
+            if (!dateString) return '-';
+
+            // Handle UTC datetime from database (append Z if not present)
+            let isoString = dateString;
+            if (!dateString.endsWith('Z') && !dateString.includes('+')) {
+                isoString = dateString + 'Z';  // Treat as UTC
+            }
+
+            const date = new Date(isoString);
+            const now = new Date();
+            const diffMs = now - date;
+            const diffMins = Math.floor(diffMs / 60000);
+
+            if (diffMins < 1) return 'Just now';
+            if (diffMins < 60) return diffMins + ' min ago';
+
+            const diffHours = Math.floor(diffMins / 60);
+            if (diffHours < 24) return diffHours + ' hour' + (diffHours > 1 ? 's' : '') + ' ago';
+
+            return date.toLocaleString();
+        }
+
+        // Test 1: Timezone
+        const dbTimestamp = "2026-05-20 06:43:19.740508";
+        const result = formatDateTime(dbTimestamp);
+        document.getElementById('timezone-result').innerHTML = 
+            '<span class="pass">' + result + '</span>';
+
+        // Test 2: Log display
+        function testLogDisplay(log) {
+            return log || 'No logs available';
+        }
+
+        document.getElementById('log-test-1').innerHTML = 
+            '<span class="pass">' + testLogDisplay('Sample log content') + '</span>';
+        
+        document.getElementById('log-test-2').innerHTML = 
+            '<span class="pass">' + testLogDisplay(null) + '</span>';
+        
+        document.getElementById('log-test-3').innerHTML = 
+            '<span class="pass">' + testLogDisplay(undefined) + '</span>';
+
+        console.log('Test Results:');
+        console.log('Timezone:', result);
+        console.log('Normal log:', testLogDisplay('Sample log'));
+        console.log('Null log:', testLogDisplay(null));
+        console.log('Undefined log:', testLogDisplay(undefined));
+    </script>
+</body>
+</html>

@@ -1,0 +1,375 @@
+/* ============================================================
+   RESPONSIVE DESIGN - Mobile & Tablet Support
+   ============================================================ */
+
+/* Tablet (max-width: 1024px) */
+@media (max-width: 1024px) {
+    html, body {
+        height: 100%;
+        overflow: hidden;
+    }
+
+    body {
+        display: flex;
+        flex-direction: column;
+    }
+
+    .sticky-header {
+        flex-shrink: 0;
+    }
+
+    .app-header {
+        padding: 12px 16px;
+        height: auto;
+        min-height: 72px;
+    }
+
+    .header-left {
+        width: auto;
+        min-width: 200px;
+    }
+
+    .header-right {
+        width: auto;
+        min-width: 300px;
+        gap: 6px;
+    }
+
+    .main-content {
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+        min-height: 0;
+    }
+
+    .header-icon {
+        font-size: 28px;
+        width: 28px;
+        height: 28px;
+    }
+
+    .app-header h1 {
+        font-size: 1.2rem;
+    }
+
+    .subtitle {
+        font-size: 0.75rem;
+    }
+
+    .stat-pill {
+        padding: 3px 8px;
+        font-size: 0.75rem;
+        min-width: 80px;
+    }
+
+    .stat-pill .material-icons-round {
+        font-size: 12px;
+    }
+
+    .main-content {
+        padding: 16px;
+    }
+
+    .tab-bar {
+        padding: 6px 16px;
+        gap: 2px;
+    }
+
+    .tab {
+        padding: 8px 12px;
+        font-size: 0.85rem;
+    }
+
+    .tab .material-icons-round {
+        font-size: 16px;
+    }
+
+    .grid-4 {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+    }
+
+    .grid-2 {
+        grid-template-columns: 1fr;
+        gap: 16px;
+    }
+
+    .stat-card {
+        padding: 12px 14px;
+        gap: 10px;
+    }
+
+    .stat-icon {
+        font-size: 24px;
+        padding: 6px;
+    }
+
+    .stat-value {
+        font-size: 1.4rem;
+    }
+
+    .stat-label {
+        font-size: 0.75rem;
+    }
+}
+
+/* Mobile (max-width: 768px) */
+@media (max-width: 768px) {
+    html, body {
+        height: 100%;
+        overflow: hidden;
+    }
+
+    body {
+        display: flex;
+        flex-direction: column;
+    }
+
+    .sticky-header {
+        flex-shrink: 0;
+    }
+
+    .app-header {
+        flex-direction: column;
+        height: auto;
+        padding: 12px;
+        gap: 12px;
+        align-items: stretch;
+    }
+
+    .header-left {
+        width: 100%;
+        justify-content: center;
+    }
+
+    .header-right {
+        width: 100%;
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .stat-pill {
+        flex: 1;
+        min-width: 70px;
+        justify-content: center;
+    }
+
+    .theme-switcher {
+        order: -1;
+    }
+
+    .tab-bar {
+        overflow-x: auto;
+        padding: 6px 8px;
+        gap: 4px;
+        scrollbar-width: thin;
+    }
+
+    .tab {
+        padding: 8px 10px;
+        font-size: 0.8rem;
+        white-space: nowrap;
+    }
+
+    .tab .material-icons-round {
+        font-size: 14px;
+    }
+
+    .main-content {
+        padding: 12px;
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+        min-height: 0;
+    }
+
+    .grid-4 {
+        grid-template-columns: 1fr;
+        gap: 10px;
+    }
+
+    .stat-card {
+        padding: 10px 12px;
+    }
+
+    .card-header h3 {
+        font-size: 1rem;
+    }
+
+    .form-row {
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .form-row input,
+    .form-row select,
+    .form-row button {
+        width: 100%;
+    }
+
+    /* Make table responsive */
+    table {
+        font-size: 0.85rem;
+    }
+
+    th, td {
+        padding: 8px 6px;
+    }
+
+    /* Terminal adjustments */
+    #term-container {
+        height: 400px;
+    }
+
+    .card-body {
+        padding: 12px;
+    }
+
+    /* VS Manager adjustments */
+    .vs-vm-list {
+        overflow-x: auto;
+    }
+
+    /* Hide less important columns on mobile */
+    .hide-mobile {
+        display: none;
+    }
+}
+
+/* Small Mobile (max-width: 480px) */
+@media (max-width: 480px) {
+    html, body {
+        height: 100%;
+        overflow: hidden;
+    }
+
+    body {
+        display: flex;
+        flex-direction: column;
+    }
+
+    .sticky-header {
+        flex-shrink: 0;
+    }
+
+    .app-header h1 {
+        font-size: 1.1rem;
+    }
+
+    .subtitle {
+        font-size: 0.7rem;
+    }
+
+    .stat-pill {
+        padding: 2px 6px;
+        font-size: 0.7rem;
+        min-width: 60px;
+    }
+
+    .stat-pill .material-icons-round {
+        font-size: 10px;
+    }
+
+    .tab {
+        padding: 6px 8px;
+        font-size: 0.75rem;
+    }
+
+    .main-content {
+        padding: 8px;
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+        min-height: 0;
+    }
+
+    .stat-card {
+        padding: 8px 10px;
+        gap: 8px;
+    }
+
+    .stat-icon {
+        font-size: 20px;
+        padding: 5px;
+    }
+
+    .stat-value {
+        font-size: 1.2rem;
+    }
+
+    .stat-label {
+        font-size: 0.7rem;
+    }
+
+    .card {
+        margin-bottom: 12px;
+    }
+
+    .card-header h3 {
+        font-size: 0.9rem;
+    }
+
+    .btn {
+        padding: 6px 10px;
+        font-size: 0.8rem;
+    }
+
+    #term-container {
+        height: 300px;
+    }
+
+    table {
+        font-size: 0.75rem;
+    }
+
+    th, td {
+        padding: 6px 4px;
+    }
+}
+
+/* Landscape mobile adjustments */
+@media (max-height: 600px) and (orientation: landscape) {
+    html, body {
+        height: 100%;
+        overflow: hidden;
+    }
+
+    body {
+        display: flex;
+        flex-direction: column;
+    }
+
+    .sticky-header {
+        flex-shrink: 0;
+    }
+
+    .app-header {
+        padding: 8px 16px;
+        min-height: 60px;
+    }
+
+    .header-left, .header-right {
+        gap: 4px;
+    }
+
+    .stat-pill {
+        padding: 2px 6px;
+    }
+
+    .tab-bar {
+        padding: 4px 16px;
+    }
+
+    .main-content {
+        padding: 12px 16px;
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+        min-height: 0;
+    }
+
+    #term-container {
+        height: 350px;
+    }
+}

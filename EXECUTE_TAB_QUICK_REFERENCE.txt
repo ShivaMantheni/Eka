@@ -1,0 +1,359 @@
+================================================================================
+EKA APPLICATION - EXECUTE TAB QUICK REFERENCE
+================================================================================
+
+FILE LOCATIONS:
+───────────────
+Frontend:  /home/hp_test/Eka/framework/dut-automation/static/app.js
+Backend:   /home/hp_test/Eka/framework/dut-automation/main.py
+HTML:      /home/hp_test/Eka/framework/dut-automation/static/index.html
+
+================================================================================
+1. SCRIPT EXECUTION
+================================================================================
+
+API ENDPOINT: POST /api/spytest/execute
+
+PARAMETERS:
+  - host_id: int (which VM to run scripts on)
+  - scripts: [{path, dut_count, min_topology}, ...] (array of scripts)
+  - testbed: str (always "master_testbed.yaml")
+  - available_dut_count: int (from canvas selection)
+  - options: {log_level, skip_init_config}
+
+EXECUTION PATTERN:
+  ✓ ONE API CALL with all scripts
+  ✓ Backend spawns PER-SCRIPT worker threads (parallel)
+  ✓ Each script runs in own SSH connection
+  ✓ Each script uses nohup + background execution
+
+COMMAND ON HOST:
+  cd /path/to/spytest && python -m spytest --tryssh 1 \
+    --testbed /tmp/temp_exec{id}_s{slot}.yaml \
+    tests/{script_path} \
+    --logs-path {log_dir} \
+    [--log-level {level}] \
+    [--skip-init-config]
+
+================================================================================
+2. DUT ALLOCATION
+================================================================================
+
+POOL-BASED ALLOCATION:
+  - Shared pool: available_pool = [list of DUTs]
+  - Protected by: pool_lock (mutex)
+  - Each script thread calls: acquire_duts(dut_count)
+    ├─ BLOCKS if insufficient DUTs
+    ├─ Polls every 5 seconds
+    └─ Atomically removes from pool when successful
+
+BACK-TO-BACK CONNECTIONS:
+  - Detects: self-loop topology (DUT_A → DUT_A)
+  - Priority: Single-DUT scripts prefer back-to-back devices
+  - Function: _has_back_to_back_connection(dut_name)
+
+TOPOLOGY-AWARE MATCHING:
+  - Script declares: min_topology = ["D1", "D1D2:2", "D2D3:1"]
+  - Parsed to: {(D1,D2): 2, (D2,D3): 1} (link requirements)
+  - Backend tries all DUT combinations
+  - Validates: Canvas has required link counts
+  - Falls back: First N available if no perfect match
+
+PARALLEL EXECUTION TIMELINE:
+  Script 1: T=0.0s → acquires DUT_A
+  Script 2: T=0.3s → acquires DUT_B
+  Script 3: T=0.6s → BLOCKS, waiting for any DUT
+  Script 1: T=60s  → completes, releases DUT_A
+  Script 3: T=60s  → unblocks, acquires DUT_A
+
+================================================================================
+3. EXECUTION LOGS & REAL-TIME DISPLAY
+================================================================================
+
+LOG STORAGE:
+  Table: execution_logs
+  Fields: id, execution_id, dut_name (script name), log_level, message, timestamp
+
+LOG STREAMING:
+  WebSocket: ws://host/ws/execution/{execution_id}
+  Server-side polling: Every 0.5 seconds for new logs
+  Message format: {id, dut_name, level, message, timestamp}
+
+FRONTEND DISPLAY:
+  - Multi-pane layout: One pane per script
+  - Key: log.dut_name (treated as script identifier)
+  - Auto-scroll per pane (scrollTop = scrollHeight)
+  - Popup modal: Click script header to see full logs
+  - Special filter: Messages starting with [QUEUE] are hidden
+
+LOG PERSISTENCE:
+  - While executing: In database + in-memory allLogs[]
+  - After completing: Permanent in database (no cleanup)
+  - Can view via: Logs tab → Execution History → View Logs
+  - Download: "Download" button on execution panel (current execution only)
+
+================================================================================
+4. QUEUE MANAGEMENT & STATUS
+================================================================================
+
+QUEUE STATE STORAGE:
+  _exec_queue_state = {
+    execution_id: {
+      "scripts": [
+        {name, status, duts, pid},
+        ...
+      ],
+      "free_duts": ["DUT_A", "DUT_B"],
+      "all_duts": ["DUT_A", "DUT_B"]
+    }
+  }
+
+FRONTEND POLLING:
+  Interval: 3 seconds
+  Endpoint: GET /api/execution-queue
+  Updates: updateQueuePanel(state)
+
+STATUS PANEL DISPLAY:
+  - Free DUTs: Green chips
+  - Busy DUTs: Red chips
+  - Scripts: List with status icons
+    ├─ ⏳ Queued
+    ├─ 📅 Waiting
+    ├─ ▶️ Running (with DUT allocation → DUT_A + DUT_B)
+    ├─ ✓ Done
+    └─ ✗ Failed
+
+STATE UPDATES:
+  _q_init(exec_id, script_names, dut_list)      → Initialize
+  _q_update_script(exec_id, name, status, duts) → Update status
+  _q_set_free(exec_id, free_duts_list)          → Update free list
+  _q_cleanup(exec_id)                           → Remove after completion
+
+QUEUE LOG MESSAGES:
+  Format: [QUEUE] Waiting for N DUT(s)…
+  Action: Filtered out of Live Logs display
+  Purpose: Update in-memory queue state only
+
+================================================================================
+5. SELECTED SCRIPTS STATE MANAGEMENT
+================================================================================
+
+GLOBAL STATE VARIABLES:
+  selectedDUTIds = new Set()        // Selected device IDs
+  selectedScriptPaths = new Set()   // Selected script paths
+
+DURING EXECUTION:
+  ✓ Remain checked (UI shows selections)
+  ✓ State is captured at execution start
+  ✓ Cannot be modified mid-execution (UI is locked)
+
+AFTER EXECUTION COMPLETES:
+  Called via: WebSocket message {type: "execution_complete"}
+  Function: resetExecutionState()
+  Action:
+    1. selectedScriptPaths.clear()
+    2. Uncheck all script checkboxes
+    3. selectedDUTIds.clear()
+    4. Uncheck all DUT checkboxes
+    5. loadDUTs() - refresh display
+
+RESULT: User must re-select everything for next execution
+
+================================================================================
+6. EXECUTION LOG PERSISTENCE & VISIBILITY
+================================================================================
+
+DURING EXECUTION:
+  - Logs appear in real-time via WebSocket
+  - "Live Execution Logs" section shows multi-pane layout
+  - Download button enabled
+
+AFTER EXECUTION ENDS:
+  - Logs remain in database forever (no auto-cleanup)
+  - "Live Execution Logs" section becomes inactive
+  - View logs via: Logs tab → Execution History → Click → View Logs
+  - API: GET /api/executions/{execution_id}/logs?limit=500
+  - Logs persist indefinitely (potential database growth issue)
+
+AUTOMATIC CLEANUP:
+  None. Logs are never automatically deleted.
+
+================================================================================
+7. BATCH EXECUTION & MID-RUN MODIFICATIONS
+================================================================================
+
+BATCH EXECUTION:
+  - All selected scripts execute together (one API call)
+  - Not sequential, but true parallel with DUT allocation
+  - No intermediate batches or re-selection during run
+
+CAN BATCH BE MODIFIED WHILE RUNNING?
+  No.
+  
+  Why:
+  - Script list is captured at execution start
+  - Backend uses thread-local copies
+  - Adding/removing scripts has no effect
+  - UI elements are locked (start button disabled)
+  - State is reset after completion (re-selection required)
+
+TIMEOUT FOR INSUFFICIENT DUTS:
+  None. Scripts block indefinitely on acquire_duts() with 5s polls.
+  Will wait forever if not enough DUTs become available.
+
+================================================================================
+8. WEBSOCKET & LOG STREAMING
+================================================================================
+
+CONNECTION LIFECYCLE:
+  1. startExecution() → POST /api/spytest/execute
+  2. Response: {execution_id, status: "started"}
+  3. connectWS(execution_id) → Open WebSocket
+     └─ ws://host/ws/execution/{execution_id}
+  4. onmessage: Receive logs or execution_complete
+  5. CLOSE: Automatically on execution_complete OR user clicks Stop
+
+CLOSING BEHAVIOR:
+  - Execution complete: WebSocket closed by backend
+  - User clicks Stop: ws.close() + stopQueuePolling()
+  - Note: "Stop" only stops monitoring, not server-side execution
+
+POLLING INTERVALS:
+  - WebSocket log polling (server-side): 0.5 seconds
+  - Queue status polling (frontend): 3 seconds
+
+================================================================================
+9. BACK-TO-BACK DEVICE ALLOCATION (DETAIL)
+================================================================================
+
+WHEN MULTIPLE SCRIPTS COMPETE FOR SAME DEVICE:
+
+Scenario:
+  Script 1 (1 DUT, back-to-back) → acquired DUT_A at T=0s
+  Script 2 (1 DUT, no back-to-back) → acquired DUT_B at T=0.3s
+  Script 3 (1 DUT, back-to-back) → blocked waiting at T=0.6s
+  
+  DUT_A has back-to-back connection
+  DUT_B does not
+
+At T=60s Script 1 completes:
+  - release_duts([DUT_A])
+  - available_pool.extend([DUT_A])
+  - _q_set_free(exec_id, [DUT_A])
+  
+Script 3's acquire_duts loop:
+  - Wakes on next iteration (max 5s poll)
+  - Checks available_pool = [DUT_A]
+  - Calls _find_duts_matching_topology()
+  - Prefers back-to-back → finds DUT_A ✓
+  - Allocates DUT_A immediately
+  
+ALLOCATION GUARANTEE:
+  Back-to-back preference is ONLY for single-DUT scripts.
+  Multi-DUT scripts ignore back-to-back and match topology only.
+
+================================================================================
+10. CURRENT LIMITATIONS & ISSUES
+================================================================================
+
+TOPOLOGY CANVAS REQUIRED:
+  - Start button disabled if:
+    ├─ No VM selected
+    ├─ No scripts selected
+    └─ NO DUTs selected OR no connections
+  - Workaround: Select 1 DUT + draw self-loop
+
+MASTER TESTBED AUTO-GENERATION:
+  - Always generates from topology canvas
+  - If canvas empty → generation fails → execution fails
+  - Old testbed selector hidden (display:none)
+
+GIT MODE INCOMPLETE:
+  - Frontend references /api/git/execute (NOT IMPLEMENTED)
+  - Falls back to SPyTest mode or 404 error
+  - Use SPyTest mode only
+
+LOG GROWTH:
+  - Logs never cleaned up
+  - Database grows indefinitely
+  - No archiving mechanism
+
+QUEUE POLLING LATENCY:
+  - Frontend polls every 3 seconds
+  - Status updates lag up to 3 seconds
+
+INSUFFICIENT DUT HANDLING:
+  - No timeout on acquire_duts()
+  - Scripts block forever if not enough DUTs
+  - User sees "Waiting for N DUT(s)…" indefinitely
+
+TOPOLOGY-AWARE ALLOCATION MISMATCH:
+  - Frontend preview is INDICATIVE ONLY
+  - Backend may allocate differently
+  - Falls back to first N if topology doesn't match
+
+MID-EXECUTION STATE CHANGES:
+  - Impossible to modify batch while running
+  - Must wait for completion + re-select everything
+
+================================================================================
+11. KEY API ENDPOINTS (EXECUTE TAB)
+================================================================================
+
+POST /api/spytest/execute
+  ├─ Input: {host_id, scripts, testbed, available_dut_count, options}
+  └─ Output: {execution_id, status, type, script_count}
+
+GET /api/execution-queue
+  ├─ Input: (none)
+  └─ Output: {execution_id: {scripts, free_duts, all_duts}, ...}
+
+WS /ws/execution/{execution_id}
+  ├─ Server sends: {id, dut_name, level, message, timestamp}
+  └─ Completion: {type: "execution_complete", status, duration}
+
+GET /api/executions/{execution_id}/logs?limit=500
+  ├─ Input: limit (default 500)
+  └─ Output: [{id, execution_id, dut_name, log_level, message, timestamp}, ...]
+
+GET /api/executions
+  ├─ Input: (none)
+  └─ Output: [{id, name, type, status, dut_count, duration, created_at}, ...]
+
+POST /api/spytest/script-info
+  ├─ Input: {host_id, script_path}
+  └─ Output: {dut_count, min_topology}
+
+================================================================================
+12. CODE FILE REFERENCES (EXECUTE TAB)
+================================================================================
+
+FRONTEND (app.js):
+  Lines   1205-1308   startExecution() & stopExecution()
+  Lines   1092-1120   startQueuePolling() & pollQueueStatus()
+  Lines   1102-1170   updateQueuePanel() & queue display
+  Lines   1179-1201   resetExecutionState()
+  Lines   1320-1350   connectWS() & WebSocket handlers
+  Lines   1358-1428   renderLogs(), appendLogEntry(), logHTML()
+  Lines   1444-1487   loadExecutions(), viewExecLogs()
+  Lines   2896-2950   allocateDUTsForScripts() (frontend preview)
+  Lines    735-743    updateSpyStartBtn() (enable/disable logic)
+  Lines    749, 841   Global state: selectedDUTIds, selectedScriptPaths
+
+BACKEND (main.py):
+  Lines   154-167     Execution model (table schema)
+  Lines   170-177     ExecutionLog model
+  Lines   345-356     log_execution() function
+  Lines   2965-3023   start_spytest_execution() API endpoint
+  Lines   3030-3074   In-memory queue state (_exec_queue_state)
+  Lines   3034-3068   Queue functions: _q_init, _q_update, _q_cleanup
+  Lines   3070-3074   GET /api/execution-queue endpoint
+  Lines   3127-3139   _has_back_to_back_connection()
+  Lines   3142-3206   _find_duts_matching_topology()
+  Lines   3213-3515   _run_spytest_execution() (background thread)
+  Lines   3311-3341   acquire_duts() and release_duts() (pool logic)
+  Lines   3343-3478   run_one_script() (per-script worker)
+  Lines   3517-3551   _create_subset_testbed()
+  Lines   1878-1956   WebSocket endpoint /ws/execution/{id}
+
+================================================================================
