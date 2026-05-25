@@ -7,14 +7,10 @@
     <title>Eka Automation</title>
     <meta name="description"
         content="Eka Automation — Network Test Execution Platform. Manage DUTs, VMs, topology, spytest scripts, and stream real-time logs.">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link
-        href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
-        rel="stylesheet">
-    <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
-    <link rel="stylesheet" href="/static/style.css?v=28">
+    <link rel="stylesheet" href="/static/style.css?v=39">
+    <link rel="stylesheet" href="/static/responsive.css?v=2">
 </head>
 
 <body>
@@ -42,7 +38,7 @@
             </div>
             <div class="stat-pill running" id="stat-running" style="display:none"><span
                     class="material-icons-round spin">sync</span> <span>0</span> Running</div>
-            <div class="health-dot" id="health-dot" title="API Health"></div>
+            <div class="health-dot" id="health-dot" title="Session Status"></div>
         </div>
     </header>
 
@@ -65,6 +61,9 @@
         </button>
         <button class="tab" data-tab="terminal" onclick="switchTab('terminal')">
             <span class="material-icons-round">terminal</span> Terminal
+        </button>
+        <button class="tab" data-tab="hardware-load" onclick="switchTab('hardware-load')">
+            <span class="material-icons-round">hardware</span> Hardware Load
         </button>
     </nav>
     </div><!-- /sticky-header -->
@@ -130,23 +129,84 @@
                     <h3><span class="material-icons-round">add_circle</span> Add New Device</h3>
                 </div>
                 <div class="card-body">
-                    <form id="add-dut-form" class="form-row" onsubmit="addDUT(event)">
-                        <input type="text" id="dut-name" placeholder="Device Name" required>
-                        <input type="text" id="dut-ip" placeholder="IP Address" required>
-                        <input type="number" id="dut-port" placeholder="Port" value="22" min="1" max="65535">
-                        <input type="text" id="dut-user" placeholder="Username" value="admin">
-                        <input type="password" id="dut-pass" placeholder="Password">
-                        <select id="dut-type">
-                            <option value="VM">VM (Host)</option>
+                    <form id="add-dut-form" onsubmit="addDUT(event)" class="device-form-responsive">
+                        <input type="text" id="dut-name" placeholder="Name" required class="form-input">
+                        <input type="text" id="dut-ip" placeholder="IP Address" required class="form-input form-input-medium">
+                        <input type="number" id="dut-port" placeholder="Port" value="22" min="1" max="65535" class="form-input form-input-small">
+                        <input type="text" id="dut-user" placeholder="User" value="admin" class="form-input">
+                        <input type="password" id="dut-pass" placeholder="Password" class="form-input">
+                        <input type="text" id="dut-xml-path" placeholder="XML Path" value="/home/hp/prajwal/VMs" class="form-input form-input-wide">
+                        <select id="dut-type" class="form-input form-input-narrow-select">
+                            <option value="VM">VM</option>
                             <option value="DUT">DUT</option>
                             <option value="Switch">Switch</option>
                             <option value="Router">Router</option>
                         </select>
-                        <button type="submit" class="btn primary"><span class="material-icons-round">add</span>
-                            Add</button>
+                        <select id="dut-connection-type" class="form-input form-input-narrow-select">
+                            <option value="ssh">SSH</option>
+                            <option value="telnet">Telnet</option>
+                        </select>
+                        <button type="submit" class="btn primary form-submit-btn">
+                            <span class="material-icons-round">add</span> Add
+                        </button>
                     </form>
                 </div>
             </div>
+            <!-- Edit Device Modal -->
+            <div id="edit-device-modal-overlay" class="modal-overlay">
+                <div class="modal">
+                    <div class="modal-header">
+                        <h3>Edit Device</h3>
+                        <button class="btn icon" onclick="closeEditDeviceModal()">
+                            <span class="material-icons-round">close</span>
+                        </button>
+                    </div>
+                    <div class="modal-body">
+                        <form id="edit-device-form" onsubmit="editDUT(event)">
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+                                <div>
+                                    <label class="field-label">Device Name</label>
+                                    <input type="text" id="edit-dut-name" required>
+                                </div>
+                                <div>
+                                    <label class="field-label">IP Address</label>
+                                    <input type="text" id="edit-dut-ip" required>
+                                </div>
+                                <div>
+                                    <label class="field-label">Port</label>
+                                    <input type="number" id="edit-dut-port" value="22" min="1" max="65535">
+                                </div>
+                                <div>
+                                    <label class="field-label">Device Type</label>
+                                    <select id="edit-dut-type">
+                                        <option value="VM">VM (Host)</option>
+                                        <option value="DUT">DUT</option>
+                                        <option value="Switch">Switch</option>
+                                        <option value="Router">Router</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="field-label">Username</label>
+                                    <input type="text" id="edit-dut-user" value="admin">
+                                </div>
+                                <div>
+                                    <label class="field-label">Password</label>
+                                    <input type="password" id="edit-dut-pass">
+                                </div>
+                                <div style="grid-column:1/-1">
+                                    <label class="field-label">XML Path (for VMs)</label>
+                                    <input type="text" id="edit-dut-xml-path" value="/home/hp/prajwal/VMs" style="width:100%">
+                                </div>
+                            </div>
+                            <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end">
+                                <button type="button" class="btn outline" onclick="closeEditDeviceModal()">Cancel</button>
+                                <button type="submit" class="btn primary">Save Changes</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
             <div class="card glass" style="margin-top:16px;">
                 <div class="card-header">
                     <h3><span class="material-icons-round">dns</span> Device Inventory</h3>
@@ -235,8 +295,8 @@
                 </div>
             </div>
 
-            <!-- Row 2: 3-Column Grid — DUTs+Topology | Categories+Scripts | Testbed -->
-            <div style="display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:16px;margin-top:16px">
+            <!-- Row 2: 2-Column Grid — DUTs+Topology | Categories+Scripts -->
+            <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:16px;margin-top:16px">
 
                 <!-- Column 1: DUTs & Topology Canvas -->
                 <div class="card glass">
@@ -264,6 +324,11 @@
                                     style="font-size:12px;vertical-align:middle">device_hub</span> Topology
                                 Canvas</span>
                             <div style="display:flex;gap:6px;align-items:center">
+                                <button onclick="generateMasterTestbed()"
+                                    style="background:var(--accent);border:1px solid var(--accent);color:white;cursor:pointer;font-size:10px;padding:2px 8px;border-radius:4px;display:flex;align-items:center;gap:4px;transition:all .2s"
+                                    title="Generate master testbed YAML from all topology DUTs">
+                                    <span class="material-icons-round" style="font-size:12px">auto_awesome</span> Generate Master Testbed
+                                </button>
                                 <button id="btn-cable-mode" onclick="toggleCableMode()"
                                     style="background:none;border:1px solid var(--border);color:var(--text-secondary);cursor:pointer;font-size:10px;padding:2px 8px;border-radius:4px;display:flex;align-items:center;gap:4px;transition:all .2s"
                                     title="Cable Mode: click port then port to connect DUTs">
@@ -356,8 +421,8 @@
                     </div>
                 </div>
 
-                <!-- Column 3: Testbed YAML -->
-                <div class="card glass">
+                <!-- Column 3: Testbed YAML (Hidden - using auto-generated master testbed) -->
+                <div class="card glass" style="display:none">
                     <div class="card-header">
                         <h3><span class="material-icons-round">settings_suggest</span> Testbed YAML</h3>
                     </div>
@@ -393,6 +458,14 @@
                                     style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--text-secondary)">
                                     <input type="checkbox" id="spy-skip-init" checked> Skip Init Config
                                 </label>
+                                <!-- Enhancement 3: DUT Reservation checkbox -->
+                                <label
+                                    style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--text-secondary)">
+                                    <input type="checkbox" id="reserve-duts-checkbox">
+                                    <span title="Keep DUTs locked after execution completes. Prevents other users from using them. Auto-releases after 4 hours.">
+                                        Reserve DUTs for next batch
+                                    </span>
+                                </label>
                             </div>
                         </details>
                     </div>
@@ -400,14 +473,27 @@
             </div>
 
             <!-- Row 3: Execute Button + Allocation Preview -->
-            <div style="margin-top:16px;display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap">
-                <button class="btn primary big" id="btn-start-exec" onclick="startExecution()" disabled>
-                    <span class="material-icons-round">play_arrow</span> Start Execution
-                </button>
-                <button class="btn danger big" id="btn-stop-exec" onclick="stopExecution()" style="display:none">
-                    <span class="material-icons-round">stop</span> Stop
-                </button>
-                <div id="exec-allocation-info" style="margin-left:4px;flex:1;min-width:0"></div>
+            <div style="margin-top:16px;">
+                <div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap">
+                    <button class="btn primary big" id="btn-start-exec" onclick="startExecution()" disabled>
+                        <span class="material-icons-round">play_arrow</span> Start Execution
+                    </button>
+                    <button class="btn secondary big" id="btn-add-scripts-exec" onclick="addScriptsDuringExecution()" style="display:none" title="Add new scripts to running execution">
+                        <span class="material-icons-round">add_circle</span> Add Scripts
+                    </button>
+                    <button class="btn danger big" id="btn-stop-exec" onclick="stopExecution()" style="display:none">
+                        <span class="material-icons-round">stop</span> Stop
+                    </button>
+                    <!-- Enhancement 3: Release Reserved DUTs button -->
+                    <button class="btn outline big" id="btn-release-duts" onclick="releaseReservedDuts()" style="display:none" title="Release all reserved DUTs">
+                        <span class="material-icons-round">lock_open</span>Release DUTs
+                    </button>
+                    <div id="exec-allocation-info" style="margin-left:4px;flex:1;min-width:0"></div>
+                </div>
+                <div style="margin-top:8px;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;font-size:11px;color:var(--text-secondary);display:flex;align-items:center;gap:6px">
+                    <span class="material-icons-round" style="font-size:14px;color:var(--accent)">info</span>
+                    <span>Master testbed is auto-generated from topology when you click Execute</span>
+                </div>
             </div>
 
             <!-- Row 3b: Queue & Status Panel (separate from logs) -->
@@ -450,10 +536,16 @@
             <div class="card glass" style="margin-top:16px">
                 <div class="card-header">
                     <h3><span class="material-icons-round">article</span> Live Execution Logs</h3>
-                    <button class="btn outline small" onclick="downloadLogs()" id="btn-download-logs"
-                        style="display:none">
-                        <span class="material-icons-round">download</span> Download
-                    </button>
+                    <div style="display:flex; gap:8px">
+                        <button class="btn outline small" onclick="toggleShowOnlyRunning()" id="btn-show-only-running"
+                            style="display:none" title="Hide completed scripts' logs">
+                            <span class="material-icons-round">visibility_off</span> Show Only Running
+                        </button>
+                        <button class="btn outline small" onclick="downloadLogs()" id="btn-download-logs"
+                            style="display:none">
+                            <span class="material-icons-round">download</span> Download
+                        </button>
+                    </div>
                 </div>
                 <div class="card-body">
                     <div class="log-container" id="exec-log-container">
@@ -477,14 +569,12 @@
                             <h3><span class="material-icons-round">dns</span> Host Device</h3>
                         </div>
                         <div class="card-body">
-                            <div class="form-row">
-                                <select id="vs-host" class="select-full" onchange="onVSHostChange()">
-                                    <option value="">-- Select Host Device --</option>
-                                </select>
-                                <button class="btn outline small" onclick="refreshVSList()" title="Refresh VM list">
-                                    <span class="material-icons-round">refresh</span>
-                                </button>
-                            </div>
+                            <select id="vs-host" class="select-full" onchange="onVSHostChange()" style="margin-bottom:12px">
+                                <option value="">-- Select Host Device --</option>
+                            </select>
+                            <button class="btn-icon" onclick="refreshVSList()" title="Refresh VM list">
+                                <span class="material-icons-round">refresh</span>
+                            </button>
                         </div>
                     </div>
 
@@ -511,6 +601,11 @@
                             <h3><span class="material-icons-round">system_update_alt</span> Update VS Image</h3>
                         </div>
                         <div class="card-body">
+                            <label class="field-label">Source Image Server <span class="muted">(optional - leave blank for local copy)</span></label>
+                            <select id="vs-source-server" class="select-full" style="margin-bottom:16px">
+                                <option value="">-- Use Host Device (Local Copy) --</option>
+                            </select>
+
                             <label class="field-label">Source Image Path <span class="muted">(shared for all selected
                                     VMs)</span></label>
                             <input type="text" id="vs-source-image"
@@ -532,11 +627,34 @@
                         <div class="card-body">
                             <!-- Step Progress -->
                             <div class="vs-progress" id="vs-progress" style="display:none">
-                                <div class="vs-step" data-step="1"><span class="step-num">1</span> Destroy VM</div>
-                                <div class="vs-step" data-step="2"><span class="step-num">2</span> Remove Old Image
+                                <div class="vs-step" data-step="1">
+                                    <div class="step-indicator">
+                                        <span class="step-num">1</span>
+                                        <span class="step-icon">✓</span>
+                                    </div>
+                                    <span class="step-label">Destroy VM</span>
                                 </div>
-                                <div class="vs-step" data-step="3"><span class="step-num">3</span> Copy New Image</div>
-                                <div class="vs-step" data-step="4"><span class="step-num">4</span> Start VM</div>
+                                <div class="vs-step" data-step="2">
+                                    <div class="step-indicator">
+                                        <span class="step-num">2</span>
+                                        <span class="step-icon">✓</span>
+                                    </div>
+                                    <span class="step-label">Remove Old Image</span>
+                                </div>
+                                <div class="vs-step" data-step="3">
+                                    <div class="step-indicator">
+                                        <span class="step-num">3</span>
+                                        <span class="step-icon">✓</span>
+                                    </div>
+                                    <span class="step-label">Copy New Image</span>
+                                </div>
+                                <div class="vs-step" data-step="4">
+                                    <div class="step-indicator">
+                                        <span class="step-num">4</span>
+                                        <span class="step-icon">✓</span>
+                                    </div>
+                                    <span class="step-label">Start VM</span>
+                                </div>
                             </div>
                             <!-- Live Logs -->
                             <div class="log-container" id="vs-log-container" style="margin-top:12px">
@@ -578,39 +696,174 @@
                     </table>
                 </div>
             </div>
-            <div class="card glass" style="margin-top:16px" id="log-detail-card" hidden>
-                <div class="card-header">
-                    <h3><span class="material-icons-round">description</span> Execution Logs — <span
-                            id="log-detail-title"></span></h3>
-                </div>
-                <div class="card-body">
-                    <div class="log-container" id="log-detail-container"></div>
+            <!-- Log Viewer Modal Popup -->
+            <div id="log-detail-modal-overlay" class="modal-overlay">
+                <div class="modal" style="max-width: 90%; max-height: 90vh; width: 1200px;">
+                    <div class="modal-header">
+                        <h3><span class="material-icons-round">description</span> Execution Logs — <span id="log-detail-title"></span></h3>
+                        <div style="display: flex; gap: 8px;">
+                            <button class="btn outline small" onclick="deleteLogs()" title="Delete Logs" style="color: var(--red);">
+                                <span class="material-icons-round">delete</span>
+                            </button>
+                            <button class="btn icon" onclick="closeLogViewer()" title="Close">
+                                <span class="material-icons-round">close</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="modal-body" style="overflow-y: auto;">
+                        <div class="log-container" id="log-detail-container"></div>
+                    </div>
                 </div>
             </div>
         </section>
 
-        <!-- ============ TERMINAL TAB ============ -->
+        <!-- ============ TERMINAL TAB - PTY Mode ============ -->
         <section id="tab-terminal" class="tab-content">
             <div class="card glass">
                 <div class="card-header">
-                    <h3><span class="material-icons-round">terminal</span> Remote Terminal</h3>
+                    <h3><span class="material-icons-round">terminal</span> Terminal</h3>
+                    <select id="term-dut" class="select-full" style="max-width:300px" onchange="termDeviceChanged()">
+                        <option value="">-- Select Device --</option>
+                    </select>
                 </div>
-                <div class="card-body">
-                    <div class="form-row" style="margin-bottom:12px">
-                        <select id="term-dut" class="select-full" style="max-width:300px">
-                            <option value="">-- Select Device --</option>
-                        </select>
-                        <input type="text" id="term-cmd" placeholder="Enter command..." style="flex:1"
-                            onkeydown="if(event.key==='Enter')termExec()">
-                        <button class="btn primary" onclick="termExec()"><span class="material-icons-round">send</span>
-                            Execute</button>
-                    </div>
-                    <div class="terminal-output" id="term-output">
+                <div class="card-body" style="padding:0; height:600px; overflow:hidden;">
+                    <!-- xterm.js will populate this container -->
+                    <div id="term-container" style="height: 100%; background: #1e1e1e; padding: 10px;">
                         <div class="log-placeholder">
                             <span class="material-icons-round">terminal</span>
-                            <p>Select a device and enter a command to execute remotely via SSH.</p>
+                            <p>Select a device to open PTY terminal session.</p>
+                            <p style="font-size: 12px; color: #888;">Supports vi, nano, top, htop, screen, tmux</p>
                         </div>
                     </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============ HARDWARE LOAD TAB ============ -->
+        <section id="tab-hardware-load" class="tab-content">
+            <!-- Hardware Load Form -->
+            <div class="card glass">
+                <div class="card-body">
+                    <form id="hardwareLoadForm" onsubmit="startHardwareLoad(event)" class="hw-form-single-row">
+                        <div class="hw-form-group">
+                            <label for="hwDeviceSelect">Device</label>
+                            <select id="hwDeviceSelect" required class="select-full">
+                                <option value="">-- Select --</option>
+                            </select>
+                        </div>
+                        <div class="hw-form-group">
+                            <label for="hwSourceServer">Source Server</label>
+                            <select id="hwSourceServer" required class="select-full" onchange="updateSourceServerDetails()">
+                                <option value="">-- Select --</option>
+                            </select>
+                        </div>
+                        <div class="hw-form-group hw-form-group-wider">
+                            <label for="hwImagePath">Image Path</label>
+                            <input type="text" id="hwImagePath" required placeholder="/home/user/sonic-image.bin" />
+                        </div>
+                        <div class="hw-form-group hw-form-group-narrow">
+                            <label for="hwGatewayIP">Gateway IP</label>
+                            <input type="text" id="hwGatewayIP" required placeholder="192.168.100.1" value="192.168.100.1" />
+                        </div>
+                        <div class="hw-form-group hw-form-group-narrow">
+                            <label for="hwSubnetMask">Subnet Mask</label>
+                            <input type="text" id="hwSubnetMask" required placeholder="255.255.255.255" value="255.255.255.255" />
+                        </div>
+                        <div class="hw-form-group hw-form-group-button">
+                            <label>&nbsp;</label>
+                            <button type="submit" class="btn primary">
+                                <span class="material-icons-round">play_arrow</span> Start
+                            </button>
+                        </div>
+                        <!-- Hidden password field for form submission - auto-filled from device -->
+                        <input type="hidden" id="hwServerPassword" />
+                    </form>
+                </div>
+            </div>
+
+            <!-- Progress Monitor -->
+            <div id="hwProgressContainer" class="card glass" style="display: none;">
+                <div class="card-header">
+                    <h3>
+                        <span class="material-icons-round">hourglass_empty</span>
+                        Installation Progress
+                    </h3>
+                </div>
+                <div class="card-body">
+                    <!-- Progress Bar -->
+                    <div class="hw-progress-wrapper">
+                        <div class="hw-progress-bar">
+                            <div id="hwProgressFill" class="hw-progress-fill" style="width: 0%"></div>
+                        </div>
+                        <div class="hw-progress-text">
+                            <span id="hwProgressPercent">0%</span>
+                            <span id="hwProgressStatus">Initializing...</span>
+                        </div>
+                    </div>
+
+                    <!-- Current Step -->
+                    <div class="hw-current-step">
+                        <span class="material-icons-round hw-step-icon">pending</span>
+                        <span id="hwCurrentStep">Waiting to start...</span>
+                    </div>
+
+                    <!-- Stop Button -->
+                    <div id="hwStopBtnWrapper" style="margin-bottom: 12px; display: flex; justify-content: flex-end;">
+                        <button id="hwStopBtn" class="btn danger" onclick="stopHardwareLoad()" title="Force stop the running hardware load job">
+                            <span class="material-icons-round">stop_circle</span> Stop Process
+                        </button>
+                    </div>
+
+                    <!-- Execution Log Terminal -->
+                    <div class="hw-log-terminal">
+                        <div class="hw-terminal-header">
+                            <span class="material-icons-round">terminal</span>
+                            Execution Log
+                            <button class="btn-icon-sm" onclick="clearHWLog()" title="Clear">
+                                <span class="material-icons-round">clear_all</span>
+                            </button>
+                        </div>
+                        <div id="hwExecutionLog" class="hw-terminal-output">
+                            <!-- Log lines appear here -->
+                        </div>
+                    </div>
+
+                    <!-- Completion Message -->
+                    <div id="hwCompletionMessage" class="hw-completion-message" style="display: none;">
+                        <!-- Success or error message -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Job History -->
+            <div class="card glass">
+                <div class="card-header">
+                    <h3>
+                        <span class="material-icons-round">history</span>
+                        Hardware Load History
+                    </h3>
+                    <button class="btn-icon" onclick="refreshHWHistory()" title="Refresh">
+                        <span class="material-icons-round">refresh</span>
+                    </button>
+                </div>
+                <div class="card-body">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Job ID</th>
+                                <th>Device</th>
+                                <th>Image</th>
+                                <th>Status</th>
+                                <th>Progress</th>
+                                <th>Started</th>
+                                <th>Duration</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="hwHistoryTable">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </section>
@@ -633,7 +886,31 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=28"></script>
+    <!-- Enhancement 2: Cancel Script Confirmation Modal -->
+    <div class="modal-overlay" id="cancel-script-confirmation-modal" style="display:none" onclick="closeCancelConfirmation()">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>Cancel Running Script?</h3>
+                <button class="btn-icon" onclick="closeCancelConfirmation()"><span class="material-icons-round">close</span></button>
+            </div>
+            <div class="modal-body">
+                <p>Are you sure you want to cancel <strong id="cancel-script-name-display"></strong>?</p>
+                <p style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
+                    This will stop the script from running and remove it from the queue.
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-cancel-no" class="btn primary" autofocus onclick="closeCancelConfirmation()">
+                    <span class="material-icons-round">done</span> NO - Keep Running
+                </button>
+                <button id="btn-cancel-yes" class="btn danger" onclick="confirmCancelScript()">
+                    <span class="material-icons-round">stop</span> YES - Cancel Script
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=50"></script>
 </body>
 
 </html>

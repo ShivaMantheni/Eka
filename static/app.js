@@ -5,27 +5,83 @@
 const API = window.location.origin;
 let currentExecId = null;
 let ws = null;
-let selectedDUTs = new Set();
 let allLogs = [];           // [{dut_name, script_name, level, message, timestamp}]
 let _queuePollTimer = null; // setInterval handle for queue status polling
 
 // Per-DUT interface cache: {dutId: [{name, speed, mtu, fec, alias, oper, admin}, ...]}
-// Populated when user clicks the wifi/ping button. Falls back to SONIC_PORTS if empty.
+// Automatically populated when a DUT is added. Falls back to SONIC_PORTS if empty.
 let dutInterfaces = {};
+
+// Session management variables
+let currentSession = null;
+let sessionKeepAliveTimer = null;
+
+// PTY Terminal (xterm.js) global variables
+let terminalInstance = null;  // xterm.js Terminal instance
+let terminalSocket = null;    // WebSocket connection for PTY
+let xtermLoaded = false;      // Track if xterm.js library is loaded
+let terminalOutputBuffer = []; // Store all terminal output for reconnection
+let terminalCurrentDutId = null; // Track which DUT is currently connected
+let terminalIsReconnecting = false; // Flag to prevent multiple reconnect attempts
+let terminalHeartbeatInterval = null; // Interval ID for heartbeat monitoring
+
+// ============================================================
+// API HELPERS - Session-based headers
+// ============================================================
+
+function getSessionHeaders() {
+    const sessionId = localStorage.getItem('eka-session-id');
+    const headers = {
+        'Content-Type': 'application/json'
+    };
+    if (sessionId) {
+        headers['X-Session-ID'] = sessionId;
+    }
+    return headers;
+}
+
+/**
+ * Get the current session ID from localStorage
+ * @returns {string|null} The session ID or null if not found
+ */
+function getSessionId() {
+    return localStorage.getItem('eka-session-id');
+}
 
 // ============================================================
 // INITIALIZATION
 // ============================================================
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     // Restore saved theme before anything renders
     const savedTheme = localStorage.getItem('eka-theme') || 'dark';
     setTheme(savedTheme, true);
 
+    // Add backdrop click handlers for modals (close on backdrop click)
+    const logModalOverlay = document.getElementById('log-detail-modal-overlay');
+    if (logModalOverlay) {
+        logModalOverlay.addEventListener('click', (e) => {
+            if (e.target === logModalOverlay) closeLogViewer();
+        });
+    }
+
+    // Initialize session management - MUST complete before making API calls
+    await initializeSession();
+
+    // Add backdrop click handlers for modals (close on backdrop click)
+    const editModalOverlay = document.getElementById('edit-device-modal-overlay');
+    if (editModalOverlay) {
+        editModalOverlay.addEventListener('click', (e) => {
+            if (e.target === editModalOverlay) closeEditDeviceModal();
+        });
+    }
+
+    // Now that session is initialized, load data
     checkHealth();
     loadStats();
     loadDUTs();
     loadExecutions();
+    // Hardware devices will be loaded when Hardware Load tab is opened
     setInterval(checkHealth, 15000);
     setInterval(loadStats, 10000);
 });
@@ -79,20 +135,499 @@ function updateThemeIcon() {
 
 
 // ============================================================
+// SESSION MANAGEMENT
+// ============================================================
+
+/**
+ * Initialize session management on page load
+ * Auto-creates session based on browser session without requiring user login
+ */
+async function initializeSession() {
+    // Check if session exists in localStorage
+    let sessionId = localStorage.getItem('eka-session-id');
+
+    if (sessionId) {
+        // Validate existing session
+        const valid = await validateSession(sessionId);
+        if (valid) {
+            console.log('Existing session validated:', sessionId);
+            startSessionKeepAlive();
+            return;
+        } else {
+            console.log('Existing session invalid, creating new one');
+            localStorage.removeItem('eka-session-id');
+            localStorage.removeItem('eka-user-name');
+        }
+    }
+
+    // No valid session - auto-create one without modal
+    await autoCreateSession();
+}
+
+/**
+ * Show modal to collect user information
+ */
+function showUserIdentificationModal() {
+    const modal = `
+        <div id="session-modal" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);
+             display:flex;align-items:center;justify-content:center;z-index:10000">
+            <div style="background:var(--bg-secondary);padding:24px;border-radius:12px;max-width:400px;width:90%">
+                <h2 style="margin:0 0 16px 0;font-size:20px">Welcome to Eka Automation</h2>
+                <p style="margin:0 0 20px 0;color:var(--text-secondary);font-size:14px">
+                    Please identify yourself to start a session:
+                </p>
+                <div style="margin-bottom:16px">
+                    <label style="display:block;margin-bottom:6px;font-size:12px;font-weight:500">
+                        Your Name <span style="color:var(--error)">*</span>
+                    </label>
+                    <input type="text" id="session-user-name" placeholder="John Doe"
+                           style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;
+                                  background:var(--bg-primary);color:var(--text);font-size:14px">
+                </div>
+                <div style="margin-bottom:20px">
+                    <label style="display:block;margin-bottom:6px;font-size:12px;font-weight:500">
+                        Email (Optional)
+                    </label>
+                    <input type="email" id="session-user-email" placeholder="john@example.com"
+                           style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;
+                                  background:var(--bg-primary);color:var(--text);font-size:14px">
+                </div>
+                <button onclick="registerUserSession()"
+                        style="width:100%;padding:10px;background:var(--accent);color:white;border:none;
+                               border-radius:6px;cursor:pointer;font-size:14px;font-weight:500">
+                    Start Session
+                </button>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', modal);
+
+    // Focus on name input
+    setTimeout(() => {
+        document.getElementById('session-user-name').focus();
+    }, 100);
+
+    // Allow Enter key to submit
+    document.getElementById('session-user-name').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') registerUserSession();
+    });
+    document.getElementById('session-user-email').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') registerUserSession();
+    });
+}
+
+/**
+ * Auto-create session without user input (browser session based)
+ */
+async function autoCreateSession() {
+    // Generate unique session ID based on timestamp and random string
+    const sessionId = 'eka-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+
+    // Generate anonymous user name with timestamp
+    const timestamp = new Date().toLocaleString('en-US', {
+        month: 'short',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+    });
+    const userName = `User_${timestamp.replace(/[^a-zA-Z0-9]/g, '_')}`;
+
+    try {
+        const res = await fetch(`${API}/api/sessions/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: sessionId,
+                user_name: userName,
+                user_email: '',
+                ttl_minutes: 480  // 8 hours
+            })
+        });
+
+        if (!res.ok) {
+            const err = await res.json();
+            console.error('Auto-session registration failed:', err.detail);
+            // Fallback: continue without session (app will still work)
+            return;
+        }
+
+        const data = await res.json();
+        currentSession = data;
+
+        // Save to localStorage (persists across browser sessions)
+        localStorage.setItem('eka-session-id', sessionId);
+        localStorage.setItem('eka-user-name', userName);
+
+        // Fetch session diagnostics to get time_remaining_minutes and update health dot
+        try {
+            const diagRes = await fetch(`${API}/api/sessions/${sessionId}/diagnostics`);
+            if (diagRes.ok) {
+                const diagData = await diagRes.json();
+                updateSessionStatusDisplay({
+                    status: 'success',
+                    time_remaining_minutes: diagData.time_remaining_minutes
+                });
+            }
+        } catch (e) {
+            console.error('Failed to fetch session diagnostics:', e);
+        }
+
+        // Start keep-alive
+        startSessionKeepAlive();
+
+        console.log('Session auto-created:', userName, sessionId);
+
+    } catch (error) {
+        console.error('Error auto-creating session:', error);
+        // Continue without session - app will still function
+    }
+}
+
+/**
+ * Register new user session
+ */
+async function registerUserSession() {
+    const userName = document.getElementById('session-user-name').value.trim();
+    const userEmail = document.getElementById('session-user-email').value.trim();
+
+    if (!userName) {
+        toast('Please enter your name', 'error');
+        return;
+    }
+
+    // Generate unique session ID
+    const sessionId = 'eka-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+
+    try {
+        const res = await fetch(`${API}/api/sessions/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: sessionId,
+                user_name: userName,
+                user_email: userEmail,
+                ttl_minutes: 480  // 8 hours
+            })
+        });
+
+        if (!res.ok) {
+            const err = await res.json();
+            toast(`Session registration failed: ${err.detail}`, 'error');
+            return;
+        }
+
+        const data = await res.json();
+        currentSession = data;
+
+        // Save to localStorage
+        localStorage.setItem('eka-session-id', sessionId);
+        localStorage.setItem('eka-user-name', userName);
+
+        // Fetch session diagnostics to get time_remaining_minutes and update health dot
+        try {
+            const diagRes = await fetch(`${API}/api/sessions/${sessionId}/diagnostics`);
+            if (diagRes.ok) {
+                const diagData = await diagRes.json();
+                updateSessionStatusDisplay({
+                    status: 'success',
+                    time_remaining_minutes: diagData.time_remaining_minutes
+                });
+            }
+        } catch (e) {
+            console.error('Failed to fetch session diagnostics:', e);
+        }
+
+        // Remove modal
+        document.getElementById('session-modal').remove();
+
+        // Start keep-alive
+        startSessionKeepAlive();
+
+        toast(`Welcome, ${userName}! Session started.`, 'success');
+        console.log('Session registered:', data);
+
+    } catch (error) {
+        toast(`Error registering session: ${error.message}`, 'error');
+        console.error('Session registration error:', error);
+    }
+}
+
+/**
+ * Validate existing session
+ */
+async function validateSession(sessionId) {
+    try {
+        const res = await fetch(`${API}/api/sessions/validate/${sessionId}`);
+        const data = await res.json();
+
+        if (data.valid) {
+            currentSession = data.session;
+
+            // Fetch session diagnostics to get time_remaining_minutes and update health dot
+            try {
+                const diagRes = await fetch(`${API}/api/sessions/${sessionId}/diagnostics`);
+                if (diagRes.ok) {
+                    const diagData = await diagRes.json();
+                    updateSessionStatusDisplay({
+                        status: 'success',
+                        time_remaining_minutes: diagData.time_remaining_minutes
+                    });
+                }
+            } catch (e) {
+                console.error('Failed to fetch session diagnostics:', e);
+            }
+
+            return true;
+        }
+        return false;
+    } catch (error) {
+        console.error('Session validation error:', error);
+        return false;
+    }
+}
+
+/**
+ * Enhanced session keep-alive with detailed logging, failure tracking, and auto-retry
+ */
+let keepaliveState = {
+    failureCount: 0,
+    lastSuccess: null,
+    isRetrying: false,
+    retryDelay: 5000  // Start with 5s, exponential backoff
+};
+
+function startSessionKeepAlive() {
+    if (sessionKeepAliveTimer) {
+        clearInterval(sessionKeepAliveTimer);
+    }
+
+    // Main keep-alive check every 4 minutes (instead of 5) for better safety margin
+    sessionKeepAliveTimer = setInterval(async () => {
+        const sessionId = localStorage.getItem('eka-session-id');
+        if (!sessionId) return;
+
+        try {
+            const response = await fetch(`${API}/api/sessions/${sessionId}/extend`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ extend_minutes: 480 })  // 8 hours to maintain session duration
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                keepaliveState.failureCount = 0;
+                keepaliveState.lastSuccess = new Date();
+                keepaliveState.isRetrying = false;
+
+                console.log(`[KEEPALIVE] ✓ Success: Session ${sessionId.substring(0,8)}... expires in ${data.time_remaining_minutes}m`, data);
+                updateSessionStatusDisplay(data);
+            } else {
+                handleKeepAliveFailure(sessionId, response.status);
+            }
+        } catch (error) {
+            handleKeepAliveFailure(sessionId, error.message);
+        }
+    }, 4 * 60 * 1000); // Every 4 minutes (safer than 5)
+
+    // Retry mechanism: if keep-alive fails, retry with exponential backoff
+    async function retryKeepAlive(sessionId, retryCount = 0) {
+        if (retryCount > 3) {
+            console.error('[KEEPALIVE] ✗ Max retries exceeded, session may expire');
+            showSessionWarning('Keep-alive failed - Session may expire!');
+            return;
+        }
+
+        const delay = keepaliveState.retryDelay * Math.pow(2, retryCount);
+        console.log(`[KEEPALIVE] Retrying in ${delay}ms (attempt ${retryCount + 1}/3)...`);
+
+        await new Promise(resolve => setTimeout(resolve, delay));
+
+        try {
+            const response = await fetch(`${API}/api/sessions/${sessionId}/extend`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ extend_minutes: 480 })  // 8 hours to maintain session duration
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                keepaliveState.failureCount = 0;
+                keepaliveState.lastSuccess = new Date();
+                console.log(`[KEEPALIVE] ✓ Retry succeeded at attempt ${retryCount + 1}`);
+                updateSessionStatusDisplay(data);
+                return;
+            }
+        } catch (error) {
+            console.error(`[KEEPALIVE] Retry failed: ${error.message}`);
+        }
+
+        retryKeepAlive(sessionId, retryCount + 1);
+    }
+
+    function handleKeepAliveFailure(sessionId, errorInfo) {
+        keepaliveState.failureCount++;
+        keepaliveState.isRetrying = true;
+        console.warn(`[KEEPALIVE] ✗ Keep-alive failed (attempt ${keepaliveState.failureCount}): ${errorInfo}`);
+
+        // Update UI to show failure
+        const statusEl = document.getElementById('session-status');
+        if (statusEl) {
+            statusEl.className = 'session-status warning';
+            statusEl.innerHTML = '⚠️ Keep-alive failed - retrying...';
+        }
+
+        // Attempt retry
+        retryKeepAlive(sessionId);
+    }
+
+    // Activity-based keep-alive: also extend on user activity
+    document.addEventListener('click', debounce(() => {
+        const sessionId = localStorage.getItem('eka-session-id');
+        if (sessionId && (Date.now() - (keepaliveState.lastSuccess?.getTime() || 0)) > 2 * 60 * 1000) {
+            console.log('[KEEPALIVE] Activity detected, extending session...');
+            fetch(`${API}/api/sessions/${sessionId}/extend`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ extend_minutes: 480 })  // 8 hours to maintain session duration
+            }).catch(e => console.error('[KEEPALIVE] Activity-based extend failed:', e));
+        }
+    }, 60000)); // Only check once per minute
+
+    console.log('[KEEPALIVE] Enhanced session keep-alive started');
+}
+
+function debounce(fn, delay) {
+    let timeout;
+    return function(...args) {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => fn(...args), delay);
+    };
+}
+
+/**
+ * Update session status display with health information
+ */
+function updateSessionStatusDisplay(sessionData) {
+    // Only update the health-dot indicator, no text status display
+    const healthDot = document.getElementById('health-dot');
+    const remaining = Math.max(0, sessionData.time_remaining_minutes || 0);
+
+    console.log('[SESSION] Updating health-dot, time remaining:', remaining, 'minutes');
+
+    // Update health dot color based on session time remaining
+    if (healthDot) {
+        healthDot.classList.remove('healthy', 'warning', 'critical');
+        if (remaining <= 10) {
+            // Red: 10 minutes or less (CRITICAL)
+            healthDot.classList.add('critical');
+            healthDot.title = `Session Status: CRITICAL (${remaining}m remaining)`;
+            console.log('[SESSION] Health-dot set to CRITICAL (red)');
+        } else if (remaining <= 30) {
+            // Yellow: 30 minutes or less (WARNING)
+            healthDot.classList.add('warning');
+            healthDot.title = `Session Status: Warning (${remaining}m remaining)`;
+            console.log('[SESSION] Health-dot set to WARNING (yellow)');
+        } else if (remaining >= 420) {
+            // Green: 7-8 hours (HEALTHY)
+            healthDot.classList.add('healthy');
+            const hours = Math.floor(remaining / 60);
+            const mins = remaining % 60;
+            healthDot.title = `Session Status: Healthy (${hours}h ${mins}m remaining)`;
+            console.log('[SESSION] Health-dot set to HEALTHY (green)');
+        } else {
+            // Gray: Between 30m and 7h (NORMAL)
+            const hours = Math.floor(remaining / 60);
+            const mins = remaining % 60;
+            healthDot.title = `Session Status: Active (${hours}h ${mins}m remaining)`;
+            console.log('[SESSION] Health-dot set to NORMAL (gray)');
+        }
+    } else {
+        console.warn('[SESSION] Health-dot element not found!');
+    }
+}
+
+/**
+ * Show session warning banner
+ */
+function showSessionWarning(message) {
+    const warningEl = document.createElement('div');
+    warningEl.className = 'session-warning';
+    warningEl.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        background: #dc2626;
+        color: white;
+        padding: 12px 20px;
+        text-align: center;
+        font-weight: 500;
+        z-index: 10000;
+    `;
+    warningEl.innerHTML = `🔴 ${message} - <a href="#" style="color: white; text-decoration: underline;" onclick="location.reload(); return false;">Reload page</a>`;
+    document.body.appendChild(warningEl);
+
+    console.error(`[SESSION_WARNING] ${message}`);
+    toast(message, 'error');
+}
+
+/**
+ * Fetch and display session diagnostics (for debugging)
+ */
+async function getSessionDiagnostics() {
+    const sessionId = localStorage.getItem('eka-session-id');
+    if (!sessionId) return null;
+
+    try {
+        const response = await fetch(`${API}/api/sessions/${sessionId}/diagnostics`);
+        if (!response.ok) return null;
+        return await response.json();
+    } catch (error) {
+        console.error('[DIAGNOSTICS] Failed to fetch:', error);
+        return null;
+    }
+}
+
+/**
+ * Log session lifecycle events
+ */
+function logSessionEvent(eventType, details = {}) {
+    const event = {
+        timestamp: new Date().toISOString(),
+        type: eventType,
+        sessionId: localStorage.getItem('eka-session-id'),
+        ...details
+    };
+    console.log(`[SESSION_EVENT] ${eventType}:`, event);
+
+    // Store in session storage for debugging
+    const events = JSON.parse(sessionStorage.getItem('eka-session-events') || '[]');
+    events.push(event);
+    sessionStorage.setItem('eka-session-events', JSON.stringify(events.slice(-50))); // Keep last 50
+}
+
+
+// ============================================================
 // HEALTH & STATS
 // ============================================================
 
 async function checkHealth() {
+    // API health check - health-dot now used for session status instead
     try {
         const res = await fetch(`${API}/health`);
-        const dot = document.getElementById('health-dot');
-        dot.classList.toggle('healthy', res.ok);
-    } catch { document.getElementById('health-dot').classList.remove('healthy'); }
+        // Health check passes silently - no visual indicator needed
+        console.log('[HEALTH] API health check:', res.ok ? 'OK' : 'FAILED');
+    } catch (e) {
+        console.error('[HEALTH] API health check failed:', e.message);
+    }
 }
 
 async function loadStats() {
     try {
-        const res = await fetch(`${API}/api/stats`);
+        const res = await fetch(`${API}/api/stats`, {
+            headers: getSessionHeaders()
+        });
         const s = await res.json();
         setText('dash-total-duts', s.total_duts);
         setText('dash-online-duts', s.online_duts);
@@ -117,6 +652,13 @@ function switchTab(tab) {
     document.querySelector(`[data-tab="${tab}"]`).classList.add('active');
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
     document.getElementById(`tab-${tab}`).classList.add('active');
+
+    // Load hardware devices when Hardware Load tab is opened
+    if (tab === 'hardware-load') {
+        loadHardwareDevices();
+        loadHWHistory();
+    }
+
     if (tab === 'execute') {
         loadDUTs();
         updateSpyStartBtn();
@@ -126,7 +668,10 @@ function switchTab(tab) {
     }
     if (tab === 'devices') loadDUTs();
     if (tab === 'logs') loadExecutions();
-    if (tab === 'terminal') renderTermDUTList();
+    if (tab === 'terminal') {
+        loadDUTs(); // Load DUTs to populate terminal dropdown
+        setupTerminalHandlers(); // Re-setup handlers when entering terminal tab
+    }
     if (tab === 'vs') renderVSHostList();
 }
 
@@ -138,7 +683,9 @@ let dutsData = [];
 
 async function loadDUTs() {
     try {
-        const res = await fetch(`${API}/api/duts`);
+        const res = await fetch(`${API}/api/duts`, {
+            headers: getSessionHeaders()
+        });
         if (!res.ok) throw new Error(`Server returned ${res.status}: ${res.statusText}`);
         dutsData = await res.json();
         renderDUTsTable();
@@ -146,6 +693,8 @@ async function loadDUTs() {
         renderTermDUTList();
         renderDashDevices();
         renderSpyVMs();
+        renderVSHostList();
+        renderVSSourceServerList();
         // renderSpyDUTs / renderGitVMs: DUT checklist already covers DUTs; VMs in renderSpyVMs
     } catch (e) {
         console.error('loadDUTs failed:', e);
@@ -158,13 +707,13 @@ function renderDUTsTable() {
     if (!dutsData.length) { tbody.innerHTML = '<tr><td colspan="6" class="muted" style="text-align:center;padding:24px">No devices added yet. Add one above.</td></tr>'; return; }
     tbody.innerHTML = dutsData.map(d => `
         <tr>
-            <td><strong>${esc(d.name)}</strong></td>
-            <td style="font-family:var(--mono)">${esc(d.ip_address)}</td>
-            <td>${d.port}</td>
-            <td>${esc(d.device_type || '-')}</td>
-            <td><span class="badge ${d.status}">${d.status}</span></td>
-            <td>
-                <button class="btn outline small" onclick="pingDUT(${d.id})" title="Test Connectivity"><span class="material-icons-round" style="font-size:16px">wifi_find</span></button>
+            <td data-label="Name"><strong>${esc(d.name)}</strong></td>
+            <td data-label="IP Address" style="font-family:var(--mono)">${esc(d.ip_address)}</td>
+            <td data-label="Port">${d.port}</td>
+            <td data-label="Type">${esc(d.device_type || '-')}</td>
+            <td data-label="Status"><span class="badge ${d.status}">${d.status}</span></td>
+            <td data-label="Actions" style="display:flex;gap:4px">
+                <button class="btn outline small" onclick="openEditDeviceModal(${d.id})" title="Edit" style="color:var(--blue)"><span class="material-icons-round" style="font-size:16px">edit</span></button>
                 <button class="btn outline small" onclick="deleteDUT(${d.id})" title="Delete" style="color:var(--red)"><span class="material-icons-round" style="font-size:16px">delete</span></button>
             </td>
         </tr>`).join('');
@@ -180,20 +729,28 @@ function renderDashDevices() {
 
     if (vms.length) {
         html += '<div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-secondary);margin-bottom:4px">🖥 VMs</div>';
-        html += vms.map(d => `
+        html += vms.map(d => {
+            const connIcon = d.connection_type === 'telnet' ? '📞' : '🔐';
+            const connTitle = d.connection_type === 'telnet' ? 'Telnet' : 'SSH';
+            return `
             <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)">
-                <div><strong>${esc(d.name)}</strong> <span class="muted" style="font-family:var(--mono);margin-left:8px">${esc(d.ip_address)}</span></div>
+                <div><strong>${esc(d.name)}</strong> <span class="muted" style="font-family:var(--mono);margin-left:8px">${esc(d.ip_address)}</span> <span title="${connTitle}" style="font-size:12px">${connIcon}</span></div>
                 <span class="badge ${d.status}">${d.status}</span>
-            </div>`).join('');
+            </div>`;
+        }).join('');
     }
 
     if (duts.length) {
         html += `<div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-secondary);margin-top:${vms.length ? '12px' : '0'};margin-bottom:4px">🔧 DUTs</div>`;
-        html += duts.map(d => `
+        html += duts.map(d => {
+            const connIcon = d.connection_type === 'telnet' ? '📞' : '🔐';
+            const connTitle = d.connection_type === 'telnet' ? 'Telnet' : 'SSH';
+            return `
             <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)">
-                <div><strong>${esc(d.name)}</strong> <span class="muted" style="font-family:var(--mono);margin-left:8px">${esc(d.ip_address)}</span></div>
+                <div><strong>${esc(d.name)}</strong> <span class="muted" style="font-family:var(--mono);margin-left:8px">${esc(d.ip_address)}</span> <span title="${connTitle}" style="font-size:12px">${connIcon}</span></div>
                 <span class="badge ${d.status}">${d.status}</span>
-            </div>`).join('');
+            </div>`;
+        }).join('');
     }
 
     el.innerHTML = html;
@@ -202,34 +759,138 @@ function renderDashDevices() {
 async function addDUT(e) {
     e.preventDefault();
     const data = {
-        name: document.getElementById('dut-name').value,
-        ip_address: document.getElementById('dut-ip').value,
+        name: document.getElementById('dut-name').value.trim(),
+        ip_address: document.getElementById('dut-ip').value.trim(),
         port: parseInt(document.getElementById('dut-port').value) || 22,
         username: document.getElementById('dut-user').value || 'admin',
         password: document.getElementById('dut-pass').value || '',
+        xml_path: document.getElementById('dut-xml-path').value || '/home/hp/prajwal/VMs',
         device_type: document.getElementById('dut-type').value,
+        connection_type: document.getElementById('dut-connection-type').value || 'ssh',
     };
+
+    // Validate device name (alphanumeric only: A-Z, a-z, 0-9)
+    const nameRegex = /^[A-Za-z0-9]+$/;
+    if (!data.name) {
+        toast('Device name is required', 'error');
+        return;
+    }
+    if (!nameRegex.test(data.name)) {
+        toast('Device name must contain only letters (A-Z, a-z) and numbers (0-9). No special characters or spaces allowed.', 'error');
+        return;
+    }
+
+    // Validate IP address (IPv4 format: xxx.xxx.xxx.xxx)
+    const ipRegex = /^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$/;
+    if (!data.ip_address) {
+        toast('IP address is required', 'error');
+        return;
+    }
+    if (!ipRegex.test(data.ip_address)) {
+        toast('Invalid IP address. Must be valid IPv4 format (e.g., 192.168.1.100). No subnet mask allowed.', 'error');
+        return;
+    }
+
     try {
-        const res = await fetch(`${API}/api/duts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+        const res = await fetch(`${API}/api/duts`, {
+            method: 'POST',
+            headers: getSessionHeaders(),
+            body: JSON.stringify(data)
+        });
         if (!res.ok) throw new Error((await res.json()).detail);
+        const result = await res.json();
         toast(`Device "${data.name}" added successfully`, 'success');
+
+        // Reset form
         document.getElementById('add-dut-form').reset();
         document.getElementById('dut-port').value = '22';
         document.getElementById('dut-user').value = 'admin';
-        loadDUTs();
+        document.getElementById('dut-xml-path').value = '/home/hp/prajwal/VMs';
+
+        // Reload device list first
+        await loadDUTs();
         loadStats();
+
+        // Refresh Hardware Load device list if telnet device was added
+        if (data.connection_type === 'telnet') {
+            loadHardwareDevices();
+        }
+
+        // Test connectivity for all devices (SSH and Telnet)
+        if (result.id) {
+            if (data.device_type === 'DUT' && data.connection_type !== 'telnet') {
+                // DUT devices with SSH: fetch interfaces via SSH
+                toast(`Connecting to ${data.name} — fetching interfaces...`, 'info');
+                await fetchDUTInterfaces(result.id);
+                await loadDUTs(); // Refresh status after interface fetch
+            } else {
+                // All other devices (VM, Switch, Router, Telnet): test basic connectivity
+                const connType = data.connection_type === 'telnet' ? 'telnet' : 'SSH';
+                toast(`Testing ${connType} connectivity to ${data.name}...`, 'info');
+                try {
+                    const res = await fetch(`${API}/api/duts/${result.id}/ping`, { method: 'POST' });
+                    const pingData = await res.json();
+                    if (res.ok) {
+                        toast(`${data.name} is ONLINE ✓`, 'success');
+                    } else {
+                        toast(`${data.name} is OFFLINE — ${pingData.detail || 'Cannot connect'}`, 'warning');
+                    }
+                    await loadDUTs(); // Refresh status
+                } catch (e) {
+                    toast(`${data.name}: connection test failed — ${e.message}`, 'error');
+                    await loadDUTs();
+                }
+            }
+        } else if (data.connection_type === 'telnet') {
+            // Telnet devices are marked online by default
+            toast(`${data.name} added successfully (telnet)`, 'success');
+        }
     } catch (e) { toast(`Failed to add device: ${e.message}`, 'error'); }
 }
 
 async function deleteDUT(id) {
     if (!confirm('Delete this device?')) return;
     try {
-        const res = await fetch(`${API}/api/duts/${id}`, { method: 'DELETE' });
+        // Close terminal connection if this device is currently connected
+        if (terminalCurrentDutId === id && terminalSocket) {
+            console.log(`[PTY] Closing terminal connection for deleted device ${id}`);
+            terminalSocket.close();
+            terminalSocket = null;
+            terminalCurrentDutId = null;
+            if (terminalInstance) {
+                terminalInstance.dispose();
+                terminalInstance = null;
+            }
+        }
+
+        const res = await fetch(`${API}/api/duts/${id}`, { method: 'DELETE', headers: getSessionHeaders() });
         if (!res.ok) throw new Error('Failed');
         toast('Device deleted', 'success');
-        selectedDUTs.delete(id);
-        loadDUTs(); loadStats();
-    } catch (e) { toast('Failed to delete device', 'error'); }
+        selectedDUTIds.delete(id);
+
+        // Clear terminal if it was showing this device
+        const termSelect = document.getElementById('term-dut');
+        if (termSelect && parseInt(termSelect.value) === id) {
+            termSelect.value = '';
+            const container = document.getElementById('term-container');
+            if (container) {
+                container.innerHTML = `
+                    <div class="log-placeholder">
+                        <span class="material-icons-round">terminal</span>
+                        <p>Select a device to open PTY terminal session.</p>
+                        <p style="font-size: 12px; color: #888;">Supports vi, nano, top, htop, screen, tmux</p>
+                    </div>`;
+            }
+        }
+
+        loadDUTs();
+        loadStats();
+
+        // Refresh terminal device list
+        renderTermDUTList();
+    } catch (e) {
+        toast('Failed to delete device', 'error');
+    }
 }
 
 async function pingDUT(id) {
@@ -274,13 +935,20 @@ async function fetchDUTInterfaces(dutId) {
         return;
     }
 
+    // Skip interface fetching for telnet devices (they don't use SSH)
+    if (dut.connection_type === 'telnet') {
+        console.log(`Skipping interface fetch for ${dut.name} (telnet device)`);
+        toast(`${dut.name} added successfully (telnet device - use Hardware Load tab)`, 'success');
+        return;
+    }
+
     try {
         const res = await fetch(`${API}/api/duts/${dutId}/interfaces`);
         const data = await res.json();
         if (res.ok && data.interfaces && data.interfaces.length > 0) {
             dutInterfaces[dutId] = data.interfaces;
             toast(`${dut?.name || 'DUT'} ONLINE ✓ — ${data.count} interfaces found`, 'success');
-            renderDUTsTable();
+            // Don't render here - let pingDUT() refresh after loadDUTs()
         } else if (!res.ok) {
             toast(`${dut?.name || 'DUT'} OFFLINE — ${data.detail || 'Cannot connect'}`, 'error');
         }
@@ -299,6 +967,149 @@ function _getInterfacesForDUT(dutId) {
     if (cached && cached.length > 0) return cached;
     // Fallback: wrap SONIC_PORTS as minimal interface objects
     return SONIC_PORTS.map(name => ({ name, oper: 'N/A', admin: 'N/A' }));
+}
+
+// ============================================================
+// DEVICE EDIT FUNCTIONALITY
+// ============================================================
+
+let editingDutId = null;
+
+function openEditDeviceModal(id) {
+    // Find device in dutsData
+    const dut = dutsData.find(d => d.id === id);
+    if (!dut) {
+        toast('Device not found', 'error');
+        return;
+    }
+
+    editingDutId = id;
+
+    // Populate form with current values
+    document.getElementById('edit-dut-name').value = dut.name || '';
+    document.getElementById('edit-dut-ip').value = dut.ip_address || '';
+    document.getElementById('edit-dut-port').value = dut.port || 22;
+    document.getElementById('edit-dut-type').value = dut.device_type || 'VM';
+    document.getElementById('edit-dut-user').value = dut.username || 'admin';
+    document.getElementById('edit-dut-pass').value = ''; // Don't pre-fill password for security
+    document.getElementById('edit-dut-xml-path').value = dut.xml_path || '/home/hp/prajwal/VMs';
+
+    // Show modal as popup overlay
+    document.getElementById('edit-device-modal-overlay').classList.add('active');
+}
+
+function closeEditDeviceModal() {
+    document.getElementById('edit-device-modal-overlay').classList.remove('active');
+    editingDutId = null;
+    document.getElementById('edit-device-form').reset();
+}
+
+async function editDUT(event) {
+    event.preventDefault();
+
+    if (!editingDutId) return;
+
+    const dut = dutsData.find(d => d.id === editingDutId);
+    if (!dut) {
+        toast('Device not found', 'error');
+        return;
+    }
+
+    const newName = document.getElementById('edit-dut-name').value.trim();
+    const newIp = document.getElementById('edit-dut-ip').value.trim();
+    const newPort = parseInt(document.getElementById('edit-dut-port').value) || 22;
+    const newType = document.getElementById('edit-dut-type').value;
+    const newUser = document.getElementById('edit-dut-user').value.trim() || 'admin';
+    const newPass = document.getElementById('edit-dut-pass').value;
+    const newXmlPath = document.getElementById('edit-dut-xml-path').value.trim();
+
+    // Validate device name (alphanumeric only: A-Z, a-z, 0-9)
+    const nameRegex = /^[A-Za-z0-9]+$/;
+    if (!newName) {
+        toast('Device name is required', 'error');
+        return;
+    }
+    if (!nameRegex.test(newName)) {
+        toast('Device name must contain only letters (A-Z, a-z) and numbers (0-9). No special characters or spaces allowed.', 'error');
+        return;
+    }
+
+    // Validate IP address (IPv4 format: xxx.xxx.xxx.xxx)
+    const ipRegex = /^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$/;
+    if (!newIp) {
+        toast('IP address is required', 'error');
+        return;
+    }
+    if (!ipRegex.test(newIp)) {
+        toast('Invalid IP address. Must be valid IPv4 format (e.g., 192.168.1.100). No subnet mask allowed.', 'error');
+        return;
+    }
+
+    // Check what changed
+    const ipChanged = newIp !== dut.ip_address;
+    const userChanged = newUser !== dut.username;
+    const passChanged = newPass !== ''; // If password field is filled, it changed
+    const credsChanged = ipChanged || userChanged || passChanged;
+
+    try {
+        // Prepare update data
+        const updateData = {
+            name: newName,
+            ip_address: newIp,
+            port: newPort,
+            device_type: newType,
+            username: newUser,
+            xml_path: newXmlPath
+        };
+
+        // Include password only if user entered a new one
+        if (passChanged) {
+            updateData.password = newPass;
+        }
+
+        // Send update request
+        const res = await fetch(`${API}/api/duts/${editingDutId}`, {
+            method: 'PUT',
+            headers: { ...getSessionHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(updateData)
+        });
+
+        if (!res.ok) {
+            const data = await res.json();
+            throw new Error(data.detail || 'Failed to update device');
+        }
+
+        const result = await res.json();
+
+        // If credentials changed, validate SSH connection
+        if (credsChanged && (newType === 'DUT' || newType === 'Switch' || newType === 'Router')) {
+            toast(`Device updated. Testing SSH connection to ${newName}...`, 'info');
+            // Fetch interfaces to validate connection and get device capabilities
+            await fetchDUTInterfaces(editingDutId);
+        } else if (credsChanged) {
+            // For VMs, just test basic connectivity
+            try {
+                const pingRes = await fetch(`${API}/api/duts/${editingDutId}/ping`, { method: 'POST' });
+                const pingData = await pingRes.json();
+                if (pingRes.ok) {
+                    toast(`Device ${newName} updated and connection verified ✓`, 'success');
+                } else {
+                    toast(`Device updated but connection failed: ${pingData.detail || 'Cannot connect'}`, 'warning');
+                }
+            } catch (e) {
+                toast(`Device updated but connection test failed: ${e.message}`, 'warning');
+            }
+        } else {
+            toast(`Device ${newName} updated successfully ✓`, 'success');
+        }
+
+        closeEditDeviceModal();
+        await loadDUTs();
+        await loadStats();
+
+    } catch (e) {
+        toast(`Failed to update device: ${e.message}`, 'error');
+    }
 }
 
 // ============================================================
@@ -428,8 +1239,9 @@ function updateSpyStartBtn() {
     if (!btn) return;
     const hasVM = document.getElementById('spy-vm-select')?.value;
     const hasScripts = getSelectedScriptPaths().length > 0;
-    const hasTestbed = document.getElementById('spy-testbed')?.value;
-    btn.disabled = !hasVM || !hasScripts || !hasTestbed;
+    const hasTopology = selectedDUTIds.size > 0 && dutConnections.length > 0;
+    // Enable if: VM selected + scripts selected + topology configured
+    btn.disabled = !hasVM || !hasScripts || !hasTopology;
 }
 
 // ============================================================
@@ -707,6 +1519,16 @@ function renderScriptsDropdown() {
 }
 
 function onScriptCheckboxChange(scriptPath, cb) {
+    // Enhancement 2: If deselecting during execution, show confirmation
+    if (!cb.checked && currentExecId) {
+        // User is trying to deselect a script during execution
+        // Show confirmation dialog
+        cb.checked = true;  // Re-check for now
+        const scriptName = scriptPath.split('/').pop();  // Get filename
+        showCancelConfirmation(scriptName);
+        return;
+    }
+
     if (cb.checked) selectedScriptPaths.add(scriptPath); else selectedScriptPaths.delete(scriptPath);
     updateScriptMultiSelectText();
     const selectAllCb = document.querySelector('#script-dropdown-list .select-all input');
@@ -863,13 +1685,74 @@ function updateQueuePanel(state) {
 // EXECUTION — START / STOP
 // ============================================================
 
+/**
+ * Reset execution state after completion - unselect all scripts and DUTs
+ */
+function resetExecutionState() {
+    // Clear script selections
+    selectedScriptPaths.clear();
+    document.querySelectorAll('.script-item input[type="checkbox"]').forEach(cb => {
+        cb.checked = false;
+    });
+
+    // Clear DUT selections
+    selectedDUTIds.clear();
+    document.querySelectorAll('.dut-card input[type="checkbox"]').forEach(cb => {
+        cb.checked = false;
+    });
+
+    // Update selection count displays
+    const scriptCountEl = document.getElementById('selected-scripts-count');
+    if (scriptCountEl) scriptCountEl.textContent = '0 scripts selected';
+
+    const dutCountEl = document.getElementById('selected-duts-count');
+    if (dutCountEl) dutCountEl.textContent = '0 devices selected';
+
+    // Refresh DUT display to remove 'selected' highlighting
+    loadDUTs();
+
+    // Enhancement 1: Clear auto-hide state for completed scripts
+    completedScripts.clear();
+    Object.keys(scriptHideTimers).forEach(key => clearTimeout(scriptHideTimers[key]));
+    scriptHideTimers = {};
+    showOnlyRunning = false;
+    const btn = document.getElementById('btn-show-only-running');
+    if (btn) {
+        btn.classList.remove('active');
+        btn.title = 'Hide completed scripts';
+        const icon = btn.querySelector('.material-icons-round');
+        if (icon) icon.textContent = 'visibility_off';
+    }
+
+    // Enhancement 2: Hide add scripts button
+    const addScriptsBtn = document.getElementById('btn-add-scripts-exec');
+    if (addScriptsBtn) addScriptsBtn.style.display = 'none';
+
+    console.log('Execution state reset: selections cleared');
+}
+
 async function startExecution() {
     const vmId = parseInt(document.getElementById('spy-vm-select').value);
     const scriptPaths = Array.from(selectedScriptPaths);
-    const testbedFile = document.getElementById('spy-testbed')?.value || '';
     const logLevel = document.getElementById('spy-log-level')?.value || 'info';
     const skipInit = document.getElementById('spy-skip-init')?.checked || false;
+    // Enhancement 3: Capture DUT reservation checkbox
+    const reserveDuts = document.getElementById('reserve-duts-checkbox')?.checked || false;
     const allocInfoEl = document.getElementById('exec-allocation-info');
+
+    // Auto-generate master testbed from topology if devices are selected (silent mode)
+    if (selectedDUTIds.size > 0) {
+        try {
+            await generateMasterTestbed(true); // Silent = true (no modal/toasts)
+        } catch (e) {
+            console.error('Failed to auto-generate master testbed:', e);
+            toast('Failed to generate testbed. Please check topology and try again.', 'error');
+            return;
+        }
+    }
+
+    // Always use master_testbed.yaml (auto-generated from topology)
+    const testbedFile = 'master_testbed.yaml';
 
     let endpoint, body;
 
@@ -889,7 +1772,7 @@ async function startExecution() {
                 try {
                     const r = await fetch(`${API}/api/spytest/script-info`, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: getSessionHeaders(),
                         body: JSON.stringify({ host_id: vmId, script_path: path }),
                     });
                     if (r.ok) { const info = await r.json(); dut_count = info.dut_count || 1; }
@@ -921,13 +1804,15 @@ async function startExecution() {
             testbed: testbedFile,
             available_dut_count: selectedDUTIds.size || 1,  // canvas-selected DUT count drives parallelism
             options: { log_level: logLevel, skip_init_config: skipInit },
+            // Enhancement 3: Pass DUT reservation flag
+            reserve_duts: reserveDuts,
         };
     }
 
     try {
         const res = await fetch(endpoint, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getSessionHeaders(),
             body: JSON.stringify(body),
         });
         if (!res.ok) throw new Error((await res.json()).detail);
@@ -938,8 +1823,14 @@ async function startExecution() {
         renderLogs();
         document.getElementById('btn-start-exec').style.display = 'none';
         document.getElementById('btn-stop-exec').style.display = '';
+        // Enhancement 2: Show "Add Scripts" button during execution
+        const addScriptsBtn = document.getElementById('btn-add-scripts-exec');
+        if (addScriptsBtn) addScriptsBtn.style.display = '';
         const dlBtn = document.getElementById('btn-download-logs');
         if (dlBtn) dlBtn.style.display = '';
+        // Enhancement 1: Show "Show Only Running" button for auto-hide feature
+        const showOnlyBtn = document.getElementById('btn-show-only-running');
+        if (showOnlyBtn) showOnlyBtn.style.display = '';
         // Show queue panel and start polling
         const qPanel = document.getElementById('queue-status-panel');
         if (qPanel) qPanel.style.display = '';
@@ -974,6 +1865,12 @@ function connectWS(execId) {
             toast(`Execution ${data.status} (${data.duration || 0}s)`, data.status === 'completed' ? 'success' : 'error');
             document.getElementById('btn-start-exec').style.display = '';
             document.getElementById('btn-stop-exec').style.display = 'none';
+            // Enhancement 2: Hide "Add Scripts" button after execution
+            const addScriptsBtn = document.getElementById('btn-add-scripts-exec');
+            if (addScriptsBtn) addScriptsBtn.style.display = 'none';
+            // Enhancement 1: Hide "Show Only Running" button after execution
+            const showOnlyBtn = document.getElementById('btn-show-only-running');
+            if (showOnlyBtn) showOnlyBtn.style.display = 'none';
             stopQueuePolling();
             // Update queue badge to completed/failed
             const badge = document.getElementById('queue-exec-badge');
@@ -983,6 +1880,21 @@ function connectWS(execId) {
             }
             loadStats();
             loadExecutions();
+
+            // BUG FIX: Clear live logs from Execute tab after completion
+            // Users should view completed logs in Logs tab, not Execute tab
+            allLogs = [];
+            logStreams = {};
+            const logContainer = document.getElementById('exec-log-container');
+            if (logContainer) {
+                logContainer.innerHTML = '<div class="log-placeholder"><span class="material-icons-round">terminal</span><p>Logs will appear here when an execution starts...</p></div>';
+            }
+            // Hide download button
+            const downloadBtn = document.getElementById('btn-download-logs');
+            if (downloadBtn) downloadBtn.style.display = 'none';
+
+            // Reset UI to normal state: unselect scripts and DUTs
+            resetExecutionState();
             return;
         }
         // Skip QUEUE log entries from appearing in log panes (they're handled by the queue panel)
@@ -999,6 +1911,9 @@ function connectWS(execId) {
 // ============================================================
 
 let logStreams = {};  // {scriptName: DOM element}
+let showOnlyRunning = false;  // Toggle for "Show Only Running" button
+let completedScripts = new Set();  // Track completed script names
+let scriptHideTimers = {};  // Auto-hide timers per script
 
 function renderLogs() {
     const container = document.getElementById('exec-log-container');
@@ -1031,10 +1946,22 @@ function appendLogEntry(log) {
     const source = log.dut_name || 'SYSTEM';
     const wrapper = _ensurePaneWrapper();
 
+    // Detect script completion messages and mark as completed
+    const msg = (log.message || '').toLowerCase();
+    if ((msg.includes('passed') || msg.includes('failed') || msg.includes('completed')) &&
+        !msg.includes('waiting')) {
+        if (!completedScripts.has(source)) {
+            completedScripts.add(source);
+            // Set auto-hide timer for 5 minutes (300000 ms)
+            setAutoHideScriptLog(source, 300000);
+        }
+    }
+
     if (!logStreams[source]) {
         const safeId = 'log-stream-' + source.replace(/[^a-zA-Z0-9]/g, '_');
         const pane = document.createElement('div');
         pane.className = 'script-log-pane';
+        pane.dataset.scriptName = source;
 
         pane.innerHTML = `
             <div class="script-pane-header" onclick="openLogPopup('${esc(source)}')" title="Click to expand">
@@ -1051,6 +1978,8 @@ function appendLogEntry(log) {
     const target = logStreams[source];
     if (target) {
         target.insertAdjacentHTML('beforeend', logHTML(log));
+        // Auto-scroll only the individual pane (not the main container)
+        // This allows each script section to scroll independently
         target.scrollTop = target.scrollHeight;
     }
 }
@@ -1080,13 +2009,294 @@ function downloadLogs() {
     a.click();
 }
 
+// Toggle "Show Only Running" filter for log panes
+function toggleShowOnlyRunning() {
+    showOnlyRunning = !showOnlyRunning;
+    const btn = document.getElementById('btn-show-only-running');
+    if (btn) {
+        btn.classList.toggle('active');
+        btn.title = showOnlyRunning ? 'Show all scripts' : 'Hide completed scripts';
+        const icon = btn.querySelector('.material-icons-round');
+        if (icon) icon.textContent = showOnlyRunning ? 'visibility' : 'visibility_off';
+    }
+
+    // Update all log panes visibility
+    document.querySelectorAll('.script-log-pane').forEach(pane => {
+        const scriptName = pane.dataset.scriptName;
+        if (showOnlyRunning && completedScripts.has(scriptName)) {
+            pane.classList.add('log-pane-hidden');
+        } else {
+            pane.classList.remove('log-pane-hidden');
+        }
+    });
+}
+
+// Auto-hide a completed script's logs after delay (in milliseconds)
+function setAutoHideScriptLog(scriptName, delay) {
+    // Clear any existing timer for this script
+    if (scriptHideTimers[scriptName]) {
+        clearTimeout(scriptHideTimers[scriptName]);
+    }
+
+    // Set new timer to hide after delay
+    scriptHideTimers[scriptName] = setTimeout(() => {
+        if (showOnlyRunning) {
+            const pane = document.querySelector(`.script-log-pane[data-script-name="${scriptName}"]`);
+            if (pane) {
+                pane.classList.add('log-pane-hidden');
+            }
+        }
+        delete scriptHideTimers[scriptName];
+    }, delay);
+}
+
+// ============================================================
+// ENHANCEMENT 2: DYNAMIC BATCH ADDITION & SCRIPT CANCELLATION
+// ============================================================
+
+let pendingCancelScript = null;  // Track which script user is trying to cancel
+
+function showCancelConfirmation(scriptName) {
+    // Show cancel confirmation dialog for a script
+    pendingCancelScript = scriptName;
+    const modal = document.getElementById('cancel-script-confirmation-modal');
+    const nameDisplay = document.getElementById('cancel-script-name-display');
+    if (modal && nameDisplay) {
+        nameDisplay.textContent = scriptName;
+        modal.style.display = 'flex';
+        // Focus the NO button (default)
+        const noBtn = document.getElementById('btn-cancel-no');
+        if (noBtn) noBtn.focus();
+    }
+}
+
+function closeCancelConfirmation() {
+    // Close the cancel confirmation dialog
+    const modal = document.getElementById('cancel-script-confirmation-modal');
+    if (modal) modal.style.display = 'none';
+    pendingCancelScript = null;
+}
+
+async function confirmCancelScript() {
+    // Confirm and execute script cancellation
+    if (!pendingCancelScript || !currentExecId) {
+        toast('Error: Script or execution ID missing', 'error');
+        closeCancelConfirmation();
+        return;
+    }
+
+    try {
+        const res = await fetch(`${API}/api/executions/${currentExecId}/cancel-script`, {
+            method: 'POST',
+            headers: getSessionHeaders(),
+            body: JSON.stringify({ script_name: pendingCancelScript }),
+        });
+
+        if (!res.ok) {
+            const err = await res.json();
+            toast(`Failed to cancel: ${err.detail}`, 'error');
+            closeCancelConfirmation();
+            return;
+        }
+
+        // Remove checkbox for cancelled script
+        const checkbox = document.querySelector(`.script-item input[data-script-name="${pendingCancelScript}"]`);
+        if (checkbox) checkbox.checked = false;
+
+        // Hide the log pane for cancelled script
+        const logPane = document.querySelector(`.script-log-pane[data-script-name="${pendingCancelScript}"]`);
+        if (logPane) logPane.classList.add('log-pane-hidden');
+
+        toast(`Script "${pendingCancelScript}" cancelled`, 'success');
+        closeCancelConfirmation();
+    } catch (e) {
+        toast(`Error cancelling script: ${e.message}`, 'error');
+        closeCancelConfirmation();
+    }
+}
+
+async function addScriptsDuringExecution() {
+    // Open modal to add new scripts during execution
+    if (!currentExecId) {
+        toast('No active execution', 'error');
+        return;
+    }
+
+    // Create modal to select scripts
+    const allScripts = Array.from(document.querySelectorAll('.script-item'));
+    if (!allScripts.length) {
+        toast('No scripts available', 'error');
+        return;
+    }
+
+    // Build script selection UI
+    const scriptOptions = allScripts.map(item => {
+        const checkbox = item.querySelector('input[type="checkbox"]');
+        const label = item.querySelector('label');
+        const path = checkbox?.getAttribute('data-script-name') || '';
+        return {
+            path,
+            name: label?.textContent || path,
+            el: item
+        };
+    });
+
+    // Show modal with unselected scripts
+    const modal = document.getElementById('modal-overlay');
+    const title = document.getElementById('modal-title');
+    const body = document.getElementById('modal-body');
+
+    title.textContent = 'Add Scripts to Running Execution';
+    body.innerHTML = `
+        <div style="max-height: 400px; overflow-y: auto;">
+            <p style="margin-bottom: 12px; font-size: 12px; color: var(--text-muted);">
+                Select scripts to add to the current execution queue:
+            </p>
+            <div id="add-scripts-selection">
+                ${scriptOptions.map(s => `
+                    <label style="display: flex; align-items: center; padding: 8px; cursor: pointer; border-radius: 6px; transition: background 0.1s;" onmouseover="this.style.background='var(--bg-hover)'" onmouseout="this.style.background=''">
+                        <input type="checkbox" data-add-script-path="${s.path}" style="margin-right: 8px;">
+                        <span style="font-family: var(--mono); font-size: 12px;">${s.name}</span>
+                    </label>
+                `).join('')}
+            </div>
+        </div>
+    `;
+
+    const footer = document.querySelector('.modal-footer');
+    footer.innerHTML = `
+        <button class="btn outline" onclick="closeModal()">Cancel</button>
+        <button class="btn primary" onclick="submitAddScripts()">Add Selected Scripts</button>
+    `;
+
+    modal.style.display = 'flex';
+}
+
+async function submitAddScripts() {
+    // Submit selected scripts to be added to execution
+    if (!currentExecId) {
+        toast('No active execution', 'error');
+        return;
+    }
+
+    // Get selected scripts
+    const selected = Array.from(document.querySelectorAll('input[data-add-script-path]:checked'));
+    if (!selected.length) {
+        toast('Please select at least one script', 'error');
+        return;
+    }
+
+    const scripts = selected.map(checkbox => ({
+        path: checkbox.getAttribute('data-add-script-path'),
+        dut_count: 1,  // Default, will be analyzed by backend
+        min_topology: []
+    }));
+
+    try {
+        const res = await fetch(`${API}/api/executions/${currentExecId}/add-scripts`, {
+            method: 'POST',
+            headers: getSessionHeaders(),
+            body: JSON.stringify({ scripts }),
+        });
+
+        if (!res.ok) {
+            const err = await res.json();
+            toast(`Failed to add scripts: ${err.detail}`, 'error');
+            return;
+        }
+
+        const data = await res.json();
+        toast(`Added ${data.added} script(s) to queue`, 'success');
+        closeModal();
+
+        // Re-render scripts to show queued status
+        loadScripts();
+    } catch (e) {
+        toast(`Error adding scripts: ${e.message}`, 'error');
+    }
+}
+
+// ============================================================
+// ENHANCEMENT 3: DUT RESERVATION SYSTEM
+// ============================================================
+
+async function releaseReservedDuts() {
+    // Release all DUTs reserved by current user
+    try {
+        // Get list of reservations
+        const res = await fetch(`${API}/api/duts/reservations`, {
+            headers: getSessionHeaders()
+        });
+
+        if (!res.ok) {
+            toast('Failed to fetch reservations', 'error');
+            return;
+        }
+
+        const data = await res.json();
+        if (data.total === 0) {
+            toast('No reserved DUTs to release', 'info');
+            return;
+        }
+
+        // Release each reserved DUT
+        let released = 0;
+        for (const reservation of data.reservations) {
+            const releaseRes = await fetch(`${API}/api/duts/${reservation.dut_id}/reserve`, {
+                method: 'POST',
+                headers: getSessionHeaders(),
+                body: JSON.stringify({ reserve: false }),
+            });
+
+            if (releaseRes.ok) {
+                released++;
+            }
+        }
+
+        toast(`Released ${released} DUT(s)`, 'success');
+
+        // Hide release button if no more reservations
+        const btn = document.getElementById('btn-release-duts');
+        if (btn && released === data.total) {
+            btn.style.display = 'none';
+        }
+    } catch (e) {
+        toast(`Error releasing DUTs: ${e.message}`, 'error');
+    }
+}
+
+async function checkAndShowReservedDuts() {
+    // Check if user has reserved DUTs and show release button
+    try {
+        const res = await fetch(`${API}/api/duts/reservations`, {
+            headers: getSessionHeaders()
+        });
+
+        if (!res.ok) return;
+
+        const data = await res.json();
+        const btn = document.getElementById('btn-release-duts');
+
+        if (btn && data.total > 0) {
+            btn.style.display = '';
+            btn.textContent = `🔒 Release ${data.total} DUT(s)`;
+        } else if (btn) {
+            btn.style.display = 'none';
+        }
+    } catch (e) {
+        console.log('Could not fetch reservations:', e);
+    }
+}
+
 // ============================================================
 // EXECUTION HISTORY
 // ============================================================
 
 async function loadExecutions() {
     try {
-        const res = await fetch(`${API}/api/executions`);
+        const res = await fetch(`${API}/api/executions`, {
+            headers: getSessionHeaders()
+        });
         const execs = await res.json();
         const tbody = document.getElementById('exec-history-tbody');
         if (!execs.length) { tbody.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No executions yet.</td></tr>'; return; }
@@ -1113,72 +2323,481 @@ async function loadExecutions() {
     } catch { }
 }
 
+// Store current viewing execution ID for delete operations
+let currentViewingExecId = null;
+
 async function viewExecLogs(execId) {
     try {
+        currentViewingExecId = execId;
         const res = await fetch(`${API}/api/executions/${execId}/logs?limit=500`);
         const logs = await res.json();
-        const card = document.getElementById('log-detail-card');
-        card.hidden = false;
+
+        // Show modal instead of inline card
+        const overlay = document.getElementById('log-detail-modal-overlay');
+        overlay.classList.add('active');
+
         document.getElementById('log-detail-title').textContent = `#${execId}`;
         const container = document.getElementById('log-detail-container');
-        if (!logs.length) { container.innerHTML = '<p class="muted">No logs for this execution.</p>'; return; }
+        if (!logs.length) {
+            container.innerHTML = '<p class="muted" style="padding:20px;">No logs for this execution.</p>';
+            return;
+        }
         container.innerHTML = logs.map(logHTML).join('');
-        card.scrollIntoView({ behavior: 'smooth' });
-    } catch { toast('Failed to load logs', 'error'); }
+    } catch (e) {
+        toast('Failed to load logs', 'error');
+        console.error('Error loading logs:', e);
+    }
+}
+
+/**
+ * Close the log viewer modal
+ */
+function closeLogViewer() {
+    const overlay = document.getElementById('log-detail-modal-overlay');
+    overlay.classList.remove('active');
+    currentViewingExecId = null;
+}
+
+/**
+ * Delete logs with confirmation dialog asking what to delete
+ */
+async function deleteLogs() {
+    if (!currentViewingExecId) {
+        toast('No logs selected', 'warning');
+        return;
+    }
+
+    // First confirmation: confirm delete action
+    const confirmDelete = confirm(`⚠️ Delete all logs for execution #${currentViewingExecId}?\n\nThis cannot be undone.`);
+    if (!confirmDelete) return;
+
+    // Second confirmation: ask what to delete (all or specific logs)
+    const options = {
+        'all': 'Delete ALL logs for this execution',
+        'current_session': 'Delete logs from current session only',
+        'cancel': 'Cancel (do not delete)'
+    };
+
+    // Create choice dialog
+    const choice = await showDeleteChoiceDialog(
+        `What logs do you want to delete for execution #${currentViewingExecId}?`,
+        options
+    );
+
+    if (choice === 'cancel' || !choice) {
+        toast('Delete cancelled', 'info');
+        return;
+    }
+
+    // Proceed with deletion
+    try {
+        const res = await fetch(`${API}/api/executions/${currentViewingExecId}/logs`, {
+            method: 'DELETE',
+            headers: getSessionHeaders(),
+            body: JSON.stringify({ scope: choice })
+        });
+
+        if (res.ok) {
+            toast(`✓ Logs deleted (scope: ${choice})`, 'success');
+            closeLogViewer();
+            // Refresh execution history
+            loadExecutions();
+        } else {
+            const err = await res.json();
+            toast(`Failed to delete logs: ${err.detail}`, 'error');
+        }
+    } catch (e) {
+        toast(`Error deleting logs: ${e.message}`, 'error');
+        console.error('Delete logs error:', e);
+    }
+}
+
+/**
+ * Show custom delete choice dialog
+ * Returns: 'all', 'current_session', or null if cancelled
+ */
+async function showDeleteChoiceDialog(message, options) {
+    return new Promise((resolve) => {
+        // Create modal overlay
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay active';
+        overlay.id = 'delete-choice-overlay';
+
+        const modal = document.createElement('div');
+        modal.className = 'modal';
+        modal.style.maxWidth = '500px';
+
+        modal.innerHTML = `
+            <div class="modal-header">
+                <h3><span class="material-icons-round">delete_forever</span> Delete Logs</h3>
+                <button class="btn icon" onclick="document.getElementById('delete-choice-overlay').remove()" title="Close">
+                    <span class="material-icons-round">close</span>
+                </button>
+            </div>
+            <div class="modal-body">
+                <p style="margin-bottom: 16px; color: var(--text-secondary);">${message}</p>
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                    <button class="btn outline" onclick="deleteChoiceClick('all')" style="justify-content: flex-start;">
+                        <span class="material-icons-round">delete_sweep</span> ${options['all']}
+                    </button>
+                    <button class="btn outline" onclick="deleteChoiceClick('current_session')" style="justify-content: flex-start;">
+                        <span class="material-icons-round">filter_alt</span> ${options['current_session']}
+                    </button>
+                    <button class="btn outline" onclick="deleteChoiceClick('cancel')" style="justify-content: flex-start;">
+                        <span class="material-icons-round">close</span> ${options['cancel']}
+                    </button>
+                </div>
+            </div>
+        `;
+
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        // Close on backdrop click
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) {
+                overlay.remove();
+                resolve(null);
+            }
+        });
+
+        // Store resolve function globally to be called from buttons
+        window.deleteChoiceClick = (choice) => {
+            document.getElementById('delete-choice-overlay')?.remove();
+            resolve(choice);
+        };
+    });
 }
 
 // ============================================================
-// TERMINAL
+// TERMINAL - PTY Mode with xterm.js
 // ============================================================
 
 function renderTermDUTList() {
     const sel = document.getElementById('term-dut');
     const current = sel.value;
+    // Filter out telnet devices - Terminal tab only supports SSH
+    const sshDevices = dutsData.filter(d => d.connection_type !== 'telnet');
     sel.innerHTML = '<option value="">-- Select Device --</option>' +
-        dutsData.map(d => `<option value="${d.id}" ${d.id == current ? 'selected' : ''}>${esc(d.name)} (${esc(d.ip_address)})</option>`).join('');
+        sshDevices.map(d => `<option value="${d.id}" ${d.id == current ? 'selected' : ''}>${esc(d.name)} (${esc(d.ip_address)})</option>`).join('');
 }
 
-async function termExec() {
-    const dutId = document.getElementById('term-dut').value;
-    const cmd = document.getElementById('term-cmd').value.trim();
-    if (!dutId) { toast('Select a device first', 'error'); return; }
-    if (!cmd) return;
+/**
+ * Load xterm.js library dynamically from CDN
+ * Loads core library, fit addon, and CSS
+ */
+async function loadXtermLibrary() {
+    if (xtermLoaded) return; // Already loaded
 
-    const el = document.getElementById('term-output');
-    if (el.querySelector('.log-placeholder')) el.innerHTML = '';
+    return new Promise((resolve, reject) => {
+        // Load xterm.js CSS
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css';
+        document.head.appendChild(link);
 
-    const dut = dutsData.find(d => d.id == dutId);
-    el.insertAdjacentHTML('beforeend', `<div class="term-block"><div class="term-prompt">${esc(dut?.name || 'device')}:~$ ${esc(cmd)}</div><div class="term-info">Executing...</div></div>`);
-    el.scrollTop = el.scrollHeight;
-    document.getElementById('term-cmd').value = '';
+        // Load xterm.js core library
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js';
+        script.onload = () => {
+            // Load fit addon for auto-resize
+            const fitScript = document.createElement('script');
+            fitScript.src = 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js';
+            fitScript.onload = () => {
+                xtermLoaded = true;
+                console.log('[PTY] xterm.js library loaded successfully');
+                resolve();
+            };
+            fitScript.onerror = () => {
+                console.error('[PTY] Failed to load xterm-addon-fit');
+                reject(new Error('Failed to load xterm-addon-fit'));
+            };
+            document.head.appendChild(fitScript);
+        };
+        script.onerror = () => {
+            console.error('[PTY] Failed to load xterm.js');
+            reject(new Error('Failed to load xterm.js'));
+        };
+        document.head.appendChild(script);
+    });
+}
 
+/**
+ * Initialize PTY terminal with xterm.js for a specific device
+ * Creates WebSocket connection for bidirectional terminal streaming
+ */
+async function initPTYTerminal(dutId) {
+    console.log(`[PTY] Initializing terminal for DUT ${dutId}`);
+
+    // Ensure xterm.js library is loaded
     try {
-        const res = await fetch(`${API}/api/duts/${dutId}/execute`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ command: cmd }),
-        });
-        const data = await res.json();
-        // Remove "Executing..." message
-        const blocks = el.querySelectorAll('.term-block');
-        const last = blocks[blocks.length - 1];
-        const infoEl = last.querySelector('.term-info');
-        if (infoEl) infoEl.remove();
-
-        if (res.ok) {
-            if (data.stdout) last.insertAdjacentHTML('beforeend', `<div class="term-output-text">${esc(data.stdout)}</div>`);
-            if (data.stderr) last.insertAdjacentHTML('beforeend', `<div class="term-error">${esc(data.stderr)}</div>`);
-            if (!data.stdout && !data.stderr) last.insertAdjacentHTML('beforeend', `<div class="term-info">(no output)</div>`);
-            if (data.exit_code !== 0) last.insertAdjacentHTML('beforeend', `<div class="term-error">Exit code: ${data.exit_code}</div>`);
-        } else {
-            last.insertAdjacentHTML('beforeend', `<div class="term-error">Error: ${data.detail || 'Connection failed'}</div>`);
-        }
-        el.scrollTop = el.scrollHeight;
+        await loadXtermLibrary();
     } catch (e) {
-        const blocks = el.querySelectorAll('.term-block');
-        const last = blocks[blocks.length - 1];
-        last.innerHTML += `<div class="term-error">Network error: ${e.message}</div>`;
+        console.error('[PTY] Failed to load xterm.js library:', e);
+        toast('Failed to load terminal library', 'error');
+        return;
     }
+
+    // Clean up existing terminal and connection
+    if (terminalSocket) {
+        console.log('[PTY] Closing existing WebSocket connection');
+        terminalSocket.close();
+        terminalSocket = null;
+    }
+    if (terminalInstance) {
+        console.log('[PTY] Disposing existing terminal instance');
+        terminalInstance.dispose();
+        terminalInstance = null;
+    }
+
+    // Get container element
+    const container = document.getElementById('term-container');
+    if (!container) {
+        console.error('[PTY] Terminal container not found');
+        toast('Terminal container not found', 'error');
+        return;
+    }
+
+    // Create xterm.js Terminal instance
+    const term = new Terminal({
+        cursorBlink: true,
+        fontSize: 14,
+        fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", Menlo, Monaco, "Courier New", monospace',
+        theme: {
+            background: '#1e1e1e',
+            foreground: '#d4d4d4',
+            cursor: '#ffffff',
+            cursorAccent: '#000000',
+            selection: '#264f78',
+            black: '#000000',
+            red: '#cd3131',
+            green: '#0dbc79',
+            yellow: '#e5e510',
+            blue: '#2472c8',
+            magenta: '#bc3fbc',
+            cyan: '#11a8cd',
+            white: '#e5e5e5',
+            brightBlack: '#666666',
+            brightRed: '#f14c4c',
+            brightGreen: '#23d18b',
+            brightYellow: '#f5f543',
+            brightBlue: '#3b8eea',
+            brightMagenta: '#d670d6',
+            brightCyan: '#29b8db',
+            brightWhite: '#e5e5e5'
+        },
+        cols: 80,
+        rows: 24,
+        scrollback: 10000,  // Keep last 10,000 lines
+        scrollOnUserInput: true,  // Auto-scroll to cursor when typing
+        allowTransparency: false
+    });
+
+    // Add fit addon for auto-resize
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+
+    // Mount terminal to DOM
+    container.innerHTML = '<div class="term-info" style="padding: 10px;">Connecting to device...</div>';
+    setTimeout(() => {
+        container.innerHTML = '';  // Clear loading message
+        term.open(container);
+        fitAddon.fit();
+        console.log(`[PTY] Terminal mounted - size: ${term.cols}x${term.rows}`);
+
+        // Prevent terminal from scrolling the page
+        const xtermViewport = container.querySelector('.xterm-viewport');
+        if (xtermViewport) {
+            xtermViewport.addEventListener('scroll', (e) => {
+                e.stopPropagation();
+            }, { passive: true });
+        }
+
+        // Prevent wheel events from bubbling to page
+        container.addEventListener('wheel', (e) => {
+            e.stopPropagation();
+        }, { passive: true });
+    }, 100);
+
+    // Establish WebSocket connection with session authentication
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const sessionId = localStorage.getItem('eka-session-id');
+    const wsUrl = `${wsProtocol}//${window.location.host}/api/terminal/ws/${dutId}?session_id=${sessionId}`;
+    console.log(`[PTY] Connecting to ${wsUrl}`);
+
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+
+    // Track current DUT and reset buffer on new connection
+    terminalCurrentDutId = dutId;
+    terminalOutputBuffer = [];
+    terminalIsReconnecting = false;
+
+    // WebSocket event handlers
+    ws.onopen = () => {
+        console.log('[PTY] WebSocket connected');
+        terminalIsReconnecting = false;
+        term.focus();
+        term.write('\x1b[32m✓ Connected to PTY terminal\x1b[0m\r\n');
+        term.write('\x1b[33mSupports: vi, nano, top, htop, screen, tmux, and all interactive applications\x1b[0m\r\n\r\n');
+    };
+
+    ws.onmessage = (event) => {
+        // Receive binary data from SSH PTY and render in terminal
+        if (event.data instanceof ArrayBuffer) {
+            const data = new Uint8Array(event.data);
+            term.write(data);
+            // Store output in buffer for reconnection
+            terminalOutputBuffer.push(data);
+            // Auto-scroll to show cursor/prompt
+            const viewport = container.querySelector('.xterm-viewport');
+            if (viewport) {
+                viewport.scrollTop = viewport.scrollHeight;
+            }
+        } else if (typeof event.data === 'string') {
+            // Handle JSON messages (status updates, errors, heartbeat, etc.)
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'heartbeat') {
+                    // Silently handle heartbeat - keep connection alive
+                    console.debug('[PTY] Heartbeat received');
+                } else if (msg.error) {
+                    term.write(`\r\n\x1b[31mError: ${msg.error}\x1b[0m\r\n`);
+                    const viewport = container.querySelector('.xterm-viewport');
+                    if (viewport) {
+                        viewport.scrollTop = viewport.scrollHeight;
+                    }
+                } else if (msg.status === 'connecting') {
+                    // Show connection status message
+                    term.write(`\x1b[33m${msg.message}\x1b[0m\r\n`);
+                    const viewport = container.querySelector('.xterm-viewport');
+                    if (viewport) {
+                        viewport.scrollTop = viewport.scrollHeight;
+                    }
+                }
+            } catch (e) {
+                // Not JSON, write as text
+                term.write(event.data);
+                const viewport = container.querySelector('.xterm-viewport');
+                if (viewport) {
+                    viewport.scrollTop = viewport.scrollHeight;
+                }
+            }
+        }
+    };
+
+    ws.onerror = (error) => {
+        console.error('[PTY] WebSocket error:', error);
+        term.write('\r\n\x1b[31m✗ Connection error\x1b[0m\r\n');
+        toast('Terminal connection error', 'error');
+    };
+
+    ws.onclose = (event) => {
+        console.log('[PTY] WebSocket closed:', event.code, event.reason);
+        term.write('\r\n\x1b[33m[Terminal session ended - attempting to reconnect...]\x1b[0m\r\n');
+
+        // Auto-reconnect if user is actively viewing Terminal tab
+        if (!document.hidden && terminalCurrentDutId && !terminalIsReconnecting) {
+            terminalIsReconnecting = true;
+            setTimeout(() => {
+                console.log(`[PTY] Auto-reconnecting to DUT ${terminalCurrentDutId}...`);
+                initPTYTerminal(terminalCurrentDutId).catch(e => {
+                    console.error('[PTY] Auto-reconnect failed:', e);
+                    term.write('\x1b[31mReconnection failed. Select device to try again.\x1b[0m\r\n');
+                });
+            }, 1000);  // Wait 1 second before attempting reconnect
+        }
+    };
+
+    // Send keyboard input from terminal to SSH via WebSocket
+    term.onData((data) => {
+        if (ws.readyState === WebSocket.OPEN) {
+            // Convert string to Uint8Array and send as binary
+            const encoder = new TextEncoder();
+            ws.send(encoder.encode(data));
+        }
+    });
+
+    // Handle terminal resize events
+    term.onResize(({ cols, rows }) => {
+        console.log(`[PTY] Terminal resized to ${cols}x${rows}`);
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'resize',
+                cols: cols,
+                rows: rows
+            }));
+        }
+    });
+
+    // Auto-resize terminal when window size changes
+    const resizeObserver = new ResizeObserver(() => {
+        if (terminalInstance) {
+            try {
+                fitAddon.fit();
+            } catch (e) {
+                // Ignore resize errors during cleanup
+            }
+        }
+    });
+    resizeObserver.observe(container);
+
+    // Store globally for cleanup
+    terminalInstance = term;
+    terminalSocket = ws;
+
+    // Add Page Visibility API detection for tab focus (one-time setup)
+    if (!terminalHeartbeatInterval) {
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && terminalCurrentDutId && terminalIsReconnecting && terminalSocket?.readyState !== WebSocket.OPEN) {
+                // Tab became visible and connection was lost - try to reconnect
+                console.log('[PTY] Tab became visible - checking connection...');
+                if (terminalSocket?.readyState !== WebSocket.OPEN) {
+                    initPTYTerminal(terminalCurrentDutId).catch(e => {
+                        console.error('[PTY] Visibility-triggered reconnect failed:', e);
+                    });
+                }
+            }
+        });
+    }
+
+    console.log('[PTY] Terminal initialization complete');
+}
+
+/**
+ * Called when device selection changes in terminal dropdown
+ */
+async function termDeviceChanged() {
+    const dutSelect = document.getElementById('term-dut');
+    const dutId = dutSelect ? dutSelect.value : null;
+    const container = document.getElementById('term-container');
+
+    console.log('[PTY] Device changed - DUT ID:', dutId);
+
+    if (!dutId) {
+        // No device selected - clean up and show placeholder
+        if (terminalSocket) {
+            terminalSocket.close();
+            terminalSocket = null;
+        }
+        if (terminalInstance) {
+            terminalInstance.dispose();
+            terminalInstance = null;
+        }
+
+        if (container) {
+            container.innerHTML = `
+                <div class="log-placeholder">
+                    <span class="material-icons-round">terminal</span>
+                    <p>Select a device to open PTY terminal session.</p>
+                    <p style="font-size: 12px; color: #888;">Supports vi, nano, top, htop, screen, tmux</p>
+                </div>`;
+        }
+        return;
+    }
+
+    // Initialize PTY terminal for selected device
+    await initPTYTerminal(dutId);
 }
 
 // ============================================================
@@ -1190,6 +2809,7 @@ function openModal(title, bodyHTML) {
     document.getElementById('modal-body').innerHTML = bodyHTML;
     document.getElementById('modal-overlay').classList.add('active');
 }
+function showModal(title, bodyHTML) { openModal(title, bodyHTML); } // Alias for openModal
 function closeModal() { document.getElementById('modal-overlay').classList.remove('active'); }
 
 // ============================================================
@@ -1697,6 +3317,73 @@ function toggleCableMode() {
     // Switching mode: redraw canvas with / without port icons
     renderTopologyCanvas();
     toast(_cableModeActive ? '🔌 Cable mode ON — click a port chip to start a cable' : '✖ Cable mode OFF', 'info');
+}
+
+/**
+ * Generate master testbed YAML from ALL canvas DUTs and topology connections
+ * @param {boolean} silent - If true, don't show modal/toasts (for auto-generation)
+ */
+async function generateMasterTestbed(silent = false) {
+    const vmId = document.getElementById('spy-vm-select').value;
+    if (!vmId) {
+        if (!silent) toast('Please select a VM host first', 'error');
+        throw new Error('No VM selected');
+    }
+
+    if (selectedDUTIds.size === 0) {
+        if (!silent) toast('No DUTs in topology. Add devices first.', 'warning');
+        throw new Error('No DUTs selected');
+    }
+
+    if (dutConnections.length === 0) {
+        if (!silent) toast('No connections found. Create connections between DUTs first.', 'warning');
+        throw new Error('No connections');
+    }
+
+    try {
+        const res = await fetch(`${API}/api/topology/generate-master-testbed`, {
+            method: 'POST',
+            headers: getSessionHeaders(),
+            body: JSON.stringify({
+                host_id: parseInt(vmId),
+                master_filename: 'master_testbed.yaml'
+            })
+        });
+
+        if (!res.ok) {
+            const err = await res.json();
+            if (!silent) toast(`Failed to generate master testbed: ${err.detail || 'Unknown error'}`, 'error');
+            throw new Error(err.detail || 'Failed to generate testbed');
+        }
+
+        const data = await res.json();
+        if (!silent) {
+            toast(`Master testbed generated: ${data.device_count} devices, ${data.connection_count} connections`, 'success');
+            console.log('Master testbed generated:', data);
+
+            // Show success modal with details
+            showModal(
+                'Master Testbed Generated',
+                `<div style="text-align:left">
+                    <p><strong>Testbed Path:</strong> ${data.master_testbed_path}</p>
+                    <p><strong>Devices:</strong> ${data.device_count}</p>
+                    <p><strong>Connections:</strong> ${data.connection_count}</p>
+                    <p><strong>Device Names:</strong> ${data.devices.join(', ')}</p>
+                    <p style="margin-top:12px;padding:8px;background:var(--bg-tertiary);border-radius:4px;font-size:11px">
+                        The master testbed has been saved to the SPyTest testbeds directory on the VM host.
+                        You can now use this testbed for script execution.
+                    </p>
+                </div>`
+            );
+        }
+        return data;
+    } catch (error) {
+        if (!silent) {
+            toast(`Error generating master testbed: ${error.message}`, 'error');
+            console.error('Master testbed generation error:', error);
+        }
+        throw error;
+    }
 }
 
 /**
@@ -2315,8 +4002,68 @@ let selectedVSNames = new Set();
 function renderVSHostList() {
     const sel = document.getElementById('vs-host');
     const current = sel.value;
-    sel.innerHTML = '<option value="">-- Select Host Device --</option>' +
-        dutsData.map(d => `<option value="${d.id}" ${d.id == current ? 'selected' : ''}>${esc(d.name)} (${esc(d.ip_address)})</option>`).join('');
+    sel.innerHTML = '<option value="">-- Select Host Device --</option>';
+
+    // Filter: Only show VM, Switch, and Router (exclude DUT devices)
+    const vsHostDevices = dutsData.filter(d =>
+        d.device_type === 'VM' || d.device_type === 'Switch' || d.device_type === 'Router'
+    );
+
+    vsHostDevices.forEach(d => {
+        const option = document.createElement('option');
+        option.value = d.id;
+
+        // Status indicator (colored dot)
+        const statusColor = d.status === 'online' ? '#10b981' :
+                           d.status === 'offline' ? '#ef4444' : '#f59e0b';
+        const statusDot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};margin-right:6px;vertical-align:middle"></span>`;
+
+        // Show status text for non-online devices
+        const statusText = d.status !== 'online' ? ` [${d.status || 'unknown'}]` : '';
+
+        option.innerHTML = `${statusDot}${esc(d.name)} (${esc(d.ip_address)})${statusText}`;
+        option.selected = d.id == current;
+
+        // Disable devices that are not online
+        if (d.status !== 'online') {
+            option.disabled = true;
+            option.style.color = '#6b7280';
+        }
+
+        sel.appendChild(option);
+    });
+}
+
+function renderVSSourceServerList() {
+    const sel = document.getElementById('vs-source-server');
+    if (!sel) return; // Element may not exist on all pages
+    const current = sel.value;
+    sel.innerHTML = '<option value="">-- Use Host Device (Local Copy) --</option>';
+
+    // Show all devices (VM, Switch, Router, DUT) as potential source servers
+    dutsData.forEach(d => {
+        const option = document.createElement('option');
+        option.value = d.id;
+
+        // Status indicator (colored dot)
+        const statusColor = d.status === 'online' ? '#10b981' :
+                           d.status === 'offline' ? '#ef4444' : '#f59e0b';
+        const statusDot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};margin-right:6px;vertical-align:middle"></span>`;
+
+        // Show status text for non-online devices
+        const statusText = d.status !== 'online' ? ` [${d.status || 'unknown'}]` : '';
+
+        option.innerHTML = `${statusDot}${esc(d.name)} (${esc(d.ip_address)})${statusText}`;
+        option.selected = d.id == current;
+
+        // Disable devices that are not online
+        if (d.status !== 'online') {
+            option.disabled = true;
+            option.style.color = '#6b7280';
+        }
+
+        sel.appendChild(option);
+    });
 }
 
 function onVSHostChange() {
@@ -2339,6 +4086,31 @@ function refreshVSList() {
 async function loadVSList(dutId) {
     const el = document.getElementById('vs-vm-list');
     el.innerHTML = '<p class="muted" style="padding:16px;text-align:center"><span class="material-icons-round spin" style="vertical-align:middle">sync</span> Loading VMs...</p>';
+
+    // Check device status first
+    await loadDUTs();  // Refresh device list to get latest status
+    const dut = dutsData.find(d => d.id == dutId);
+
+    if (!dut) {
+        el.innerHTML = '<p class="muted" style="padding:16px;text-align:center;color:var(--red)">Device not found</p>';
+        toast('Device not found', 'error');
+        return;
+    }
+
+    if (dut.status !== 'online') {
+        const statusColor = dut.status === 'offline' ? 'var(--red)' : 'var(--orange)';
+        el.innerHTML = `<div style="padding:24px;text-align:center">
+            <span class="material-icons-round" style="font-size:48px;color:${statusColor};opacity:0.5">cloud_off</span>
+            <p style="margin-top:12px;font-size:1.1rem;font-weight:600;color:${statusColor}">Device ${dut.status || 'Not Online'}</p>
+            <p class="muted" style="margin-top:8px">Please wait for <strong>${esc(dut.name)}</strong> to come online before managing VMs.</p>
+            <button class="btn outline" onclick="loadDUTs(); loadVSList(${dutId})" style="margin-top:16px">
+                <span class="material-icons-round" style="font-size:16px">refresh</span> Retry
+            </button>
+        </div>`;
+        toast(`Device ${dut.name} is ${dut.status || 'not online'} - cannot fetch VS list`, 'warning');
+        return;
+    }
+
     try {
         const res = await fetch(`${API}/api/vs/list/${dutId}`);
         if (!res.ok) {
@@ -2397,7 +4169,7 @@ async function loadVSList(dutId) {
                         <span style="font-weight:600;font-size:0.9rem">${esc(vm.name)}</span>
                     </div>
                 </td>
-                <td><span class="badge ${stateClass}">${esc(vm.state)}</span></td>
+                <td><span class="badge ${stateClass}" style="white-space:nowrap">${esc(vm.state)}</span></td>
                 <td>
                     <input type="text" class="vs-target-input" data-vm="${esc(vm.name)}"
                         value="${esc(defaultTarget)}"
@@ -2472,7 +4244,15 @@ async function loadXMLFiles(dutId) {
 async function vsQuickAction(vmName, action) {
     const dutId = document.getElementById('vs-host').value;
     if (!dutId) { toast('Select a host device first', 'error'); return; }
-    if (!confirm(`${action.toUpperCase()} VM "${vmName}"?`)) return;
+
+    // For destroy action, require VS name confirmation
+    if (action === 'destroy') {
+        const confirmed = await showVSDestroyConfirmation(vmName);
+        if (!confirmed) return;
+    } else {
+        if (!confirm(`${action.toUpperCase()} VM "${vmName}"?`)) return;
+    }
+
     toast(`Executing ${action} on ${vmName}...`, 'info');
     try {
         const res = await fetch(`${API}/api/vs/${dutId}/action`, {
@@ -2491,10 +4271,88 @@ async function vsQuickAction(vmName, action) {
     } catch (e) { toast(`Action failed: ${e.message}`, 'error'); }
 }
 
+function showVSDestroyConfirmation(vmName) {
+    return new Promise((resolve) => {
+        // Create modal overlay
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:2000;display:flex;align-items:center;justify-content:center;animation:fadeIn 0.2s';
+
+        // Create modal dialog
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:var(--bg-secondary);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:450px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5)';
+
+        modal.innerHTML = `
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+                <span class="material-icons-round" style="color:var(--red);font-size:32px">warning</span>
+                <h3 style="margin:0;font-size:1.3rem;color:var(--text-primary)">Confirm VS Destruction</h3>
+            </div>
+            <p style="color:var(--text-secondary);margin:0 0 16px 0;line-height:1.6">
+                You are about to <strong style="color:var(--red)">destroy</strong> the virtual switch: <strong style="color:var(--text-primary)">${vmName}</strong>
+            </p>
+            <p style="color:var(--text-muted);font-size:0.9rem;margin:0 0 16px 0">
+                This action cannot be undone. To confirm, please type the VS name below:
+            </p>
+            <input type="text" id="vs-destroy-confirm-input" placeholder="Enter VS name: ${vmName}"
+                style="width:100%;padding:10px;font-size:0.95rem;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:var(--mono);margin-bottom:16px">
+            <div id="vs-destroy-error" style="color:var(--red);font-size:0.85rem;margin-bottom:12px;display:none"></div>
+            <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button id="vs-destroy-cancel" class="btn outline" style="padding:8px 16px">Cancel</button>
+                <button id="vs-destroy-confirm" class="btn" style="padding:8px 16px;background:var(--red);border-color:var(--red)">Destroy</button>
+            </div>
+        `;
+
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        const input = document.getElementById('vs-destroy-confirm-input');
+        const confirmBtn = document.getElementById('vs-destroy-confirm');
+        const cancelBtn = document.getElementById('vs-destroy-cancel');
+        const errorDiv = document.getElementById('vs-destroy-error');
+
+        // Focus input
+        setTimeout(() => input.focus(), 100);
+
+        // Validate on input
+        input.addEventListener('input', () => {
+            errorDiv.style.display = 'none';
+        });
+
+        // Confirm button
+        confirmBtn.addEventListener('click', () => {
+            const enteredName = input.value.trim();
+            if (enteredName === vmName) {
+                document.body.removeChild(overlay);
+                resolve(true);
+            } else {
+                errorDiv.textContent = `Entered name "${enteredName}" does not match "${vmName}"`;
+                errorDiv.style.display = 'block';
+                input.select();
+            }
+        });
+
+        // Cancel button
+        cancelBtn.addEventListener('click', () => {
+            document.body.removeChild(overlay);
+            resolve(false);
+        });
+
+        // Press Enter to confirm
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') confirmBtn.click();
+        });
+
+        // Press Escape to cancel
+        overlay.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') cancelBtn.click();
+        });
+    });
+}
+
 async function startVSUpdate() {
     console.log('[VS] startVSUpdate called. selectedVSNames.size =', selectedVSNames.size);
     const dutId = document.getElementById('vs-host').value;
     const sourceImage = document.getElementById('vs-source-image').value.trim();
+    const sourceServerId = document.getElementById('vs-source-server').value;
 
     if (!dutId) { toast('Select a host device', 'error'); return; }
     if (!selectedVSNames.size) { toast('Select at least one VM using the checkboxes', 'error'); return; }
@@ -2515,10 +4373,15 @@ async function startVSUpdate() {
         `<div style="padding:3px 0;font-family:var(--mono);font-size:0.82rem">• <b>${esc(e.vs_name)}</b> → ${esc(e.target_image_name)}</div>`
     ).join('');
 
+    // Get source server name for display
+    const sourceServerName = sourceServerId ? (dutsData.find(d => d.id == sourceServerId)?.name || 'Unknown') : 'Host Device (Local)';
+    const copyMethod = sourceServerId ? '(Direct SCP Copy)' : '(Local Copy)';
+
     logEl.innerHTML = `<div style="padding:16px">
         <div style="font-weight:600;margin-bottom:8px">⚠ Confirm batch update for ${vsEntries.length} VM(s):</div>
         ${vmRows}
-        <div style="margin-top:8px;font-size:0.82rem;color:var(--text-secondary)">Source: ${esc(sourceImage)}</div>
+        <div style="margin-top:8px;font-size:0.82rem;color:var(--text-secondary)">Source Server: ${esc(sourceServerName)} ${copyMethod}</div>
+        <div style="font-size:0.82rem;color:var(--text-secondary)">Source Path: ${esc(sourceImage)}</div>
         <div style="margin-top:12px;display:flex;gap:8px">
             <button class="btn primary" onclick="execVSUpdate()" style="padding:8px 20px">
                 <span class="material-icons-round" style="font-size:16px">rocket_launch</span> Confirm & Start Update
@@ -2528,7 +4391,7 @@ async function startVSUpdate() {
     </div>`;
 
     // Store pending data for execVSUpdate to pick up
-    window._vsPendingUpdate = { dutId, vsEntries, sourceImage };
+    window._vsPendingUpdate = { dutId, vsEntries, sourceImage, sourceServerId };
 }
 
 function cancelVSUpdate() {
@@ -2542,13 +4405,17 @@ async function execVSUpdate() {
     if (!pending) return;
     window._vsPendingUpdate = null;
 
-    const { dutId, vsEntries, sourceImage } = pending;
+    const { dutId, vsEntries, sourceImage, sourceServerId } = pending;
 
     // Reset progress UI
     vsLogs = [];
     const progress = document.getElementById('vs-progress');
     progress.style.display = '';
-    progress.querySelectorAll('.vs-step').forEach(s => s.classList.remove('active', 'done', 'error'));
+    // Initialize all steps to pending, reset any previous states
+    progress.querySelectorAll('.vs-step').forEach(s => {
+        s.classList.remove('active', 'done', 'error', 'pending');
+        s.classList.add('pending');
+    });
     const logEl = document.getElementById('vs-log-container');
     logEl.innerHTML = `<div class="log-placeholder"><span class="material-icons-round spin">sync</span><p>Starting VS image update for ${vsEntries.length} VM(s)...</p></div>`;
 
@@ -2558,41 +4425,76 @@ async function execVSUpdate() {
 
     // Call the existing working single-VM endpoint for each VM sequentially
     let allOk = true;
+    console.log(`[VS Update] ========================================`);
+    console.log(`[VS Update] Starting sequential update of ${vsEntries.length} VMs`);
+    console.log(`[VS Update] ========================================`);
+
     for (let i = 0; i < vsEntries.length; i++) {
         const entry = vsEntries[i];
         const vmLabel = `[${i + 1}/${vsEntries.length}] ${entry.vs_name}`;
+
+        console.log(`\n[VS Update] ====== VM ${i + 1}/${vsEntries.length} ======`);
+        console.log(`[VS Update] VS Name:`, entry.vs_name);
+        console.log(`[VS Update] Target Image:`, entry.target_image_name);
+        console.log(`[VS Update] About to fetch API...`);
 
         // Update log area
         logEl.innerHTML = `<div class="log-placeholder"><span class="material-icons-round spin">sync</span><p>Updating ${vmLabel}...</p></div>`;
 
         try {
+            const requestBody = {
+                dut_id: parseInt(dutId),
+                vs_name: entry.vs_name,
+                source_image_path: sourceImage,
+                target_image_name: entry.target_image_name || '',
+                source_server_id: sourceServerId ? parseInt(sourceServerId) : null,
+            };
+            console.log('[VS Update] Request body:', JSON.stringify(requestBody, null, 2));
+
             const res = await fetch(`${API}/api/vs/update-image`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    dut_id: parseInt(dutId),
-                    vs_name: entry.vs_name,
-                    source_image_path: sourceImage,
-                    target_image_name: entry.target_image_name || '',
-                }),
+                body: JSON.stringify(requestBody),
             });
+            console.log(`[VS Update] API response status:`, res.status);
+
             if (!res.ok) {
                 const errData = await res.json().catch(() => ({}));
+                console.error(`[VS Update] API returned error:`, errData);
                 throw new Error(errData.detail || res.statusText);
             }
             const data = await res.json();
             currentVSExecId = data.execution_id;
+            console.log(`[VS Update] Execution ID:`, data.execution_id);
             toast(`${vmLabel}: update started`, 'success');
 
-            // Wait for this VM's update to complete via polling
-            await waitForExecution(data.execution_id, vmLabel, logEl);
+            // Close previous WebSocket if exists
+            if (vsWS) {
+                console.log('[VS Update] Closing previous WebSocket connection');
+                vsWS.close();
+                vsWS = null;
+            }
+
+            // Connect to WebSocket and wait for completion
+            console.log('[VS Update] Connecting WebSocket for execution:', data.execution_id);
+            await waitForVSCompletion(data.execution_id, vmLabel, logEl);
+            console.log(`[VS Update] ✓ VM ${i + 1}/${vsEntries.length} COMPLETED: ${entry.vs_name}`);
+            console.log(`[VS Update] Moving to next VM...`);
 
         } catch (e) {
+            console.error(`[VS Update] Error updating ${entry.vs_name}:`, e);
             toast(`${vmLabel}: FAILED — ${e.message}`, 'error');
+            logEl.innerHTML += `<div style="color:#ff5252;padding:8px;margin-top:8px;border:1px solid #ff5252;border-radius:4px;">
+                <strong>ERROR:</strong> ${escapeHTML(e.message)}<br>
+                <small>Continuing with remaining VMs...</small>
+            </div>`;
             allOk = false;
             // Continue with next VM even if one fails
+            console.log(`[VS Update] Continuing to next VM after error...`);
         }
     }
+
+    console.log(`[VS Update] Loop finished. All VMs processed. allOk=${allOk}`);
 
     // Done — all VMs processed
     btn.disabled = false;
@@ -2621,14 +4523,22 @@ async function waitForExecution(execId, label, logEl) {
     const interval = 3;  // poll every 3 seconds
     let elapsed = 0;
 
+    console.log(`[waitForExecution] Starting polling for exec ${execId}, max wait ${maxWait}s`);
+
     while (elapsed < maxWait) {
         await new Promise(r => setTimeout(r, interval * 1000));
         elapsed += interval;
 
+        console.log(`[waitForExecution] Polling exec ${execId} at ${elapsed}s / ${maxWait}s`);
+
         try {
             const res = await fetch(`${API}/api/executions/${execId}`);
-            if (!res.ok) continue;
+            if (!res.ok) {
+                console.warn(`[waitForExecution] API returned ${res.status} for exec ${execId}`);
+                continue;
+            }
             const exec = await res.json();
+            console.log(`[waitForExecution] Exec ${execId} status:`, exec.status);
 
             // Also fetch logs for display
             const logsRes = await fetch(`${API}/api/executions/${execId}/logs?limit=200`);
@@ -2652,17 +4562,22 @@ async function waitForExecution(execId, label, logEl) {
 
             // Check completion
             if (exec.status === 'completed' || exec.status === 'failed') {
+                console.log(`[waitForExecution] ✓ Exec ${execId} ${exec.status}! Returning from wait.`);
                 if (exec.status === 'completed') {
                     toast(`${label}: completed successfully (${exec.duration || 0}s)`, 'success');
                 } else {
                     toast(`${label}: update failed`, 'error');
                 }
                 return;
+            } else {
+                console.log(`[waitForExecution] Status is '${exec.status}', continuing to poll...`);
             }
         } catch (e) {
+            console.error(`[waitForExecution] Error polling exec ${execId}:`, e);
             // Network error, keep polling
         }
     }
+    console.error(`[waitForExecution] ✗ TIMEOUT after ${maxWait}s for exec ${execId}`);
     toast(`${label}: timed out after ${maxWait}s`, 'error');
 }
 
@@ -2671,31 +4586,87 @@ function escapeHTML(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function connectVSWebSocket(execId) {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    vsWS = new WebSocket(`${proto}//${location.host}/ws/execution/${execId}`);
+// Wait for VS update to complete using WebSocket + polling fallback
+async function waitForVSCompletion(execId, label, logEl) {
+    return new Promise((resolve, reject) => {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${proto}//${location.host}/ws/execution/${execId}`);
+        const timeout = setTimeout(() => {
+            console.error(`[waitForVSCompletion] Timeout after 10 minutes for exec ${execId}`);
+            ws.close();
+            reject(new Error('Update timed out after 10 minutes'));
+        }, 600000); // 10 minute timeout
 
-    vsWS.onmessage = (event) => {
-        const data = JSON.parse(event.data);
+        ws.onopen = () => {
+            console.log(`[waitForVSCompletion] WebSocket connected for exec ${execId}`);
+        };
 
-        if (data.type === 'execution_complete') {
-            const btn = document.getElementById('btn-vs-update');
-            btn.disabled = false;
-            btn.innerHTML = '<span class="material-icons-round">rocket_launch</span> Update Image & Restart VMs';
-            toast(`VS update ${data.status} (${data.duration || 0}s)`, data.status === 'completed' ? 'success' : 'error');
-            // Refresh VM list
-            const dutId = document.getElementById('vs-host').value;
-            if (dutId) setTimeout(() => loadVSList(dutId), 2000);
-            return;
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+
+            if (data.type === 'execution_complete') {
+                console.log(`[waitForVSCompletion] ✓ Received execution_complete for exec ${execId}, status: ${data.status}`);
+                clearTimeout(timeout);
+                ws.close();
+                toast(`${label}: ${data.status} (${data.duration || 0}s)`, data.status === 'completed' ? 'success' : 'error');
+
+                if (data.status === 'completed') {
+                    resolve();
+                } else {
+                    reject(new Error(`Update failed with status: ${data.status}`));
+                }
+                return;
+            }
+
+            // Display logs in real-time
+            if (data.message) {
+                vsLogs.push(data);
+                appendVSLogEntry(data);
+                updateVSProgress(data);
+            }
+        };
+
+        ws.onerror = (error) => {
+            console.error(`[waitForVSCompletion] WebSocket error for exec ${execId}:`, error);
+            // Don't reject - let timeout handle it or wait for close
+        };
+
+        ws.onclose = () => {
+            console.log(`[waitForVSCompletion] WebSocket closed for exec ${execId}`);
+            // If closed without resolving, fall back to polling
+            if (timeout) {
+                console.log(`[waitForVSCompletion] Falling back to polling for exec ${execId}`);
+                pollForCompletion(execId, label, timeout, resolve, reject);
+            }
+        };
+    });
+}
+
+// Fallback polling if WebSocket fails
+async function pollForCompletion(execId, label, timeout, resolve, reject) {
+    const pollInterval = setInterval(async () => {
+        try {
+            const res = await fetch(`${API}/api/executions/${execId}`);
+            if (res.ok) {
+                const exec = await res.json();
+                console.log(`[pollForCompletion] Exec ${execId} status: ${exec.status}`);
+
+                if (exec.status === 'completed') {
+                    clearInterval(pollInterval);
+                    clearTimeout(timeout);
+                    console.log(`[pollForCompletion] ✓ Exec ${execId} completed`);
+                    resolve();
+                } else if (exec.status === 'failed') {
+                    clearInterval(pollInterval);
+                    clearTimeout(timeout);
+                    console.log(`[pollForCompletion] ✗ Exec ${execId} failed`);
+                    reject(new Error('Update failed'));
+                }
+            }
+        } catch (e) {
+            console.error(`[pollForCompletion] Error polling exec ${execId}:`, e);
         }
-
-        vsLogs.push(data);
-        appendVSLogEntry(data);
-        updateVSProgress(data);
-    };
-
-    vsWS.onerror = () => toast('VS WebSocket connection error', 'error');
-    vsWS.onclose = () => { vsWS = null; };
+    }, 3000); // Poll every 3 seconds
 }
 
 function appendVSLogEntry(log) {
@@ -2706,45 +4677,91 @@ function appendVSLogEntry(log) {
 }
 
 function updateVSProgress(log) {
-    const msg = log.message || '';
+    const msg = (log.message || '').trim();
+
+    // Debug: Log all messages to console for debugging
+    console.log('[VS Progress] Message:', msg);
+
+    // Map backend steps to UI steps (keep only 4)
+    // Step 1/6 → UI Step 1 (Destroy VM)
+    // Step 2/6 → UI Step 2 (Remove Old Image)
+    // Step 3/6 → UI Step 3 (Copy New Image)
+    // Step 6/6 → UI Step 4 (Start VM)
     const stepMap = {
-        'Step 1/6': '1', 'Step 2/6': '2', 'Step 3/6': '3',
-        'Step 4/6': '4', 'Step 5/6': '5', 'Step 6/6': '6',
+        'Step 1/6': '1',
+        'Step 2/6': '2',
+        'Step 3/6': '3',
+        'Step 6/6': '4',
     };
 
+    let stepFound = false;
     for (const [prefix, stepNum] of Object.entries(stepMap)) {
         if (msg.includes(prefix)) {
-            const stepEl = document.querySelector(`.vs-step[data-step="${stepNum}"]`);
-            if (!stepEl) continue;
+            stepFound = true;
+            console.log(`[VS Progress] Found ${prefix}, mapping to step ${stepNum}`);
 
-            // Mark previous steps as done
+            const stepEl = document.querySelector(`.vs-step[data-step="${stepNum}"]`);
+            if (!stepEl) {
+                console.warn(`[VS Progress] Step element not found for data-step="${stepNum}"`);
+                continue;
+            }
+
+            // Remove all state classes first
+            stepEl.classList.remove('active', 'done', 'error', 'pending');
+
+            // Mark all previous steps as done
             for (let i = 1; i < parseInt(stepNum); i++) {
                 const prev = document.querySelector(`.vs-step[data-step="${i}"]`);
                 if (prev && !prev.classList.contains('error')) {
-                    prev.classList.remove('active');
+                    prev.classList.remove('active', 'pending');
                     prev.classList.add('done');
                 }
             }
 
-            if (msg.includes('FAILED') || msg.includes('error')) {
-                stepEl.classList.remove('active');
+            // Determine current step state
+            if (msg.includes('FAILED') || msg.includes('✗')) {
+                // Error state
+                console.log(`[VS Progress] Step ${stepNum} ERROR`);
                 stepEl.classList.add('error');
+                // Mark following steps as pending (skipped)
+                for (let i = parseInt(stepNum) + 1; i <= 4; i++) {
+                    const next = document.querySelector(`.vs-step[data-step="${i}"]`);
+                    if (next) {
+                        next.classList.remove('active', 'done');
+                        next.classList.add('pending');
+                    }
+                }
             } else if (msg.includes('completed successfully') || msg.includes('✓')) {
-                stepEl.classList.remove('active');
+                // Completed state
+                console.log(`[VS Progress] Step ${stepNum} DONE`);
                 stepEl.classList.add('done');
             } else {
+                // Active/Running state
+                console.log(`[VS Progress] Step ${stepNum} ACTIVE`);
                 stepEl.classList.add('active');
             }
+
+            break; // Stop after finding the step
         }
     }
 
+    if (!stepFound && msg.length > 0) {
+        console.log(`[VS Progress] No step prefix matched in message: "${msg.substring(0, 100)}..."`);
+    }
+
     // Handle final completion message
-    if (msg.includes('VS image update completed')) {
-        for (let i = 1; i <= 6; i++) {
+    if (msg.includes('VS image update completed') || msg.includes('update successfully')) {
+        console.log('[VS Progress] Final completion detected');
+        let allDone = true;
+        for (let i = 1; i <= 4; i++) {
             const s = document.querySelector(`.vs-step[data-step="${i}"]`);
-            if (s && !s.classList.contains('error')) {
-                s.classList.remove('active');
-                s.classList.add('done');
+            if (s) {
+                if (!s.classList.contains('error')) {
+                    s.classList.remove('active', 'pending');
+                    s.classList.add('done');
+                } else {
+                    allDone = false;
+                }
             }
         }
     }
@@ -2761,3 +4778,659 @@ function setText(id, val) { const el = document.getElementById(id); if (el) el.t
 document.addEventListener('change', (e) => {
     if (e.target.id === 'spy-vm-select' || e.target.id === 'spy-testbed') updateSpyStartBtn();
 });
+
+// ============================================================================
+// HARDWARE LOAD FUNCTIONALITY
+// ============================================================================
+
+// Hardware Load state
+let currentHWJobId = null;
+let hwWebSocket = null;
+let hwAutoScroll = true;
+
+/**
+ * Load hardware devices (telnet-only) for device dropdown
+ */
+async function loadHardwareDevices() {
+    try {
+        const response = await fetch(`${API}/api/duts`, {
+            headers: getSessionHeaders()
+        });
+
+        if (!response.ok) throw new Error('Failed to load devices');
+
+        const devices = await response.json();
+
+        // Filter for telnet devices only
+        const telnetDevices = devices.filter(d => d.connection_type === 'telnet');
+
+        const deviceSelect = document.getElementById('hwDeviceSelect');
+        if (!deviceSelect) {
+            console.warn('Hardware Load tab elements not found. Tab may not be loaded yet.');
+            return;
+        }
+
+        deviceSelect.innerHTML = '<option value="">-- Select Device --</option>';
+
+        telnetDevices.forEach(device => {
+            const option = document.createElement('option');
+            option.value = device.id;
+            option.textContent = `${device.name} (${device.ip_address}:${device.port})`;
+            deviceSelect.appendChild(option);
+        });
+
+        // Load all devices for source server dropdown (SSH/Telnet)
+        const serverSelect = document.getElementById('hwSourceServer');
+        if (!serverSelect) {
+            console.warn('Hardware Load server select not found.');
+            return;
+        }
+
+        serverSelect.innerHTML = '<option value="">-- Select Server --</option>';
+
+        devices.forEach(device => {
+            const option = document.createElement('option');
+            option.value = device.id;
+            option.textContent = `${device.name} (${device.ip_address})`;
+            option.dataset.password = device.password || '';
+            option.dataset.username = device.username || 'admin';
+            option.dataset.ip = device.ip_address;
+            serverSelect.appendChild(option);
+        });
+
+    } catch (error) {
+        console.error('Error loading hardware devices:', error);
+        const errorMsg = error.message || error.toString() || 'Failed to load devices';
+        toast(errorMsg, 'error');
+    }
+}
+
+/**
+ * Update source server details when server is selected
+ * Password is auto-filled from device credentials (hidden field)
+ */
+function updateSourceServerDetails() {
+    const serverSelect = document.getElementById('hwSourceServer');
+    const selectedOption = serverSelect.options[serverSelect.selectedIndex];
+    const passwordField = document.getElementById('hwServerPassword');
+
+    if (selectedOption && selectedOption.dataset.password) {
+        passwordField.value = selectedOption.dataset.password;
+    } else {
+        passwordField.value = '';
+    }
+}
+
+/**
+ * Start hardware load job
+ */
+async function startHardwareLoad(event) {
+    event.preventDefault();
+
+    // Gather form data
+    const deviceId = parseInt(document.getElementById('hwDeviceSelect').value);
+    const sourceServerId = parseInt(document.getElementById('hwSourceServer').value);
+    const imagePath = document.getElementById('hwImagePath').value.trim();
+    const serverPassword = document.getElementById('hwServerPassword').value;
+    const gatewayIP = document.getElementById('hwGatewayIP').value.trim();
+    const subnetMask = document.getElementById('hwSubnetMask').value.trim();
+
+    // Validation
+    if (!deviceId || !sourceServerId || !imagePath) {
+        toast('Please fill all required fields', 'error');
+        return;
+    }
+
+    // Password is optional - will be fetched from device data if not provided
+    if (!serverPassword) {
+        console.warn('Server password not auto-filled, will fetch from device data');
+    }
+
+    // Validate gateway IP format
+    const ipRegex = /^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$/;
+    if (!ipRegex.test(gatewayIP)) {
+        toast('Invalid gateway IP address format', 'error');
+        return;
+    }
+
+    // Validate subnet mask (allow common valid masks including 255.255.255.255)
+    const validSubnetMasks = [
+        '255.0.0.0', '255.255.0.0', '255.255.255.0',
+        '255.255.255.128', '255.255.255.192', '255.255.255.224',
+        '255.255.255.240', '255.255.255.248', '255.255.255.252',
+        '255.255.255.255'  // /32 host route
+    ];
+    if (!validSubnetMasks.includes(subnetMask)) {
+        toast('Invalid subnet mask. Must be one of: 255.0.0.0, 255.255.0.0, 255.255.255.0, 255.255.255.128, 255.255.255.192, 255.255.255.224, 255.255.255.240, 255.255.255.248, 255.255.255.252, or 255.255.255.255', 'error');
+        return;
+    }
+
+    // Get source server details
+    const serverSelect = document.getElementById('hwSourceServer');
+    const selectedOption = serverSelect.options[serverSelect.selectedIndex];
+    const serverIP = selectedOption.dataset.ip;
+    const serverUsername = selectedOption.dataset.username || 'admin';
+
+    // Validate server details
+    if (!serverIP) {
+        toast('Source server IP not found. Please reselect the server.', 'error');
+        console.error('Missing server IP for source server ID:', sourceServerId);
+        return;
+    }
+
+    // Debug log
+    console.log('Hardware Load Request Data:', {
+        dut_id: deviceId,
+        source_server_id: sourceServerId,
+        image_path: imagePath,
+        source_server_ip: serverIP,
+        source_server_username: serverUsername,
+        gateway_ip: gatewayIP,
+        subnet_mask: subnetMask
+    });
+
+    // Confirm before starting
+    const deviceName = document.getElementById('hwDeviceSelect').options[document.getElementById('hwDeviceSelect').selectedIndex].textContent;
+    const imageName = imagePath.split('/').pop();
+
+    if (!confirm('Start hardware load for ' + deviceName + '?\n\nImage: ' + imageName + '\nThis will reboot the device and install a new OS image.\n\nThis process takes 15-30 minutes and cannot be interrupted.')) {
+        return;
+    }
+
+    try {
+        // Send request
+        const response = await fetch('/api/hardware-load/start', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Session-ID': getSessionId()
+            },
+            body: JSON.stringify({
+                dut_id: deviceId,
+                source_server_id: sourceServerId,
+                image_path: imagePath,
+                source_server_ip: serverIP,
+                source_server_username: serverUsername,
+                source_server_password: serverPassword,
+                gateway_ip: gatewayIP,
+                subnet_mask: subnetMask
+            })
+        });
+
+        if (!response.ok) {
+            let errorMessage = 'Failed to start hardware load';
+            try {
+                const errorData = await response.json();
+
+                // Handle FastAPI validation errors (422 - detail is an array)
+                if (Array.isArray(errorData.detail)) {
+                    const errors = errorData.detail.map(err => {
+                        const field = err.loc ? err.loc[err.loc.length - 1] : 'unknown';
+                        return `${field}: ${err.msg}`;
+                    }).join(', ');
+                    errorMessage = `Validation error: ${errors}`;
+                }
+                // Handle regular error responses (detail is a string)
+                else if (typeof errorData.detail === 'string') {
+                    errorMessage = errorData.detail;
+                }
+                // Fallback to message field
+                else if (errorData.message) {
+                    errorMessage = errorData.message;
+                }
+            } catch (parseError) {
+                // If response is not JSON, use status text
+                errorMessage = response.statusText || errorMessage;
+            }
+            throw new Error(errorMessage);
+        }
+
+        const result = await response.json();
+        currentHWJobId = result.job_id;
+
+        // Show progress container
+        document.getElementById('hwProgressContainer').style.display = 'block';
+        document.getElementById('hwCompletionMessage').style.display = 'none';
+
+        // Show stop button for new job
+        const stopBtnWrap = document.getElementById('hwStopBtnWrapper');
+        if (stopBtnWrap) stopBtnWrap.style.display = 'flex';
+
+        // Reset progress
+        document.getElementById('hwProgressFill').style.width = '0%';
+        document.getElementById('hwProgressPercent').textContent = '0%';
+        document.getElementById('hwProgressStatus').textContent = 'Starting...';
+        document.getElementById('hwCurrentStep').textContent = 'Initializing hardware load...';
+        document.getElementById('hwExecutionLog').innerHTML = '';
+
+        // Connect WebSocket for real-time updates
+        connectHWWebSocket(currentHWJobId);
+
+        // Scroll to progress section
+        document.getElementById('hwProgressContainer').scrollIntoView({ behavior: 'smooth' });
+
+        toast('Hardware load started successfully', 'success');
+
+    } catch (error) {
+        console.error('Error starting hardware load:', error);
+        // Ensure we always have a string message to display
+        const errorMessage = error.message || error.toString() || 'An unknown error occurred';
+        toast(errorMessage, 'error');
+    }
+}
+
+/**
+ * Connect WebSocket for real-time progress updates
+ */
+function connectHWWebSocket(jobId) {
+    // Close existing connection
+    if (hwWebSocket) {
+        hwWebSocket.close();
+    }
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = protocol + '//' + window.location.host + '/api/hardware-load/ws/' + jobId;
+
+    hwWebSocket = new WebSocket(wsUrl);
+
+    hwWebSocket.onopen = () => {
+        console.log('Hardware load WebSocket connected');
+        appendHWLog('[System] Connected to progress stream\n', 'log-success');
+    };
+
+    hwWebSocket.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            handleHWProgressUpdate(data);
+        } catch (error) {
+            console.error('Error parsing WebSocket message:', error);
+        }
+    };
+
+    hwWebSocket.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        appendHWLog('[System] Connection error occurred\n', 'log-error');
+    };
+
+    hwWebSocket.onclose = () => {
+        console.log('Hardware load WebSocket closed');
+        hwWebSocket = null;
+    };
+}
+
+/**
+ * Handle progress update from WebSocket
+ */
+function handleHWProgressUpdate(data) {
+    switch (data.type) {
+        case 'progress':
+            // Update progress bar
+            document.getElementById('hwProgressFill').style.width = data.progress_percentage + '%';
+            document.getElementById('hwProgressPercent').textContent = data.progress_percentage + '%';
+            document.getElementById('hwProgressStatus').textContent = formatStatusText(data.status);
+            document.getElementById('hwCurrentStep').textContent = data.current_step;
+
+            // Append new log lines
+            if (data.new_log_lines) {
+                appendHWLog(data.new_log_lines);
+            }
+            break;
+
+        case 'complete':
+            // Job completed (success or failure)
+            const isSuccess = data.status === 'completed';
+
+            // Show completion message
+            const completionDiv = document.getElementById('hwCompletionMessage');
+            completionDiv.style.display = 'flex';
+            completionDiv.className = 'hw-completion-message ' + (isSuccess ? 'success' : 'error');
+
+            const icon = isSuccess ? 'check_circle' : 'error';
+            const message = isSuccess
+                ? 'Hardware load completed successfully!'
+                : 'Hardware load failed: ' + (data.error_message || 'Unknown error');
+
+            completionDiv.innerHTML = '<span class="material-icons-round">' + icon + '</span>' + message;
+
+            // Update progress bar
+            document.getElementById('hwProgressFill').style.width = isSuccess ? '100%' : document.getElementById('hwProgressFill').style.width;
+            document.getElementById('hwProgressPercent').textContent = isSuccess ? '100%' : 'Failed';
+
+            // Stop pulsing animation
+            const stepIcon = document.querySelector('.hw-current-step .hw-step-icon');
+            if (stepIcon) stepIcon.style.animation = 'none';
+
+            // Hide stop button - job is done
+            const stopWrapper = document.getElementById('hwStopBtnWrapper');
+            if (stopWrapper) stopWrapper.style.display = 'none';
+
+            // Close WebSocket
+            if (hwWebSocket) {
+                hwWebSocket.close();
+                hwWebSocket = null;
+            }
+
+            // Refresh history
+            refreshHWHistory();
+
+            // Notification
+            toast(message, isSuccess ? 'success' : 'error');
+            break;
+
+        case 'error':
+            appendHWLog('[System Error] ' + data.message + '\n', 'log-error');
+            toast('WebSocket error: ' + data.message, 'error');
+            break;
+    }
+}
+
+/**
+ * Append log line to terminal
+ */
+function appendHWLog(text, cssClass) {
+    cssClass = cssClass || '';
+    const logDiv = document.getElementById('hwExecutionLog');
+
+    const lines = text.split('\n');
+    lines.forEach(line => {
+        if (line.trim()) {
+            const lineDiv = document.createElement('div');
+            lineDiv.className = 'log-line ' + cssClass;
+
+            // Color coding based on content
+            if (line.includes('✓') || line.includes('SUCCESS')) {
+                lineDiv.className = 'log-line log-success';
+            } else if (line.includes('✗') || line.includes('ERROR') || line.includes('failed')) {
+                lineDiv.className = 'log-line log-error';
+            } else if (line.includes('WARNING') || line.includes('⚠')) {
+                lineDiv.className = 'log-line log-warning';
+            }
+
+            lineDiv.textContent = line;
+            logDiv.appendChild(lineDiv);
+        }
+    });
+
+    // Auto-scroll to bottom
+    if (hwAutoScroll) {
+        logDiv.scrollTop = logDiv.scrollHeight;
+    }
+}
+
+/**
+ * Format status text for display
+ */
+function formatStatusText(status) {
+    const statusMap = {
+        'pending': 'Pending',
+        'connecting': 'Connecting to device',
+        'detecting_mode': 'Detecting device mode',
+        'saving_config': 'Saving configuration',
+        'rebooting': 'Rebooting device',
+        'grub_menu': 'Waiting for GRUB menu',
+        'grub_navigation': 'Navigating to ONIE',
+        'onie_menu': 'ONIE menu detected',
+        'onie_install_select': 'Selecting Install mode',
+        'onie_loading': 'Loading ONIE',
+        'onie_stop': 'Stopping discovery',
+        'network_config': 'Configuring network',
+        'downloading': 'Downloading image',
+        'installing': 'Installing image',
+        'completed': 'Completed',
+        'failed': 'Failed',
+        'cancelled': 'Cancelled'
+    };
+
+    return statusMap[status] || status || '-';
+}
+
+/**
+ * Clear log terminal
+ */
+function clearHWLog() {
+    if (confirm('Clear execution log?')) {
+        document.getElementById('hwExecutionLog').innerHTML = '';
+    }
+}
+
+/**
+ * Load hardware load job history
+ */
+async function loadHWHistory() {
+    try {
+        const response = await fetch('/api/hardware-load/jobs', {
+            headers: { 'X-Session-ID': getSessionId() }
+        });
+
+        if (!response.ok) throw new Error('Failed to load job history');
+
+        const jobs = await response.json();
+        renderHWHistoryTable(jobs);
+
+    } catch (error) {
+        console.error('Error loading job history:', error);
+        toast('Failed to load job history', 'error');
+    }
+}
+
+/**
+ * Render job history table
+ */
+function renderHWHistoryTable(jobs) {
+    const tbody = document.getElementById('hwHistoryTable');
+    if (!tbody) {
+        console.warn('Hardware history table element not found');
+        return;
+    }
+
+    tbody.innerHTML = '';
+
+    if (jobs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 40px; color: rgba(255,255,255,0.5);">No hardware load jobs yet</td></tr>';
+        return;
+    }
+
+    jobs.forEach(job => {
+        const row = document.createElement('tr');
+
+        // Calculate duration
+        let duration = '-';
+        if (job.started_at) {
+            const start = new Date(job.started_at);
+            const end = job.completed_at ? new Date(job.completed_at) : new Date();
+            const diffMs = end - start;
+            const diffMins = Math.floor(diffMs / 60000);
+            const diffSecs = Math.floor((diffMs % 60000) / 1000);
+            duration = diffMins + 'm ' + diffSecs + 's';
+        }
+
+        row.innerHTML = '<td>' + job.id + '</td>' +
+            '<td>' + esc(job.device_name || ('DUT ' + job.dut_id) || '-') + '</td>' +
+            '<td title="' + esc(job.image_path || '') + '">' + esc(job.image_name || job.image_path || '-') + '</td>' +
+            '<td><span class="status-badge ' + (job.status || '') + '">' + formatStatusText(job.status || '') + '</span></td>' +
+            '<td>' + (job.progress_percentage != null ? job.progress_percentage : 0) + '%</td>' +
+            '<td>' + (job.started_at ? formatDateTime(job.started_at) : '-') + '</td>' +
+            '<td>' + duration + '</td>' +
+            '<td>' +
+                '<button class="btn-icon" onclick="viewHWJobDetails(' + job.id + ')" title="View Details">' +
+                    '<span class="material-icons-round">visibility</span>' +
+                '</button>' +
+                (job.status === 'failed' ?
+                    '<button class="btn-icon" onclick="retryHWJob(' + job.id + ')" title="Retry">' +
+                        '<span class="material-icons-round">refresh</span>' +
+                    '</button>'
+                : '') +
+            '</td>';
+
+        tbody.appendChild(row);
+    });
+}
+
+/**
+ * View job details in modal
+ */
+async function viewHWJobDetails(jobId) {
+    try {
+        const response = await fetch('/api/hardware-load/job/' + jobId, {
+            headers: { 'X-Session-ID': getSessionId() }
+        });
+
+        if (!response.ok) throw new Error('Failed to load job details');
+
+        const job = await response.json();
+
+        // Show in modal (reuse existing modal or create custom one)
+        const modalTitle = document.getElementById('modal-title');
+        const modalBody = document.getElementById('modal-body');
+
+        const deviceLabel = job.device_name || ('DUT ' + job.dut_id) || 'Unknown Device';
+        modalTitle.textContent = 'Job #' + job.id + ' - ' + deviceLabel;
+        modalBody.innerHTML = '<div style="margin-bottom: 20px;">' +
+                '<div style="margin-bottom: 10px;"><strong>Status:</strong> <span class="status-badge ' + (job.status || '') + '">' + formatStatusText(job.status || '') + '</span></div>' +
+                '<div style="margin-bottom: 10px;"><strong>Progress:</strong> ' + (job.progress_percentage != null ? job.progress_percentage : 0) + '%</div>' +
+                '<div style="margin-bottom: 10px;"><strong>Current Step:</strong> ' + esc(job.current_step || '-') + '</div>' +
+                '<div style="margin-bottom: 10px;"><strong>Image:</strong> ' + esc(job.image_path || '-') + '</div>' +
+                '<div style="margin-bottom: 10px;"><strong>Started:</strong> ' + (job.started_at ? formatDateTime(job.started_at) : '-') + '</div>' +
+                '<div style="margin-bottom: 10px;"><strong>Completed:</strong> ' + (job.completed_at ? formatDateTime(job.completed_at) : 'In progress') + '</div>' +
+                (job.error_message ? '<div style="margin-bottom: 10px; color: var(--red);"><strong>Error:</strong> ' + esc(job.error_message) + '</div>' : '') +
+            '</div>' +
+            '<div class="hw-log-terminal">' +
+                '<div class="hw-terminal-header"><span class="material-icons-round">terminal</span> Full Execution Log</div>' +
+                '<div class="hw-terminal-output"><pre>' + esc(job.execution_log || 'No logs available') + '</pre></div>' +
+            '</div>';
+
+        openModal();
+
+    } catch (error) {
+        console.error('Error loading job details:', error);
+        toast('Failed to load job details', 'error');
+    }
+}
+
+/**
+ * Retry failed job
+ */
+async function retryHWJob(jobId) {
+    try {
+        const response = await fetch('/api/hardware-load/job/' + jobId, {
+            headers: { 'X-Session-ID': getSessionId() }
+        });
+
+        if (!response.ok) throw new Error('Failed to load job details');
+
+        const job = await response.json();
+
+        // Pre-fill form
+        // Note: need to get dut_id from job details endpoint
+        document.getElementById('hwImagePath').value = job.image_path;
+
+        // Switch to hardware load tab
+        switchTab('hardware-load');
+
+        // Scroll to form
+        document.getElementById('hardwareLoadForm').scrollIntoView({ behavior: 'smooth' });
+
+        toast('Form pre-filled with previous job settings', 'info');
+
+    } catch (error) {
+        console.error('Error loading job for retry:', error);
+        toast('Failed to load job details', 'error');
+    }
+}
+
+/**
+ * Stop / cancel the currently running hardware load job
+ */
+async function stopHardwareLoad() {
+    if (!currentHWJobId) {
+        toast('No active hardware load job to stop', 'error');
+        return;
+    }
+
+    if (!confirm('Are you sure you want to stop the hardware load process?\n\nThis will forcibly cancel the job and close the device connection.')) {
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/hardware-load/cancel/' + currentHWJobId, {
+            method: 'POST',
+            headers: { 'X-Session-ID': getSessionId() }
+        });
+
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.detail || 'Failed to cancel job');
+        }
+
+        // Close WebSocket
+        if (hwWebSocket) {
+            hwWebSocket.close();
+            hwWebSocket = null;
+        }
+
+        // Update UI to reflect cancellation
+        const completionDiv = document.getElementById('hwCompletionMessage');
+        completionDiv.style.display = 'flex';
+        completionDiv.className = 'hw-completion-message error';
+        completionDiv.innerHTML = '<span class="material-icons-round">cancel</span> Hardware load cancelled by user.';
+
+        document.getElementById('hwProgressPercent').textContent = 'Stopped';
+        document.getElementById('hwProgressStatus').textContent = 'Cancelled';
+        document.getElementById('hwCurrentStep').textContent = 'Process stopped by user';
+
+        // Hide stop button
+        const stopBtn = document.getElementById('hwStopBtnWrapper');
+        if (stopBtn) stopBtn.style.display = 'none';
+
+        appendHWLog('[System] Hardware load process cancelled by user\n', 'log-warning');
+
+        refreshHWHistory();
+        toast('Hardware load job cancelled', 'warning');
+
+    } catch (error) {
+        console.error('Error cancelling hardware load:', error);
+        toast(error.message || 'Failed to cancel job', 'error');
+    }
+}
+
+/**
+ * Refresh job history
+ */
+function refreshHWHistory() {
+    loadHWHistory();
+}
+
+/**
+ * Reset hardware load form
+ */
+function resetHardwareLoadForm() {
+    document.getElementById('hardwareLoadForm').reset();
+    document.getElementById('hwGatewayIP').value = '192.168.100.1';
+    document.getElementById('hwSubnetMask').value = '255.255.255.255';  // Host route
+}
+
+/**
+ * Format datetime for display
+ */
+function formatDateTime(dateString) {
+    if (!dateString) return '-';
+
+    // Handle UTC datetime from database (append Z if not present)
+    let isoString = dateString;
+    if (!dateString.endsWith('Z') && !dateString.includes('+')) {
+        isoString = dateString + 'Z';  // Treat as UTC
+    }
+
+    const date = new Date(isoString);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / 60000);
+
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return diffMins + ' min ago';
+
+    const diffHours = Math.floor(diffMins / 60);
+    if (diffHours < 24) return diffHours + ' hour' + (diffHours > 1 ? 's' : '') + ' ago';
+
+    return date.toLocaleString();
+}
