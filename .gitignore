@@ -1,8 +1,27 @@
-venv/
+# Python
 __pycache__/
 *.pyc
 *.pyo
-data/logs/
-data/dut_automation.db
+*.pyd
+venv/
+env/
+.venv/
+
+# Bundled Python runtime (Windows portable - distribute separately)
+python/
+
+# Runtime data - never commit
+data/
 uvicorn.log
 *.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Demo/presentation artifacts
+*.pptx
+screenshot_*.png
+spotlight_*.png
