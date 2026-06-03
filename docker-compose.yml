@@ -1,0 +1,163 @@
+version: '3.9'
+
+# ============================================================
+#  Eka Automation — Docker Compose
+#  Services:
+#    postgres        → Shared PostgreSQL database
+#    eka-core        → Core app (Devices, Dashboard, Logs, Terminal)
+#    eka-execute     → Execute tab (SpyTest, script execution)
+#    eka-vs          → VS Manager tab (virsh, VM lifecycle)
+#    eka-hardware    → Hardware Load tab (ONIE, telnet)
+#    eka-nginx       → API Gateway (routes to correct service)
+# ============================================================
+
+networks:
+  eka-network:
+    driver: bridge
+
+volumes:
+  postgres_data:      # PostgreSQL data (persistent)
+  eka_logs:           # Shared execution logs volume
+  eka_images:         # Shared images volume
+
+services:
+
+  # ── PostgreSQL Database ───────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: eka-postgres
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-eka_automation}
+      POSTGRES_USER:     ${POSTGRES_USER:-eka_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-eka_secret_change_me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - eka-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-eka_user} -d ${POSTGRES_DB:-eka_automation}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    ports:
+      - "5432:5432"   # Expose for debugging (remove in production)
+
+  # ── Core Monolith (Devices + Dashboard + Logs + Terminal) ─────────────────
+  eka-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eka-core
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-eka_user}:${POSTGRES_PASSWORD:-eka_secret_change_me}@postgres:5432/${POSTGRES_DB:-eka_automation}
+      SECRET_KEY:   ${SECRET_KEY:-eka-secret-key-change-in-production}
+    volumes:
+      - eka_logs:/app/data/logs
+      - eka_images:/app/data/images
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - eka-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Execute Service (Execute Tab — SpyTest & Script Execution) ────────────
+  eka-execute:
+    build:
+      context: services/execute-service
+      dockerfile: Dockerfile
+    container_name: eka-execute
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-eka_user}:${POSTGRES_PASSWORD:-eka_secret_change_me}@postgres:5432/${POSTGRES_DB:-eka_automation}
+      SPYTEST_BASE: ${SPYTEST_BASE:-/home/hp_test/Eka/sonic-mgmt/spytest}
+    volumes:
+      - eka_logs:/app/data/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - eka-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── VS Manager Service (VS Manager Tab — virsh VM Lifecycle) ──────────────
+  eka-vs:
+    build:
+      context: services/vs-service
+      dockerfile: Dockerfile
+    container_name: eka-vs
+    environment:
+      DATABASE_URL:    postgresql://${POSTGRES_USER:-eka_user}:${POSTGRES_PASSWORD:-eka_secret_change_me}@postgres:5432/${POSTGRES_DB:-eka_automation}
+      VS_SOURCE_IMAGE: ${VS_SOURCE_IMAGE:-/home/hp/anuradha_build_imgs/target/sonic-vs.img}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - eka-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Hardware Load Service (Hardware Tab — Telnet + ONIE) ──────────────────
+  eka-hardware:
+    build:
+      context: services/hardware-service
+      dockerfile: Dockerfile
+    container_name: eka-hardware
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-eka_user}:${POSTGRES_PASSWORD:-eka_secret_change_me}@postgres:5432/${POSTGRES_DB:-eka_automation}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - eka-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Nginx API Gateway ─────────────────────────────────────────────────────
+  eka-nginx:
+    image: nginx:1.25-alpine
+    container_name: eka-nginx
+    ports:
+      - "80:80"          # HTTP (main access point)
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      eka-core:
+        condition: service_healthy
+      eka-execute:
+        condition: service_healthy
+      eka-vs:
+        condition: service_healthy
+      eka-hardware:
+        condition: service_healthy
+    networks:
+      - eka-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

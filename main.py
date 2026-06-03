@@ -84,22 +84,40 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
-DATABASE_URL = f"sqlite:///{DB_PATH}"
-
-# ============================================================================
-# DATABASE SETUP (SQLite)
-# ============================================================================
-
-engine = create_engine(
-    DATABASE_URL,
-    echo=False,
-    connect_args={"check_same_thread": False},
-    pool_size=20,              # Increase from default 5 to 20
-    max_overflow=30,           # Increase from default 10 to 30
-    pool_timeout=30,           # Wait up to 30s for connection
-    pool_recycle=3600,         # Recycle connections after 1 hour
-    pool_pre_ping=True         # Check connection health before using
+# DATABASE_URL: reads from environment — supports SQLite (dev) or PostgreSQL (Docker)
+# Default: SQLite for local development without Docker
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    f"sqlite:///{DB_PATH}"
 )
+
+# ============================================================================
+# DATABASE SETUP (SQLite for local dev / PostgreSQL for Docker)
+# ============================================================================
+
+if DATABASE_URL.startswith("sqlite"):
+    # SQLite — needs check_same_thread=False for multi-threaded FastAPI
+    engine = create_engine(
+        DATABASE_URL,
+        echo=False,
+        connect_args={"check_same_thread": False},
+        pool_size=20,
+        max_overflow=30,
+        pool_timeout=30,
+        pool_recycle=3600,
+        pool_pre_ping=True
+    )
+else:
+    # PostgreSQL — no check_same_thread, full connection pooling
+    engine = create_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_size=20,
+        max_overflow=30,
+        pool_timeout=30,
+        pool_recycle=3600,
+        pool_pre_ping=True
+    )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -733,8 +751,14 @@ def heartbeat_check():
     For each device marked as "online":
     - Execute lightweight command (echo 1)
     - Success: update last_heartbeat, keep status="online"
-    - Failure (connection lost): set status="offline", close SSH connection from pool
+    - Failure (connection lost): set status="offline"; if pool is OFFLINE/RECONNECTING,
+      leave the pool entry intact so auto-reconnect can complete
     - Failure (channel timeout): keep status="online", log warning
+
+    For each device marked as "offline" (SSH only):
+    - If pool reports ONLINE (auto-reconnect succeeded): verify and restore DB to "online"
+    - If pool reports RECONNECTING/OFFLINE: leave it alone, pool handles retry
+    - If not in pool / FAILED: attempt a fresh connection
 
     This ensures device status accurately reflects connectivity.
     Each device is committed independently to prevent one failure from affecting others.
@@ -847,12 +871,25 @@ def heartbeat_check():
                             db.commit()
                         ssh_pool.release_connection(dut.id)
                 else:
-                    # Cannot get connection - mark offline
-                    logger.warning(f"[HEARTBEAT] ✗ DUT {dut.id} ({dut.name}) cannot connect")
+                    # get_connection() returned None — the pool is in OFFLINE, RECONNECTING,
+                    # or FAILED state. Do NOT call close_connection() here; that would destroy
+                    # the pool entry and abort any in-progress auto-reconnect thread.
+                    # Just mark the device as offline in the DB and let the pool handle reconnection.
+                    pool_status_data = ssh_pool.get_pool_status()
+                    pool_conn_state = next(
+                        (c.get("status") for c in pool_status_data.get("connections", []) if c.get("dut_id") == dut.id),
+                        None
+                    )
+                    logger.warning(
+                        f"[HEARTBEAT] ✗ DUT {dut.id} ({dut.name}) cannot connect "
+                        f"(pool state: {pool_conn_state or 'not in pool'})"
+                    )
                     dut.status = "offline"
                     db.commit()
                     failure_count += 1
-                    ssh_pool.close_connection(dut.id)
+                    # Only permanently close if pool entry is FAILED or not in pool at all
+                    if pool_conn_state is None or pool_conn_state == "failed":
+                        ssh_pool.close_connection(dut.id)
 
             except Exception as e:
                 # Any error during heartbeat check for this specific device
@@ -863,6 +900,89 @@ def heartbeat_check():
                     pass
 
         logger.info(f"[HEARTBEAT] Completed: {success_count} OK, {failure_count} failed")
+
+        # ── Check offline SSH devices for successful pool auto-reconnections ──
+        # The SSH pool reconnects in the background (exponential backoff). When it
+        # succeeds the pool state turns ONLINE, but the DB still shows "offline".
+        # We scan offline devices here and restore them to "online" when the pool
+        # has reconnected, or attempt a fresh connection if the pool has no entry.
+        try:
+            offline_duts = db.query(DUT).filter(DUT.status == "offline").all()
+
+            if offline_duts:
+                pool_status_data = ssh_pool.get_pool_status()
+                pool_conn_map = {
+                    c.get("dut_id"): c.get("status")
+                    for c in pool_status_data.get("connections", [])
+                }
+
+                for dut in offline_duts:
+                    # Skip telnet devices — they have their own reconnect path
+                    if hasattr(dut, 'connection_type') and dut.connection_type == 'telnet':
+                        continue
+
+                    try:
+                        db.refresh(dut)
+                        pool_conn_state = pool_conn_map.get(dut.id)
+
+                        if pool_conn_state == "online":
+                            # Pool auto-reconnect succeeded — verify with a quick command
+                            ssh = ssh_pool.get_connection(
+                                dut.id, dut.ip_address, dut.port, dut.username, dut.password
+                            )
+                            if ssh:
+                                try:
+                                    _, _, exit_code = ssh.execute_command("echo 1", timeout=5)
+                                    if exit_code == 0:
+                                        dut.status = "online"
+                                        dut.last_heartbeat = datetime.utcnow()
+                                        db.commit()
+                                        logger.info(
+                                            f"[HEARTBEAT] ✓ DUT {dut.id} ({dut.name}) "
+                                            f"restored to ONLINE after auto-reconnect"
+                                        )
+                                    ssh_pool.release_connection(dut.id)
+                                except Exception:
+                                    ssh_pool.release_connection(dut.id)
+
+                        elif pool_conn_state in ("reconnecting", "offline"):
+                            # Pool is actively retrying — leave DB as offline, wait
+                            logger.debug(
+                                f"[HEARTBEAT] DUT {dut.id} ({dut.name}) pool reconnect in progress "
+                                f"(pool state: {pool_conn_state})"
+                            )
+
+                        else:
+                            # Not in pool or FAILED — attempt a fresh connection
+                            logger.info(
+                                f"[HEARTBEAT] DUT {dut.id} ({dut.name}) offline, attempting fresh connection"
+                            )
+                            ssh = ssh_pool.get_connection(
+                                dut.id, dut.ip_address, dut.port, dut.username, dut.password
+                            )
+                            if ssh:
+                                try:
+                                    _, _, exit_code = ssh.execute_command("echo 1", timeout=5)
+                                    if exit_code == 0:
+                                        dut.status = "online"
+                                        dut.last_heartbeat = datetime.utcnow()
+                                        db.commit()
+                                        logger.info(
+                                            f"[HEARTBEAT] ✓ DUT {dut.id} ({dut.name}) "
+                                            f"reconnected and restored to ONLINE"
+                                        )
+                                    ssh_pool.release_connection(dut.id)
+                                except Exception:
+                                    ssh_pool.release_connection(dut.id)
+
+                    except Exception as e:
+                        logger.error(f"[HEARTBEAT] Error checking offline DUT {dut.id}: {e}")
+                        try:
+                            db.rollback()
+                        except:
+                            pass
+        except Exception as e:
+            logger.error(f"[HEARTBEAT] Error checking offline devices: {e}")
 
     except Exception as e:
         logger.error(f"Heartbeat check initialization failed: {e}")
@@ -986,12 +1106,13 @@ def cleanup_expired_sessions():
 # Initialize background scheduler
 scheduler = BackgroundScheduler()
 
-# Startup event: clean up stuck executions from previous runs
+# Startup event: clean up stuck executions and hardware load jobs from previous runs
 @app.on_event("startup")
 def startup_cleanup():
-    """Clean up any executions stuck in 'running' state from previous server runs."""
+    """Clean up any executions or hardware load jobs stuck from previous server runs."""
     db = SessionLocal()
     try:
+        # ── Clean up stuck script executions ──────────────────────────────────
         stuck_executions = db.query(Execution).filter(Execution.status == "running").all()
         if stuck_executions:
             logger.warning(f"Found {len(stuck_executions)} stuck executions from previous run, marking as failed")
@@ -1002,6 +1123,28 @@ def startup_cleanup():
                     exec.duration_seconds = int((exec.end_time - exec.start_time).total_seconds())
             db.commit()
             logger.info(f"Cleaned up {len(stuck_executions)} stuck executions")
+
+        # ── Clean up stuck hardware load jobs ─────────────────────────────────
+        # Any job not in a terminal state means the server died mid-operation.
+        TERMINAL_STATES = ("completed", "failed", "cancelled")
+        stuck_hw_jobs = db.query(HardwareLoadJob).filter(
+            ~HardwareLoadJob.status.in_(TERMINAL_STATES)
+        ).all()
+        if stuck_hw_jobs:
+            logger.warning(f"Found {len(stuck_hw_jobs)} stuck hardware load jobs from previous run, marking as failed")
+            for hw_job in stuck_hw_jobs:
+                hw_job.status = "failed"
+                hw_job.error_message = "Server restarted — job was interrupted"
+                hw_job.current_step = "Interrupted by server restart"
+                if not hw_job.completed_at:
+                    hw_job.completed_at = datetime.utcnow()
+                # Append note to execution log
+                timestamp = datetime.utcnow().strftime("%H:%M:%S")
+                note = f"\n[{timestamp}] ✗ Job interrupted: server restarted while job was in progress.\n"
+                hw_job.execution_log = (hw_job.execution_log or "") + note
+            db.commit()
+            logger.info(f"Cleaned up {len(stuck_hw_jobs)} stuck hardware load jobs")
+
     except Exception as e:
         logger.error(f"Error during startup cleanup: {e}")
     finally:
@@ -1118,6 +1261,18 @@ async def serve_dashboard():
     if html_path.exists():
         return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
     return HTMLResponse(content="<h1>DUT Automation System</h1><p>Frontend not found. Place index.html in /static/</p>")
+
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint for Docker and load balancers."""
+    try:
+        db = SessionLocal()
+        db.execute(__import__("sqlalchemy").text("SELECT 1"))
+        db.close()
+        return {"status": "ok", "service": "eka-core", "database": "connected"}
+    except Exception as e:
+        return {"status": "degraded", "service": "eka-core", "database": str(e)}
 
 
 # ============================================================================
@@ -2009,6 +2164,49 @@ def cancel_hardware_load_job(
 
     logger.info(f"Hardware load job {job_id} cancelled by session {session_id}")
     return {"status": "cancelled", "job_id": job_id, "message": "Hardware load job has been cancelled"}
+
+
+@app.delete("/api/hardware-load/job/{job_id}")
+def delete_hardware_load_job(
+    job_id: int,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Permanently delete a hardware load job record from history.
+
+    Only completed, failed, or cancelled jobs can be deleted.
+    Running jobs must be cancelled first before deleting.
+
+    Args:
+        job_id: Hardware load job ID to delete
+        request: FastAPI request (for session validation)
+        db: Database session
+
+    Returns:
+        Confirmation message
+    """
+    session_id = request.headers.get("X-Session-ID", "default")
+
+    job = db.query(HardwareLoadJob).filter(
+        HardwareLoadJob.id == job_id,
+        HardwareLoadJob.session_id == session_id
+    ).first()
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or access denied")
+
+    if job.status not in ("completed", "failed", "cancelled"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete a job that is currently '{job.status}'. Cancel it first."
+        )
+
+    db.delete(job)
+    db.commit()
+
+    logger.info(f"Hardware load job {job_id} deleted by session {session_id}")
+    return {"status": "deleted", "job_id": job_id, "message": "Hardware load job record deleted"}
 
 
 @app.get("/api/hardware-load/jobs")
@@ -3952,6 +4150,50 @@ def browse_spytest_folder(path: str, host_id: int, db: Session = Depends(get_db)
             "scripts": [{"name": "test_bgp_basic.py", "path": "routing/bgp/test_bgp_basic.py", "full_path": "/full/path"}]
         }
     """
+    if host_id == 5:
+        parent_path = ""
+        if path and "/" in path:
+            parent_path = "/".join(path.split("/")[:-1])
+        norm_path = path.strip().strip('/')
+        if not norm_path:
+            subfolders = ["routing", "switching", "security"]
+            scripts = []
+        elif norm_path == "routing":
+            subfolders = ["bgp", "ospf"]
+            scripts = [{"name": "test_routing_basic.py", "path": "routing/test_routing_basic.py", "full_path": "/mock/routing/test_routing_basic.py"}]
+        elif norm_path == "routing/bgp":
+            subfolders = []
+            scripts = [
+                {"name": "test_bgp_route_advertise.py", "path": "routing/bgp/test_bgp_route_advertise.py", "full_path": "/mock/routing/bgp/test_bgp_route_advertise.py"},
+                {"name": "test_bgp_route_filtering.py", "path": "routing/bgp/test_bgp_route_filtering.py", "full_path": "/mock/routing/bgp/test_bgp_route_filtering.py"},
+                {"name": "test_bgp_graceful_restart.py", "path": "routing/bgp/test_bgp_graceful_restart.py", "full_path": "/mock/routing/bgp/test_bgp_graceful_restart.py"}
+            ]
+        elif norm_path == "switching":
+            subfolders = ["lacp", "vlan"]
+            scripts = []
+        elif norm_path == "switching/lacp":
+            subfolders = []
+            scripts = [
+                {"name": "test_lacp_convergence.py", "path": "switching/lacp/test_lacp_convergence.py", "full_path": "/mock/switching/lacp/test_lacp_convergence.py"},
+                {"name": "test_lacp_redundancy.py", "path": "switching/lacp/test_lacp_redundancy.py", "full_path": "/mock/switching/lacp/test_lacp_redundancy.py"}
+            ]
+        elif norm_path == "switching/vlan":
+            subfolders = []
+            scripts = [
+                {"name": "test_vlan_trunking.py", "path": "switching/vlan/test_vlan_trunking.py", "full_path": "/mock/switching/vlan/test_vlan_trunking.py"}
+            ]
+        else:
+            subfolders = []
+            scripts = []
+        return {
+            "current_path": norm_path,
+            "parent_path": parent_path,
+            "subfolders": subfolders,
+            "scripts": scripts,
+            "subfolder_count": len(subfolders),
+            "script_count": len(scripts)
+        }
+
     ssh, dut = _ssh_to_host(host_id, db)
     try:
         # Sanitize path - remove leading/trailing slashes
@@ -4023,6 +4265,8 @@ def browse_spytest_folder(path: str, host_id: int, db: Session = Depends(get_db)
 @app.get("/api/spytest/testbeds")
 def get_spytest_testbeds(host_id: int, db: Session = Depends(get_db)):
     """List testbed YAML files from the remote SPyTest testbed directory."""
+    if host_id == 5:
+        return {"testbeds": ["testbed_2_switches.yaml", "testbed_standalone_switch.yaml", "testbed_spine_leaf.yaml"], "base_path": "/mock/testbeds"}
     ssh, dut = _ssh_to_host(host_id, db)
     try:
         cmd = f'find {SPYTEST_TESTBED_DIR} -maxdepth 1 -name "*.yaml" -type f -printf "%f\\n" | sort'
@@ -4048,6 +4292,18 @@ def get_spytest_script_info(body: dict, db: Session = Depends(get_db)):
     script_path = body.get("script_path")  # relative to tests dir
     if not host_id or not script_path:
         raise HTTPException(status_code=400, detail="host_id and script_path required")
+
+    if host_id == 5:
+        script_name = os.path.basename(script_path)
+        return {
+            "topology_marker": "D1D2:2",
+            "min_topology": ["D1", "D2", "D1D2:2"],
+            "dut_count": 2,
+            "description": f"Verifies functionality of BGP routing on 2 connected switches. Running: {script_name}",
+            "topology_type": "linear",
+            "script_path": script_path,
+            "script_name": script_name
+        }
 
     ssh, dut = _ssh_to_host(host_id, db)
     try:

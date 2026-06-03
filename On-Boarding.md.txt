@@ -1,0 +1,395 @@
+One PalC Based SSO – What & Why 
+What is One PalC 
+It is a Hub-Based SSO model which a central authentication broker (Hub) that sits between users and all onboarded applications. 
+
+The Hub (One PalC) handles  
+User authentication (via Identity Provider like Azure AD)  
+
+Token generation and validation  
+
+Centralized access control  
+
+Applications do not authenticate users directly  
+
+Instead, applications trust the Hub and consume validated identity + roles  
+
+In simple terms 
+One login → Hub verifies → All applications trust the Hub 
+
+How It Works (Conceptually) 
+
+User accesses an application  
+
+Application redirects user to One PalC Hub  
+
+One PalC authenticates user (e.g., via Azure AD + MFA)  
+
+One PalC issues an auth token  
+
+User is redirected back to the application  
+
+Application validates token using the OnePalC Public Key 
+
+Application retrieves user id, roles for the application post validation 
+
+Application creates user session based on the details and allow the user in the application 
+
+Why Hub-Based SSO 
+
+1. Centralized Authentication 
+
+No need for each application to implement login  
+
+Authentication logic is standardized and secure  
+
+2. Improved Security 
+
+Policies, and identity controls are handled centrally  
+
+Reduces risk of weak or inconsistent implementations  
+
+Tokens are validated through a trusted system  
+
+3. Better User Experience 
+
+Users log in once and access multiple applications  
+
+Eliminates repeated login prompts  
+
+4. Centralized Access Control 
+
+Role-based access managed via One PalC  
+
+Application owners define roles, but enforcement is consistent  
+
+5. Faster Application Onboarding 
+
+New applications plug into the Hub instead of building auth from scratch  
+
+Reduces development effort significantly  
+
+6. Audit & Governance 
+
+All access and authentication flows are tracked centrally  
+
+Easier compliance and reporting  
+
+What Changes for Application Teams 
+
+Instead of building authentication 
+
+Traditional Approach 
+
+Hub-Based SSO Approach 
+
+Build login UI 
+
+Redirect to Hub 
+
+Store passwords 
+
+No credential storage 
+
+Implement auth logic 
+
+Validate token only 
+
+ 
+
+Key Responsibility Split 
+
+One PalC Hub  
+
+Authentication  
+
+Token issuance  
+
+Policy enforcement  
+
+Application  
+
+Token validation  
+Session creation  
+Role-based authorization  
+Redirect URI 
+URL where the user will be redirected after authentication. This endpoint must handle and consume the authentication token 
+httpsyouapplicationDomainCallbackUrl  
+
+Local Example httplocalhost8005hub-callback.php 
+Application Owner 
+Single point of ownership for the application 
+The owner will receive access approval requests after manager approval 
+Application Roles 
+
+Define roles within the application 
+
+Example 
+• Role1 
+• Role2 
+• Role3  
+ 
+Also specify 
+- Whether roles are assigned on request, or 
+- Assigned by default based on predefined conditions 
+
+ 
+
+Step 2 IT Onboarding 
+
+The IT team will  
+
+Configure the application in One PalC  
+
+Validate the provided details  
+
+A confirmation will be shared once onboarding is complete  
+
+IT team will share the API Token and One PalC Public key required for integration  
+
+IT will share the following information  
+
+Field 
+
+Description 
+
+One PalCHub Auth URL 
+
+This is the Hub URL to which your application need to redirect the authentication request 
+
+Public Key 
+
+Public Key of Dev  Prod 
+
+Api Token 
+
+Api Token specific to your application 
+
+ 
+
+Step 3 Role Management by Application Owner 
+
+After onboarding  
+
+The Application Owner can log in to One PalC  
+
+Manage application roles, under my application 
+
+Adding new roles  
+
+Modifying existing roles  
+
+Removing roles  
+
+ 
+
+The owner is also responsible for handling role-based access approvals  
+
+Shape 
+
+Key Notes 
+
+Only one application owner is supported per application  
+
+Keep the API Token secure and do not expose it in client-side code  
+
+Clearly define role assignment logic to avoid access issues later 
+
+Guide - Implementation at Application End 
+
+Step 1  Redirect user to One PalC Auth URL when authentication is required 
+
+Format for Calling authentication URL   
+
+ 
+
+https One PalCHub Auth URL  app_name=YOUR_APP_NAME&redirect_uri=  
+
+t URI) 
+
+After Authentication, One PalCHub will redirect the user to the Application callback URL with a Token, Retrieve the TOKEN 
+
+ 
+
+Format of the redirected URL 
+
+ 
+
+https YOUR_CALLBACK_URL token=TOKEN 
+
+YOUR_CALLBACK_URL &api_token=API_TOKEN 
+
+ 
+
+One PalCHub Auth URL 	 Auth URL shared by IT 
+
+YOUR_APP_NAME		 Application name you shared while onboarding 
+
+YOUR_CALLBACK_URL	 Application Redirect URL you sahred while onboarding 
+
+API_TOKEN			 API token shared by IT 
+
+ 
+
+Step 2  Callback Handling (Your Redirec 
+
+Step 3 Validate and Consume the Token  
+
+Validate the token using Public Key shared by the IT team and then use the Token, rettrive Sub which is the user id, Filter roles based on application name. 
+
+ 
+
+Token Format  The token is a JWT-like structure containing user identity and roles. 
+
+{ 
+
+  sub balamurali.kumar@palcnetworks.com, 
+
+  name Balamurali Santhakumar, 
+
+  roles { 
+
+    CIS CRMAdmin, 
+
+    DELIVERY MANAGEMENT DMAdmin, 
+
+    WORKPULSE Admin, User 
+
+  }, 
+
+  exp 1757484858 
+
+} 
+
+sub → User’s unique identifier (email). 
+
+name → Full name of the user. 
+
+roles → Application-specific role mappings. 
+
+exp → Token expiry (Unix timestamp). 
+
+ 
+
+Step 4  Create Local Application Session based on Token  
+
+Step 5  Consume One PalC User API’s 
+
+API 1  To pull all the user who have access to your application with appropriate roles 
+
+Refer following attached instruction for the same 
+
+ActiveX control 
+
+API 2  Single user details 
+
+Fetch Employees 
+
+Use the API token to fetch employee details. 
+
+Endpoint  
+
+Non Prod    httpsDev_ULRapiusers 
+
+Prod   httpsonepalc.palcnetworks.comworkpulseapiusers 
+
+Parameters 
+
+app_name=application name 
+
+token=apitoken 
+
+ 
+
+Fetch Individual User 
+
+To fetch details of a specific user, include the email parameter along with the token. 
+
+ 
+
+Step 6  Redirect user to OnePalC Login during Logout 
+
+ 
+
+ 
+
+Pre build working base code for One Palc integration - PHP 
+
+ 
+
+To reduce the time and repeated effort , following PHP based Code base ( BaseApp ) has been developed . this is a skeleton application. On top of which you can build your application. 
+
+ 
+
+These Code base (BaseApp) takes care of  
+
+ 
+
+Authentication flow , Login , Logout 
+
+Notification Centre 
+
+Different authentication  module 
+
+Lookups module 
+
+Logging mechanism 
+
+Audit mechanism 
+
+User provisioning API integration 
+
+UI template 
+
+Different type of mysql database 
+
+ 
+
+Using Claude   Additional Support for development using 
+
+ 
+
+Base Claude.md refereeing to Architecture mark down file and UI template mark down file. 
+
+Reference to the API template. 
+
+Predefined Agents for 
+
+Lead Orchestrator 
+
+Frontend 
+
+Backend 
+
+Security Audit 
+
+Testing 
+
+Steps for for using the Base app 
+
+Download the BaseApp Package and AppTemplate Package. 
+
+ 
+
+Rename BaseApp package to your new application name, make sure this what is communicated as part of onboarding 
+
+ 
+
+Change .env file inside the BaseApp folder to point to your DB. The .env may not be visible. Use console to edit. 
+
+ 
+
+Create DB and import the SQL file BaseApp.sql which is there in the BaseApp folder 
+
+mysql -u user -p DB_NAME  BaseApp.sql 
+
+ 
+
+Make sure PHP is installed and running . 
+
+ 
+
+Run the application by pointing to public folder ex 
+
+ 
+
+php -S localhost8007 -t public 

@@ -9,7 +9,11 @@
         content="Eka Automation — Network Test Execution Platform. Manage DUTs, VMs, topology, spytest scripts, and stream real-time logs.">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
-    <link rel="stylesheet" href="/static/style.css?v=39">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons+Round">
+    <link rel="stylesheet" href="/static/style.css?v=40">
     <link rel="stylesheet" href="/static/responsive.css?v=2">
 </head>
 
@@ -769,14 +773,16 @@
                             <label for="hwSubnetMask">Subnet Mask</label>
                             <input type="text" id="hwSubnetMask" required placeholder="255.255.255.255" value="255.255.255.255" />
                         </div>
+                        <div class="hw-form-group hw-form-group-narrow">
+                            <label for="hwServerPassword">Server Password</label>
+                            <input type="password" id="hwServerPassword" required placeholder="SCP server password" autocomplete="off" title="Password for the source server (e.g. hp_test's Linux account password)" />
+                        </div>
                         <div class="hw-form-group hw-form-group-button">
                             <label>&nbsp;</label>
                             <button type="submit" class="btn primary">
                                 <span class="material-icons-round">play_arrow</span> Start
                             </button>
                         </div>
-                        <!-- Hidden password field for form submission - auto-filled from device -->
-                        <input type="hidden" id="hwServerPassword" />
                     </form>
                 </div>
             </div>
@@ -869,6 +875,29 @@
         </section>
     </main>
 
+    <!-- HW Job Log Modal (dedicated, avoids "undefined" from generic modal) -->
+    <div class="modal-overlay" id="hw-job-modal-overlay" onclick="closeHWJobModal()">
+        <div class="modal" onclick="event.stopPropagation()" style="max-width:92%;width:1100px;max-height:90vh;display:flex;flex-direction:column;">
+            <div class="modal-header">
+                <h3 id="hw-job-modal-title" style="display:flex;align-items:center;gap:8px;">
+                    <span class="material-icons-round">terminal</span>
+                    Hardware Load Job
+                </h3>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <button id="hw-job-delete-btn" class="btn outline small" style="color:var(--red);" title="Delete this job record" onclick="deleteHWJobFromModal()">
+                        <span class="material-icons-round" style="font-size:16px;">delete</span> Delete
+                    </button>
+                    <button class="btn-icon" onclick="closeHWJobModal()" title="Close">
+                        <span class="material-icons-round">close</span>
+                    </button>
+                </div>
+            </div>
+            <div class="modal-body" id="hw-job-modal-body" style="overflow-y:auto;flex:1;">
+                <!-- Populated dynamically -->
+            </div>
+        </div>
+    </div>
+
     <!-- Toast container -->
     <div id="toast-container"></div>
 
@@ -910,7 +939,7 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=50"></script>
+    <script src="/static/app.js?v=53"></script>
 </body>
 
 </html>

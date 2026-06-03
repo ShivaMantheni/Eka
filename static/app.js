@@ -24,6 +24,7 @@ let terminalOutputBuffer = []; // Store all terminal output for reconnection
 let terminalCurrentDutId = null; // Track which DUT is currently connected
 let terminalIsReconnecting = false; // Flag to prevent multiple reconnect attempts
 let terminalHeartbeatInterval = null; // Interval ID for heartbeat monitoring
+let _termVisibilityListenerAdded = false; // Guard to prevent duplicate visibilitychange listeners
 
 // ============================================================
 // API HELPERS - Session-based headers
@@ -1139,13 +1140,26 @@ async function loadDUTLockStatus() {
 function renderDUTChecklist() {
     const el = document.getElementById('exec-dut-checklist');
     if (!el) return;
-    const duts = dutsData.filter(d => d.device_type === 'DUT');
+    // Only show DUTs that are online — offline devices cannot be used for execution
+    const allDuts = dutsData.filter(d => d.device_type === 'DUT');
+    const duts = allDuts.filter(d => d.status === 'online');
+    const offlineCount = allDuts.length - duts.length;
+
     if (!duts.length) {
-        el.innerHTML = '<p class="muted" style="padding:8px;font-size:12px;margin:0">No DUTs available. Add devices with type "DUT" in Devices tab.</p>';
+        const offlineNote = offlineCount > 0
+            ? ` <span style="color:var(--text-secondary);font-size:11px">(${offlineCount} offline device${offlineCount > 1 ? 's' : ''} hidden)</span>`
+            : '';
+        el.innerHTML = `<p class="muted" style="padding:8px;font-size:12px;margin:0">No online DUTs available.${offlineNote} Add devices with type "DUT" in Devices tab.</p>`;
         updateDUTSelectionCount();
         return;
     }
-    el.innerHTML = duts.map(d => {
+    const offlineBanner = offlineCount > 0
+        ? `<div style="padding:4px 8px;font-size:11px;color:var(--text-secondary);display:flex;align-items:center;gap:4px;border-bottom:1px solid var(--border)">
+               <span class="material-icons-round" style="font-size:13px;color:#ef4444">wifi_off</span>
+               ${offlineCount} offline device${offlineCount > 1 ? 's' : ''} hidden
+           </div>`
+        : '';
+    el.innerHTML = offlineBanner + duts.map(d => {
         const checked = selectedDUTIds.has(d.id) ? 'checked' : '';
         const sel = selectedDUTIds.has(d.id) ? 'selected' : '';
         const lockStatus = dutLockStatus[d.id] || 'AVAILABLE';
@@ -1254,15 +1268,24 @@ let scriptsData = [];
 function renderSpyVMs() {
     const sel = document.getElementById('spy-vm-select');
     if (!sel) return;
-    const vms = dutsData.filter(d => d.device_type === 'VM');
+    // Only show online VMs — offline VMs cannot run test scripts
+    const allVms = dutsData.filter(d => d.device_type === 'VM');
+    const vms = allVms.filter(d => d.status === 'online');
+    const offlineCount = allVms.length - vms.length;
     const prevVal = sel.value;
     sel.innerHTML = '<option value="">-- Select VM Host --</option>';
     vms.forEach(d => {
         const opt = document.createElement('option');
         opt.value = d.id;
-        opt.textContent = `${d.name} (${d.ip_address}:${d.port}) — ${d.status}`;
+        opt.textContent = `\u{1F7E2} ${d.name} (${d.ip_address}:${d.port})`;
         sel.appendChild(opt);
     });
+    if (offlineCount > 0) {
+        const divider = document.createElement('option');
+        divider.disabled = true;
+        divider.textContent = `\u2014 ${offlineCount} offline VM${offlineCount > 1 ? 's' : ''} hidden \u2014`;
+        sel.appendChild(divider);
+    }
     if (prevVal) sel.value = prevVal;
     updateSpyStartBtn();
 }
@@ -2329,7 +2352,9 @@ let currentViewingExecId = null;
 async function viewExecLogs(execId) {
     try {
         currentViewingExecId = execId;
-        const res = await fetch(`${API}/api/executions/${execId}/logs?limit=500`);
+        const res = await fetch(`${API}/api/executions/${execId}/logs?limit=500`, {
+            headers: getSessionHeaders()
+        });
         const logs = await res.json();
 
         // Show modal instead of inline card
@@ -2476,10 +2501,30 @@ async function showDeleteChoiceDialog(message, options) {
 function renderTermDUTList() {
     const sel = document.getElementById('term-dut');
     const current = sel.value;
-    // Filter out telnet devices - Terminal tab only supports SSH
-    const sshDevices = dutsData.filter(d => d.connection_type !== 'telnet');
-    sel.innerHTML = '<option value="">-- Select Device --</option>' +
-        sshDevices.map(d => `<option value="${d.id}" ${d.id == current ? 'selected' : ''}>${esc(d.name)} (${esc(d.ip_address)})</option>`).join('');
+    // Terminal tab: only show online SSH devices — offline or telnet devices
+    // cannot open a PTY session.
+    const allSsh = dutsData.filter(d => d.connection_type !== 'telnet');
+    const onlineSsh = allSsh.filter(d => d.status === 'online');
+    const offlineCount = allSsh.length - onlineSsh.length;
+
+    sel.innerHTML = '<option value="">-- Select Device --</option>';
+    onlineSsh.forEach(d => {
+        const opt = document.createElement('option');
+        opt.value = d.id;
+        opt.textContent = `\u{1F7E2} ${d.name} (${d.ip_address})`;
+        opt.selected = d.id == current;
+        sel.appendChild(opt);
+    });
+    if (offlineCount > 0) {
+        const divider = document.createElement('option');
+        divider.disabled = true;
+        divider.textContent = `\u2014 ${offlineCount} offline device${offlineCount > 1 ? 's' : ''} hidden \u2014`;
+        sel.appendChild(divider);
+    }
+    // If the previously selected device is now offline, clear it
+    if (current && !onlineSsh.find(d => d.id == current)) {
+        sel.value = '';
+    }
 }
 
 /**
@@ -2538,9 +2583,19 @@ async function initPTYTerminal(dutId) {
         return;
     }
 
+    // ── Snapshot the dutId we are connecting to ─────────────────────────────
+    const thisDutId = dutId;
+
+    // ── Reset reconnect state for the new session ────────────────────────────
+    terminalIsReconnecting = false;
+
+    // ── Null out current DUT while we switch ────────────────────────────────
+    terminalCurrentDutId = null;
+
     // Clean up existing terminal and connection
     if (terminalSocket) {
         console.log('[PTY] Closing existing WebSocket connection');
+        terminalSocket.onclose = null; // detach handler before close to avoid stale reconnect
         terminalSocket.close();
         terminalSocket = null;
     }
@@ -2549,6 +2604,10 @@ async function initPTYTerminal(dutId) {
         terminalInstance.dispose();
         terminalInstance = null;
     }
+
+    // Now set the authoritative current DUT
+    terminalCurrentDutId = thisDutId;
+    terminalOutputBuffer = [];
 
     // Get container element
     const container = document.getElementById('term-container');
@@ -2622,16 +2681,11 @@ async function initPTYTerminal(dutId) {
     // Establish WebSocket connection with session authentication
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const sessionId = localStorage.getItem('eka-session-id');
-    const wsUrl = `${wsProtocol}//${window.location.host}/api/terminal/ws/${dutId}?session_id=${sessionId}`;
+    const wsUrl = `${wsProtocol}//${window.location.host}/api/terminal/ws/${thisDutId}?session_id=${sessionId}`;
     console.log(`[PTY] Connecting to ${wsUrl}`);
 
     const ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
-
-    // Track current DUT and reset buffer on new connection
-    terminalCurrentDutId = dutId;
-    terminalOutputBuffer = [];
-    terminalIsReconnecting = false;
 
     // WebSocket event handlers
     ws.onopen = () => {
@@ -2688,22 +2742,40 @@ async function initPTYTerminal(dutId) {
 
     ws.onerror = (error) => {
         console.error('[PTY] WebSocket error:', error);
-        term.write('\r\n\x1b[31m✗ Connection error\x1b[0m\r\n');
-        toast('Terminal connection error', 'error');
+        // Only write to the terminal if it still belongs to this session
+        if (terminalCurrentDutId === thisDutId) {
+            term.write('\r\n\x1b[31m✗ Connection error\x1b[0m\r\n');
+            toast('Terminal connection error', 'error');
+        }
     };
 
     ws.onclose = (event) => {
         console.log('[PTY] WebSocket closed:', event.code, event.reason);
+
+        // ── Stale-socket guard ────────────────────────────────────────────────
+        if (terminalCurrentDutId !== thisDutId) {
+            console.log(`[PTY] Ignoring onclose for stale DUT ${thisDutId} (current: ${terminalCurrentDutId})`);
+            return;
+        }
+
         term.write('\r\n\x1b[33m[Terminal session ended - attempting to reconnect...]\x1b[0m\r\n');
 
         // Auto-reconnect if user is actively viewing Terminal tab
         if (!document.hidden && terminalCurrentDutId && !terminalIsReconnecting) {
             terminalIsReconnecting = true;
             setTimeout(() => {
-                console.log(`[PTY] Auto-reconnecting to DUT ${terminalCurrentDutId}...`);
-                initPTYTerminal(terminalCurrentDutId).catch(e => {
+                // Re-check guard after the delay — user may have switched device
+                if (terminalCurrentDutId !== thisDutId) {
+                    console.log(`[PTY] Reconnect cancelled: device changed from ${thisDutId} to ${terminalCurrentDutId}`);
+                    terminalIsReconnecting = false;
+                    return;
+                }
+                console.log(`[PTY] Auto-reconnecting to DUT ${thisDutId}...`);
+                initPTYTerminal(thisDutId).catch(e => {
                     console.error('[PTY] Auto-reconnect failed:', e);
-                    term.write('\x1b[31mReconnection failed. Select device to try again.\x1b[0m\r\n');
+                    if (terminalCurrentDutId === thisDutId && terminalInstance) {
+                        terminalInstance.writeln('\x1b[31mReconnection failed. Select device to try again.\x1b[0m');
+                    }
                 });
             }, 1000);  // Wait 1 second before attempting reconnect
         }
@@ -2746,17 +2818,17 @@ async function initPTYTerminal(dutId) {
     terminalInstance = term;
     terminalSocket = ws;
 
-    // Add Page Visibility API detection for tab focus (one-time setup)
-    if (!terminalHeartbeatInterval) {
+    // Add Page Visibility API detection for tab focus (one-time setup only)
+    if (!_termVisibilityListenerAdded) {
+        _termVisibilityListenerAdded = true;
         document.addEventListener('visibilitychange', () => {
-            if (!document.hidden && terminalCurrentDutId && terminalIsReconnecting && terminalSocket?.readyState !== WebSocket.OPEN) {
+            if (!document.hidden && terminalCurrentDutId && terminalIsReconnecting &&
+                terminalSocket?.readyState !== WebSocket.OPEN) {
                 // Tab became visible and connection was lost - try to reconnect
                 console.log('[PTY] Tab became visible - checking connection...');
-                if (terminalSocket?.readyState !== WebSocket.OPEN) {
-                    initPTYTerminal(terminalCurrentDutId).catch(e => {
-                        console.error('[PTY] Visibility-triggered reconnect failed:', e);
-                    });
-                }
+                initPTYTerminal(terminalCurrentDutId).catch(e => {
+                    console.error('[PTY] Visibility-triggered reconnect failed:', e);
+                });
             }
         });
     }
@@ -2775,8 +2847,13 @@ async function termDeviceChanged() {
     console.log('[PTY] Device changed - DUT ID:', dutId);
 
     if (!dutId) {
-        // No device selected - clean up and show placeholder
+        // No device selected - clear state flags FIRST so any in-flight
+        // onclose from the closing socket sees null and skips reconnect.
+        terminalCurrentDutId = null;
+        terminalIsReconnecting = false;
+
         if (terminalSocket) {
+            terminalSocket.onclose = null; // detach before close
             terminalSocket.close();
             terminalSocket = null;
         }
@@ -4004,34 +4081,35 @@ function renderVSHostList() {
     const current = sel.value;
     sel.innerHTML = '<option value="">-- Select Host Device --</option>';
 
-    // Filter: Only show VM, Switch, and Router (exclude DUT devices)
+    // Filter: Only show online VM, Switch, and Router devices
+    // Offline devices cannot be used as VS hosts
     const vsHostDevices = dutsData.filter(d =>
-        d.device_type === 'VM' || d.device_type === 'Switch' || d.device_type === 'Router'
+        (d.device_type === 'VM' || d.device_type === 'Switch' || d.device_type === 'Router')
+        && d.status === 'online'
     );
+    const offlineCount = dutsData.filter(d =>
+        (d.device_type === 'VM' || d.device_type === 'Switch' || d.device_type === 'Router')
+        && d.status !== 'online'
+    ).length;
 
     vsHostDevices.forEach(d => {
         const option = document.createElement('option');
         option.value = d.id;
-
-        // Status indicator (colored dot)
-        const statusColor = d.status === 'online' ? '#10b981' :
-                           d.status === 'offline' ? '#ef4444' : '#f59e0b';
-        const statusDot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};margin-right:6px;vertical-align:middle"></span>`;
-
-        // Show status text for non-online devices
-        const statusText = d.status !== 'online' ? ` [${d.status || 'unknown'}]` : '';
-
-        option.innerHTML = `${statusDot}${esc(d.name)} (${esc(d.ip_address)})${statusText}`;
+        option.textContent = `\u{1F7E2} ${d.name} (${d.ip_address})`;
         option.selected = d.id == current;
-
-        // Disable devices that are not online
-        if (d.status !== 'online') {
-            option.disabled = true;
-            option.style.color = '#6b7280';
-        }
-
         sel.appendChild(option);
     });
+
+    if (offlineCount > 0) {
+        const divider = document.createElement('option');
+        divider.disabled = true;
+        divider.textContent = `\u2014 ${offlineCount} offline device${offlineCount > 1 ? 's' : ''} hidden \u2014`;
+        sel.appendChild(divider);
+    }
+    // If previously selected device is now offline, reset selection
+    if (current && !vsHostDevices.find(d => d.id == current)) {
+        sel.value = '';
+    }
 }
 
 function renderVSSourceServerList() {
@@ -4040,30 +4118,28 @@ function renderVSSourceServerList() {
     const current = sel.value;
     sel.innerHTML = '<option value="">-- Use Host Device (Local Copy) --</option>';
 
-    // Show all devices (VM, Switch, Router, DUT) as potential source servers
-    dutsData.forEach(d => {
+    // Only show online devices as source servers
+    const onlineDevices = dutsData.filter(d => d.status === 'online');
+    const offlineCount = dutsData.length - onlineDevices.length;
+
+    onlineDevices.forEach(d => {
         const option = document.createElement('option');
         option.value = d.id;
-
-        // Status indicator (colored dot)
-        const statusColor = d.status === 'online' ? '#10b981' :
-                           d.status === 'offline' ? '#ef4444' : '#f59e0b';
-        const statusDot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};margin-right:6px;vertical-align:middle"></span>`;
-
-        // Show status text for non-online devices
-        const statusText = d.status !== 'online' ? ` [${d.status || 'unknown'}]` : '';
-
-        option.innerHTML = `${statusDot}${esc(d.name)} (${esc(d.ip_address)})${statusText}`;
+        option.textContent = `\u{1F7E2} ${d.name} (${d.ip_address})`;
         option.selected = d.id == current;
-
-        // Disable devices that are not online
-        if (d.status !== 'online') {
-            option.disabled = true;
-            option.style.color = '#6b7280';
-        }
-
         sel.appendChild(option);
     });
+
+    if (offlineCount > 0) {
+        const divider = document.createElement('option');
+        divider.disabled = true;
+        divider.textContent = `\u2014 ${offlineCount} offline device${offlineCount > 1 ? 's' : ''} hidden \u2014`;
+        sel.appendChild(divider);
+    }
+    // If previously selected device is now offline, reset selection
+    if (current && !onlineDevices.find(d => d.id == current)) {
+        sel.value = '';
+    }
 }
 
 function onVSHostChange() {
@@ -4532,7 +4608,9 @@ async function waitForExecution(execId, label, logEl) {
         console.log(`[waitForExecution] Polling exec ${execId} at ${elapsed}s / ${maxWait}s`);
 
         try {
-            const res = await fetch(`${API}/api/executions/${execId}`);
+            const res = await fetch(`${API}/api/executions/${execId}`, {
+                headers: getSessionHeaders()
+            });
             if (!res.ok) {
                 console.warn(`[waitForExecution] API returned ${res.status} for exec ${execId}`);
                 continue;
@@ -4541,7 +4619,9 @@ async function waitForExecution(execId, label, logEl) {
             console.log(`[waitForExecution] Exec ${execId} status:`, exec.status);
 
             // Also fetch logs for display
-            const logsRes = await fetch(`${API}/api/executions/${execId}/logs?limit=200`);
+            const logsRes = await fetch(`${API}/api/executions/${execId}/logs?limit=200`, {
+                headers: getSessionHeaders()
+            });
             if (logsRes.ok) {
                 const logsData = await logsRes.json();
                 // API returns array directly, not {logs: [...]}
@@ -4646,7 +4726,9 @@ async function waitForVSCompletion(execId, label, logEl) {
 async function pollForCompletion(execId, label, timeout, resolve, reject) {
     const pollInterval = setInterval(async () => {
         try {
-            const res = await fetch(`${API}/api/executions/${execId}`);
+            const res = await fetch(`${API}/api/executions/${execId}`, {
+                headers: getSessionHeaders()
+            });
             if (res.ok) {
                 const exec = await res.json();
                 console.log(`[pollForCompletion] Exec ${execId} status: ${exec.status}`);
@@ -4784,9 +4866,20 @@ document.addEventListener('change', (e) => {
 // ============================================================================
 
 // Hardware Load state
-let currentHWJobId = null;
+// currentHWJobId is persisted to localStorage so it survives page refresh
+let currentHWJobId = parseInt(localStorage.getItem('hwCurrentJobId')) || null;
 let hwWebSocket = null;
 let hwAutoScroll = true;
+let hwReconnectTimer = null;  // setTimeout handle for reconnect
+let hwViewingJobId = null;    // Which job is open in the modal
+
+// On DOMContentLoaded, try to reconnect to any in-progress job
+document.addEventListener('DOMContentLoaded', () => {
+    if (currentHWJobId) {
+        // Give the rest of the app a moment to settle before reconnecting
+        setTimeout(() => hwTryResumeJob(currentHWJobId), 1500);
+    }
+});
 
 /**
  * Load hardware devices (telnet-only) for device dropdown
@@ -4801,8 +4894,9 @@ async function loadHardwareDevices() {
 
         const devices = await response.json();
 
-        // Filter for telnet devices only
-        const telnetDevices = devices.filter(d => d.connection_type === 'telnet');
+        // Filter for online telnet devices only — offline devices cannot be used
+        const telnetDevices = devices.filter(d => d.connection_type === 'telnet' && d.status === 'online');
+        const offlineTelnetCount = devices.filter(d => d.connection_type === 'telnet' && d.status !== 'online').length;
 
         const deviceSelect = document.getElementById('hwDeviceSelect');
         if (!deviceSelect) {
@@ -4815,28 +4909,45 @@ async function loadHardwareDevices() {
         telnetDevices.forEach(device => {
             const option = document.createElement('option');
             option.value = device.id;
-            option.textContent = `${device.name} (${device.ip_address}:${device.port})`;
+            option.textContent = `\u{1F7E2} ${device.name} (${device.ip_address}:${device.port})`;
             deviceSelect.appendChild(option);
         });
 
-        // Load all devices for source server dropdown (SSH/Telnet)
+        if (offlineTelnetCount > 0) {
+            const divider = document.createElement('option');
+            divider.disabled = true;
+            divider.textContent = `\u2014 ${offlineTelnetCount} offline device${offlineTelnetCount > 1 ? 's' : ''} hidden \u2014`;
+            deviceSelect.appendChild(divider);
+        }
+
+        // Load only online devices for source server dropdown
         const serverSelect = document.getElementById('hwSourceServer');
         if (!serverSelect) {
             console.warn('Hardware Load server select not found.');
             return;
         }
 
+        const onlineServers = devices.filter(d => d.status === 'online');
+        const offlineServerCount = devices.length - onlineServers.length;
+
         serverSelect.innerHTML = '<option value="">-- Select Server --</option>';
 
-        devices.forEach(device => {
+        onlineServers.forEach(device => {
             const option = document.createElement('option');
             option.value = device.id;
-            option.textContent = `${device.name} (${device.ip_address})`;
+            option.textContent = `\u{1F7E2} ${device.name} (${device.ip_address})`;
             option.dataset.password = device.password || '';
             option.dataset.username = device.username || 'admin';
             option.dataset.ip = device.ip_address;
             serverSelect.appendChild(option);
         });
+
+        if (offlineServerCount > 0) {
+            const divider = document.createElement('option');
+            divider.disabled = true;
+            divider.textContent = `\u2014 ${offlineServerCount} offline device${offlineServerCount > 1 ? 's' : ''} hidden \u2014`;
+            serverSelect.appendChild(divider);
+        }
 
     } catch (error) {
         console.error('Error loading hardware devices:', error);
@@ -4847,17 +4958,21 @@ async function loadHardwareDevices() {
 
 /**
  * Update source server details when server is selected
- * Password is auto-filled from device credentials (hidden field)
+ * Username and IP auto-filled from device; password must be typed by user.
  */
 function updateSourceServerDetails() {
     const serverSelect = document.getElementById('hwSourceServer');
     const selectedOption = serverSelect.options[serverSelect.selectedIndex];
     const passwordField = document.getElementById('hwServerPassword');
 
-    if (selectedOption && selectedOption.dataset.password) {
-        passwordField.value = selectedOption.dataset.password;
-    } else {
-        passwordField.value = '';
+    // DO NOT auto-fill the password.
+    // The SCP server password is the Linux account password on the source server
+    // (e.g. hp_test's password on 192.168.100.175).
+    // This is DIFFERENT from the device's telnet login password stored in the DB.
+    // Auto-filling the wrong password is the root cause of SCP auth failures.
+    if (passwordField) {
+        passwordField.value = '';    // always clear on server change
+        passwordField.focus();       // guide user to fill it in
     }
 }
 
@@ -4875,15 +4990,15 @@ async function startHardwareLoad(event) {
     const gatewayIP = document.getElementById('hwGatewayIP').value.trim();
     const subnetMask = document.getElementById('hwSubnetMask').value.trim();
 
-    // Validation
+    // Validation — password is REQUIRED, must be typed by user
     if (!deviceId || !sourceServerId || !imagePath) {
         toast('Please fill all required fields', 'error');
         return;
     }
-
-    // Password is optional - will be fetched from device data if not provided
     if (!serverPassword) {
-        console.warn('Server password not auto-filled, will fetch from device data');
+        toast('Server Password is required — enter the Linux account password for the source server (e.g. hp_test\'s password)', 'error');
+        document.getElementById('hwServerPassword').focus();
+        return;
     }
 
     // Validate gateway IP format
@@ -4987,6 +5102,7 @@ async function startHardwareLoad(event) {
 
         const result = await response.json();
         currentHWJobId = result.job_id;
+        localStorage.setItem('hwCurrentJobId', currentHWJobId);
 
         // Show progress container
         document.getElementById('hwProgressContainer').style.display = 'block';
@@ -5020,22 +5136,37 @@ async function startHardwareLoad(event) {
 }
 
 /**
- * Connect WebSocket for real-time progress updates
+ * Connect WebSocket for real-time progress updates.
+ * Automatically reconnects if connection is lost and job is still running.
  */
 function connectHWWebSocket(jobId) {
+    // Clear any pending reconnect timer
+    if (hwReconnectTimer) {
+        clearTimeout(hwReconnectTimer);
+        hwReconnectTimer = null;
+    }
+
     // Close existing connection
     if (hwWebSocket) {
         hwWebSocket.close();
+        hwWebSocket = null;
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = protocol + '//' + window.location.host + '/api/hardware-load/ws/' + jobId;
 
-    hwWebSocket = new WebSocket(wsUrl);
+    try {
+        hwWebSocket = new WebSocket(wsUrl);
+    } catch (e) {
+        console.error('Failed to create WebSocket:', e);
+        // Schedule reconnect
+        hwScheduleReconnect(jobId);
+        return;
+    }
 
     hwWebSocket.onopen = () => {
-        console.log('Hardware load WebSocket connected');
-        appendHWLog('[System] Connected to progress stream\n', 'log-success');
+        console.log('Hardware load WebSocket connected for job', jobId);
+        appendHWLog('[System] Connected to live progress stream\n', 'log-success');
     };
 
     hwWebSocket.onmessage = (event) => {
@@ -5049,13 +5180,124 @@ function connectHWWebSocket(jobId) {
 
     hwWebSocket.onerror = (error) => {
         console.error('WebSocket error:', error);
-        appendHWLog('[System] Connection error occurred\n', 'log-error');
     };
 
-    hwWebSocket.onclose = () => {
-        console.log('Hardware load WebSocket closed');
+    hwWebSocket.onclose = (event) => {
+        console.log('Hardware load WebSocket closed. Code:', event.code, 'Job:', jobId);
         hwWebSocket = null;
+
+        // Only reconnect if this job is still marked as active
+        if (currentHWJobId === jobId) {
+            hwScheduleReconnect(jobId);
+        }
     };
+}
+
+/**
+ * Schedule a WebSocket reconnect, checking job status first.
+ */
+function hwScheduleReconnect(jobId) {
+    if (hwReconnectTimer) return;  // Already scheduled
+    appendHWLog('[System] Connection lost — checking job status...\n', 'log-warning');
+
+    hwReconnectTimer = setTimeout(async () => {
+        hwReconnectTimer = null;
+        // Check if job is still actually running before reconnecting
+        try {
+            const res = await fetch('/api/hardware-load/job/' + jobId, {
+                headers: { 'X-Session-ID': getSessionId() }
+            });
+            if (!res.ok) {
+                // Job not found — clear state
+                appendHWLog('[System] Job no longer accessible. Process may have been cancelled.\n', 'log-warning');
+                hwClearActiveJob();
+                return;
+            }
+            const job = await res.json();
+
+            if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') {
+                // Job finished while we were disconnected — update UI
+                appendHWLog('[System] Job finished while disconnected. Final status: ' + formatStatusText(job.status) + '\n',
+                    job.status === 'completed' ? 'log-success' : 'log-error');
+                handleHWProgressUpdate({
+                    type: 'complete',
+                    status: job.status,
+                    error_message: job.error_message,
+                    progress_percentage: job.progress_percentage
+                });
+                hwClearActiveJob();
+            } else {
+                // Job is still running — reconnect
+                appendHWLog('[System] Job still running (status: ' + formatStatusText(job.status) + '). Reconnecting...\n', 'log-warning');
+                // Update UI immediately with latest polled state
+                const pct = job.progress_percentage || 0;
+                document.getElementById('hwProgressFill').style.width = pct + '%';
+                document.getElementById('hwProgressPercent').textContent = pct + '%';
+                document.getElementById('hwProgressStatus').textContent = formatStatusText(job.status);
+                document.getElementById('hwCurrentStep').textContent = job.current_step || '...';
+                connectHWWebSocket(jobId);
+            }
+        } catch (e) {
+            console.error('Error checking job status during reconnect:', e);
+            appendHWLog('[System] Could not reach server. Retrying in 5s...\n', 'log-warning');
+            // Try again in 5 seconds
+            hwReconnectTimer = setTimeout(() => {
+                hwReconnectTimer = null;
+                hwScheduleReconnect(jobId);
+            }, 5000);
+        }
+    }, 3000);
+}
+
+/**
+ * Try to resume tracking an in-progress job (called on page load).
+ */
+async function hwTryResumeJob(jobId) {
+    try {
+        const res = await fetch('/api/hardware-load/job/' + jobId, {
+            headers: { 'X-Session-ID': getSessionId() }
+        });
+        if (!res.ok) { hwClearActiveJob(); return; }
+
+        const job = await res.json();
+
+        if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') {
+            // Job already done — just refresh history
+            hwClearActiveJob();
+            refreshHWHistory();
+            return;
+        }
+
+        // Job is still running — restore progress UI and reconnect
+        const progressContainer = document.getElementById('hwProgressContainer');
+        if (progressContainer) {
+            progressContainer.style.display = 'block';
+            const pct = job.progress_percentage || 0;
+            document.getElementById('hwProgressFill').style.width = pct + '%';
+            document.getElementById('hwProgressPercent').textContent = pct + '%';
+            document.getElementById('hwProgressStatus').textContent = formatStatusText(job.status);
+            document.getElementById('hwCurrentStep').textContent = job.current_step || 'Resuming...';
+            document.getElementById('hwCompletionMessage').style.display = 'none';
+            const stopBtnWrap = document.getElementById('hwStopBtnWrapper');
+            if (stopBtnWrap) stopBtnWrap.style.display = 'flex';
+            appendHWLog('[System] Resuming connection to running job #' + jobId + ' (status: ' + formatStatusText(job.status) + ')\n', 'log-warning');
+        }
+
+        connectHWWebSocket(jobId);
+    } catch (e) {
+        console.warn('Could not resume HW job', jobId, e);
+        hwClearActiveJob();
+    }
+}
+
+/**
+ * Clear the active job tracking state.
+ */
+function hwClearActiveJob() {
+    currentHWJobId = null;
+    localStorage.removeItem('hwCurrentJobId');
+    if (hwWebSocket) { hwWebSocket.close(); hwWebSocket = null; }
+    if (hwReconnectTimer) { clearTimeout(hwReconnectTimer); hwReconnectTimer = null; }
 }
 
 /**
@@ -5104,11 +5346,8 @@ function handleHWProgressUpdate(data) {
             const stopWrapper = document.getElementById('hwStopBtnWrapper');
             if (stopWrapper) stopWrapper.style.display = 'none';
 
-            // Close WebSocket
-            if (hwWebSocket) {
-                hwWebSocket.close();
-                hwWebSocket = null;
-            }
+            // Close WebSocket and clear reconnect state
+            hwClearActiveJob();
 
             // Refresh history
             refreshHWHistory();
@@ -5244,22 +5483,29 @@ function renderHWHistoryTable(jobs) {
             duration = diffMins + 'm ' + diffSecs + 's';
         }
 
-        row.innerHTML = '<td>' + job.id + '</td>' +
+        row.innerHTML = '<td style="font-weight:600;color:var(--text-secondary);font-size:12px">#' + job.id + '</td>' +
             '<td>' + esc(job.device_name || ('DUT ' + job.dut_id) || '-') + '</td>' +
-            '<td title="' + esc(job.image_path || '') + '">' + esc(job.image_name || job.image_path || '-') + '</td>' +
+            '<td title="' + esc(job.image_path || '') + '" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(job.image_name || job.image_path || '-') + '</td>' +
             '<td><span class="status-badge ' + (job.status || '') + '">' + formatStatusText(job.status || '') + '</span></td>' +
-            '<td>' + (job.progress_percentage != null ? job.progress_percentage : 0) + '%</td>' +
-            '<td>' + (job.started_at ? formatDateTime(job.started_at) : '-') + '</td>' +
-            '<td>' + duration + '</td>' +
+            '<td style="font-weight:600">' + (job.progress_percentage != null ? job.progress_percentage : 0) + '%</td>' +
+            '<td style="font-size:12px;color:var(--text-secondary)">' + (job.started_at ? formatDateTime(job.started_at) : '-') + '</td>' +
+            '<td style="font-size:12px;color:var(--text-secondary)">' + duration + '</td>' +
             '<td>' +
-                '<button class="btn-icon" onclick="viewHWJobDetails(' + job.id + ')" title="View Details">' +
-                    '<span class="material-icons-round">visibility</span>' +
-                '</button>' +
-                (job.status === 'failed' ?
-                    '<button class="btn-icon" onclick="retryHWJob(' + job.id + ')" title="Retry">' +
-                        '<span class="material-icons-round">refresh</span>' +
-                    '</button>'
-                : '') +
+                '<div class="hw-action-group">' +
+                    '<button class="hw-action-btn view" onclick="viewHWJobDetails(' + job.id + ')" title="View full execution logs">' +
+                        '<span class="material-icons-round">description</span>' +
+                    '</button>' +
+                    (job.status === 'failed' || job.status === 'cancelled' ?
+                        '<button class="hw-action-btn retry" onclick="retryHWJob(' + job.id + ')" title="Retry with same settings">' +
+                            '<span class="material-icons-round">replay</span>' +
+                        '</button>'
+                    : '') +
+                    (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled' ?
+                        '<button class="hw-action-btn del" onclick="deleteHWJob(' + job.id + ')" title="Delete this record permanently">' +
+                            '<span class="material-icons-round">delete_outline</span>' +
+                        '</button>'
+                    : '') +
+                '</div>' +
             '</td>';
 
         tbody.appendChild(row);
@@ -5267,9 +5513,11 @@ function renderHWHistoryTable(jobs) {
 }
 
 /**
- * View job details in modal
+ * View job details in the dedicated HW Job Log modal.
+ * Uses hw-job-modal-overlay to avoid the generic modal's "undefined" issue.
  */
 async function viewHWJobDetails(jobId) {
+    hwViewingJobId = jobId;
     try {
         const response = await fetch('/api/hardware-load/job/' + jobId, {
             headers: { 'X-Session-ID': getSessionId() }
@@ -5279,31 +5527,79 @@ async function viewHWJobDetails(jobId) {
 
         const job = await response.json();
 
-        // Show in modal (reuse existing modal or create custom one)
-        const modalTitle = document.getElementById('modal-title');
-        const modalBody = document.getElementById('modal-body');
+        const overlay = document.getElementById('hw-job-modal-overlay');
+        const titleEl = document.getElementById('hw-job-modal-title');
+        const bodyEl = document.getElementById('hw-job-modal-body');
+        const deleteBtn = document.getElementById('hw-job-delete-btn');
 
-        const deviceLabel = job.device_name || ('DUT ' + job.dut_id) || 'Unknown Device';
-        modalTitle.textContent = 'Job #' + job.id + ' - ' + deviceLabel;
-        modalBody.innerHTML = '<div style="margin-bottom: 20px;">' +
-                '<div style="margin-bottom: 10px;"><strong>Status:</strong> <span class="status-badge ' + (job.status || '') + '">' + formatStatusText(job.status || '') + '</span></div>' +
-                '<div style="margin-bottom: 10px;"><strong>Progress:</strong> ' + (job.progress_percentage != null ? job.progress_percentage : 0) + '%</div>' +
-                '<div style="margin-bottom: 10px;"><strong>Current Step:</strong> ' + esc(job.current_step || '-') + '</div>' +
-                '<div style="margin-bottom: 10px;"><strong>Image:</strong> ' + esc(job.image_path || '-') + '</div>' +
-                '<div style="margin-bottom: 10px;"><strong>Started:</strong> ' + (job.started_at ? formatDateTime(job.started_at) : '-') + '</div>' +
-                '<div style="margin-bottom: 10px;"><strong>Completed:</strong> ' + (job.completed_at ? formatDateTime(job.completed_at) : 'In progress') + '</div>' +
-                (job.error_message ? '<div style="margin-bottom: 10px; color: var(--red);"><strong>Error:</strong> ' + esc(job.error_message) + '</div>' : '') +
+        const deviceLabel = job.device_name || ('DUT ' + (job.dut_id || '?'));
+        titleEl.innerHTML = '<span class="material-icons-round">terminal</span> Job #' + job.id + ' — ' + esc(deviceLabel);
+
+        // Only allow delete for finished jobs
+        const deletable = (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled');
+        deleteBtn.style.display = deletable ? '' : 'none';
+
+        // Build info grid
+        const statusBadge = '<span class="status-badge ' + (job.status || '') + '">' + formatStatusText(job.status || '') + '</span>';
+        const pct = job.progress_percentage != null ? job.progress_percentage : 0;
+        const errorHtml = job.error_message
+            ? '<div style="margin-bottom:10px;padding:8px 12px;background:rgba(255,80,80,.08);border-left:3px solid var(--red);border-radius:4px;"><strong style="color:var(--red)">Error:</strong> ' + esc(job.error_message) + '</div>'
+            : '';
+
+        bodyEl.innerHTML =
+            '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px 20px;margin-bottom:16px;padding:12px 16px;background:var(--bg-secondary);border-radius:8px;">' +
+                '<div><span style="color:var(--text-secondary);font-size:11px">STATUS</span><br>' + statusBadge + '</div>' +
+                '<div><span style="color:var(--text-secondary);font-size:11px">PROGRESS</span><br><strong>' + pct + '%</strong></div>' +
+                '<div><span style="color:var(--text-secondary);font-size:11px">CURRENT STEP</span><br><span style="font-size:13px">' + esc(job.current_step || '-') + '</span></div>' +
+                '<div><span style="color:var(--text-secondary);font-size:11px">IMAGE</span><br><span style="font-size:12px;word-break:break-all">' + esc(job.image_name || job.image_path || '-') + '</span></div>' +
+                '<div><span style="color:var(--text-secondary);font-size:11px">STARTED</span><br><span style="font-size:13px">' + (job.started_at ? formatDateTime(job.started_at) : '-') + '</span></div>' +
+                '<div><span style="color:var(--text-secondary);font-size:11px">COMPLETED</span><br><span style="font-size:13px">' + (job.completed_at ? formatDateTime(job.completed_at) : 'In progress') + '</span></div>' +
             '</div>' +
-            '<div class="hw-log-terminal">' +
+            errorHtml +
+            '<div class="hw-log-terminal" style="min-height:300px">' +
                 '<div class="hw-terminal-header"><span class="material-icons-round">terminal</span> Full Execution Log</div>' +
-                '<div class="hw-terminal-output"><pre>' + esc(job.execution_log || 'No logs available') + '</pre></div>' +
+                '<div class="hw-terminal-output" style="height:420px;overflow-y:auto"><pre style="margin:0;white-space:pre-wrap;word-break:break-word">' + esc(job.execution_log || 'No logs available.') + '</pre></div>' +
             '</div>';
 
-        openModal();
+        overlay.style.display = 'flex';
 
     } catch (error) {
         console.error('Error loading job details:', error);
-        toast('Failed to load job details', 'error');
+        toast('Failed to load job details: ' + (error.message || 'unknown error'), 'error');
+    }
+}
+
+/** Close the HW Job Log modal. */
+function closeHWJobModal() {
+    const overlay = document.getElementById('hw-job-modal-overlay');
+    if (overlay) overlay.style.display = 'none';
+    hwViewingJobId = null;
+}
+
+/** Delete the job currently shown in the modal. */
+async function deleteHWJobFromModal() {
+    if (!hwViewingJobId) return;
+    await deleteHWJob(hwViewingJobId, true /* closeModal */);
+}
+
+/** Delete a hardware load job by ID. */
+async function deleteHWJob(jobId, closeModal) {
+    if (!confirm('Delete job #' + jobId + ' from history?\nThis cannot be undone.')) return;
+    try {
+        const res = await fetch('/api/hardware-load/job/' + jobId, {
+            method: 'DELETE',
+            headers: { 'X-Session-ID': getSessionId() }
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'Failed to delete job');
+        }
+        toast('Job #' + jobId + ' deleted', 'success');
+        if (closeModal) closeHWJobModal();
+        refreshHWHistory();
+    } catch (e) {
+        console.error('Error deleting HW job:', e);
+        toast(e.message || 'Failed to delete job', 'error');
     }
 }
 
@@ -5362,11 +5658,8 @@ async function stopHardwareLoad() {
             throw new Error(errData.detail || 'Failed to cancel job');
         }
 
-        // Close WebSocket
-        if (hwWebSocket) {
-            hwWebSocket.close();
-            hwWebSocket = null;
-        }
+        // Close WebSocket and clear reconnect state
+        hwClearActiveJob();
 
         // Update UI to reflect cancellation
         const completionDiv = document.getElementById('hwCompletionMessage');

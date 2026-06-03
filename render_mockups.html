@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Eka UI Mockups</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
+    <style>
+        body {
+            background-color: #f7f5f0;
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            margin: 0;
+            padding: 40px;
+            color: #1a241c;
+        }
+        .mockup-container {
+            width: 760px;
+            height: 480px;
+            background: #ffffff;
+            border: 1px solid #e2dcd0;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(45, 38, 25, 0.05);
+            margin-bottom: 50px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+            box-sizing: border-box;
+        }
+        /* Tab Bar Header in mockup */
+        .mockup-header {
+            background: #faf9f6;
+            border-bottom: 1px solid #e2dcd0;
+            height: 50px;
+            display: flex;
+            align-items: center;
+            padding: 0 20px;
+            gap: 15px;
+            box-sizing: border-box;
+        }
+        .mockup-dots {
+            display: flex;
+            gap: 6px;
+        }
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        .dot.red { background: #e06c75; }
+        .dot.yellow { background: #d19a66; }
+        .dot.green { background: #98c379; }
+        
+        .mockup-title {
+            font-size: 11px;
+            color: #5e685f;
+            background: #ffffff;
+            border: 1px solid #e2dcd0;
+            padding: 3px 12px;
+            border-radius: 4px;
+            font-weight: 700;
+            letter-spacing: 0.8px;
+            text-transform: uppercase;
+        }
+        
+        /* Inner Content */
+        .mockup-body {
+            padding: 22px;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+            background: #ffffff;
+            box-sizing: border-box;
+            overflow: hidden;
+        }
+        
+        /* UI Typography - Enlarged for Slide Legibility */
+        h3 {
+            margin: 0;
+            font-size: 22px;
+            font-weight: 700;
+            color: #244d32;
+        }
+        .subtitle {
+            margin: 0;
+            font-size: 13px;
+            color: #5e685f;
+            margin-top: 4px;
+        }
+        
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 14px;
+        }
+        .stat-card {
+            border: 1px solid #e2dcd0;
+            border-radius: 8px;
+            padding: 12px 14px;
+            background: #fafaf9;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            box-sizing: border-box;
+        }
+        .stat-label {
+            font-size: 11px;
+            color: #5e685f;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 700;
+        }
+        .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #244d32;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .stat-badge {
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: 700;
+        }
+        .stat-badge.green { background: #e8f5e9; color: #2e7d32; }
+        .stat-badge.blue { background: #e3f2fd; color: #1565c0; }
+        
+        /* Activity List */
+        .activity-box {
+            border: 1px solid #e2dcd0;
+            border-radius: 8px;
+            padding: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            box-sizing: border-box;
+            background: #ffffff;
+        }
+        .activity-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: #1a241c;
+            border-bottom: 1px dashed #e2dcd0;
+            padding-bottom: 6px;
+            margin-bottom: 2px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .activity-item {
+            display: flex;
+            align-items: center;
+            font-size: 13px;
+            gap: 8px;
+            color: #4a544b;
+        }
+        .activity-item .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .activity-item .status-dot.success { background: #2e7d32; }
+        .activity-item .status-dot.running { background: #b0593e; }
+        
+        .activity-item .time {
+            margin-left: auto;
+            color: #8a958b;
+            font-size: 11px;
+        }
+
+        /* Tables - Fixed layout to prevent overflow & wrapping overlaps */
+        .mockup-table-container {
+            border: 1px solid #e2dcd0;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #ffffff;
+            box-sizing: border-box;
+        }
+        .mockup-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13.5px;
+            table-layout: fixed;
+        }
+        .mockup-table th {
+            text-align: left;
+            padding: 10px 12px;
+            background: #fafaf9;
+            border-bottom: 1.5px solid #e2dcd0;
+            color: #5e685f;
+            font-weight: 700;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .mockup-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #f0ede6;
+            color: #1a241c;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: 700;
+        }
+        .status-pill.online { background: #e8f5e9; color: #2e7d32; }
+        .status-pill.idle { background: #f5f5f5; color: #616161; }
+        .status-pill.running { background: #fff8e1; color: #f57f17; }
+        .status-pill.passed { background: #e8f5e9; color: #2e7d32; }
+        .status-pill.failed { background: #ffebee; color: #c62828; }
+        
+        .action-btn {
+            background: #ffffff;
+            border: 1px solid #e2dcd0;
+            border-radius: 4px;
+            padding: 3px 8px;
+            font-size: 11px;
+            font-weight: 700;
+            cursor: pointer;
+            color: #b0593e;
+            display: inline-flex;
+            align-items: center;
+            gap: 2px;
+            box-sizing: border-box;
+        }
+        .action-btn:hover {
+            border-color: #b0593e;
+            background: #fafaf9;
+        }
+
+        /* Topology Canvas - Enlarged for node legibility */
+        .topology-canvas {
+            border: 1px solid #e2dcd0;
+            border-radius: 8px;
+            background: #fafaf9;
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+            box-sizing: border-box;
+        }
+        .canvas-bg-grid {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-image: radial-gradient(#e2dcd0 1.2px, transparent 1.2px);
+            background-size: 18px 18px;
+            opacity: 0.5;
+        }
+        .canvas-node {
+            position: absolute;
+            background: #ffffff;
+            border: 1.5px solid #244d32;
+            border-radius: 6px;
+            padding: 8px 14px;
+            box-shadow: 0 4px 10px rgba(45, 38, 25, 0.03);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 3px;
+            z-index: 2;
+            box-sizing: border-box;
+            width: 130px;
+        }
+        /* Centered node coordinates to align perfectly with SVG paths */
+        .canvas-node.spine { top: 35px; left: 185px; } /* Center calculated for 500px wide canvas */
+        .canvas-node.leaf1 { bottom: 45px; left: 30px; }
+        .canvas-node.leaf2 { bottom: 45px; right: 30px; }
+        .node-title {
+            font-size: 13.5px;
+            font-weight: 700;
+            color: #244d32;
+        }
+        .node-desc {
+            font-size: 10.5px;
+            color: #5e685f;
+        }
+        
+        /* Execution Split layout */
+        .exec-split {
+            display: flex;
+            gap: 16px;
+            flex: 1;
+            box-sizing: border-box;
+            overflow: hidden;
+        }
+        .exec-sidebar {
+            width: 200px;
+            border: 1px solid #e2dcd0;
+            border-radius: 8px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            background: #fafaf9;
+            box-sizing: border-box;
+        }
+        .sidebar-section {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .sidebar-label {
+            font-size: 11px;
+            font-weight: 700;
+            color: #5e685f;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .select-box {
+            border: 1px solid #e2dcd0;
+            background: #ffffff;
+            border-radius: 4px;
+            padding: 6px 8px;
+            font-size: 12px;
+            color: #1a241c;
+            font-weight: 600;
+        }
+        .btn-primary {
+            background: #244d32;
+            color: #ffffff;
+            border: none;
+            border-radius: 6px;
+            padding: 9px;
+            font-size: 12px;
+            font-weight: 700;
+            cursor: pointer;
+            text-align: center;
+            margin-top: auto;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        /* VS Manager Cards */
+        .vs-card-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 14px;
+            flex: 1;
+        }
+        .vs-item-card {
+            border: 1px solid #e2dcd0;
+            border-radius: 8px;
+            padding: 12px 14px;
+            background: #ffffff;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.01);
+            box-sizing: border-box;
+            justify-content: space-between;
+        }
+        .vs-item-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px dashed #f0ede6;
+            padding-bottom: 6px;
+        }
+        .vs-name {
+            font-size: 15px;
+            font-weight: 700;
+            color: #244d32;
+        }
+        .vs-meta {
+            font-size: 12px;
+            color: #5e685f;
+            display: flex;
+            justify-content: space-between;
+        }
+        .vs-meta b {
+            color: #1a241c;
+        }
+        
+        /* Modern CSS Toggle Switch for VS Manager */
+        .toggle-container {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .toggle-switch {
+            width: 30px;
+            height: 17px;
+            background: #cbd5e1;
+            border-radius: 8.5px;
+            position: relative;
+            cursor: pointer;
+        }
+        .toggle-switch.on {
+            background: #2e7d32;
+        }
+        .toggle-switch::after {
+            content: "";
+            position: absolute;
+            width: 13px;
+            height: 13px;
+            background: #ffffff;
+            border-radius: 50%;
+            top: 2px;
+            left: 2px;
+            transition: 0.15s ease-in-out;
+        }
+        .toggle-switch.on::after {
+            left: 15px;
+        }
+        
+        /* Terminal styling */
+        .terminal-box {
+            background: #121614;
+            border: 1px solid #244d32;
+            border-radius: 8px;
+            flex: 1;
+            padding: 14px;
+            color: #d1ebd6;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 12px;
+            line-height: 1.4;
+            box-shadow: inset 0 0 12px rgba(0,0,0,0.6);
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            box-sizing: border-box;
+            overflow: hidden;
+        }
+        .terminal-header {
+            display: flex;
+            justify-content: space-between;
+            color: #8f9779;
+            font-size: 10px;
+            border-bottom: 1.5px solid rgba(36, 77, 50, 0.3);
+            padding-bottom: 4px;
+            margin-bottom: 4px;
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            font-weight: 700;
+        }
+        
+        /* Step Process Flow - Hardware Load */
+        .process-flow {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            flex: 1;
+            justify-content: center;
+            box-sizing: border-box;
+            padding-left: 10px;
+        }
+        .process-step {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            position: relative;
+        }
+        .step-num {
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 10.5px;
+            font-weight: 700;
+            z-index: 2;
+            box-sizing: border-box;
+        }
+        .step-num.done { background: #e8f5e9; color: #2e7d32; border: 1.5px solid #2e7d32; }
+        .step-num.active { background: #fff8e1; color: #f57f17; border: 1.5px solid #f57f17; }
+        .step-num.pending { background: #fafaf9; color: #8a958b; border: 1.5px solid #e2dcd0; }
+        
+        .step-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        .step-title {
+            font-weight: 700;
+            color: #1a241c;
+            font-size: 13.5px;
+        }
+        .step-desc {
+            font-size: 11.5px;
+            color: #5e685f;
+        }
+        
+        .step-bar-container {
+            height: 6px;
+            background: #e8e5df;
+            border-radius: 3px;
+            overflow: hidden;
+            width: 150px;
+            margin-top: 4px;
+        }
+        .step-bar {
+            height: 100%;
+            background: #b0593e;
+            width: 65%;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Mockup 1: Dashboard -->
+    <div class="mockup-container" id="mockup-1">
+        <div class="mockup-header">
+            <div class="mockup-dots">
+                <div class="dot red"></div>
+                <div class="dot yellow"></div>
+                <div class="dot green"></div>
+            </div>
+            <div class="mockup-title">EKA AUTOMATION &bull; DASHBOARD</div>
+        </div>
+        <div class="mockup-body">
+            <div>
+                <h3>System Telemetry Dashboard</h3>
+                <div class="subtitle">Overview of onboarded devices and active runs</div>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <span class="stat-label">Onboarded Devices</span>
+                    <span class="stat-value">5 <span class="stat-badge green">All Online</span></span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Active Runs</span>
+                    <span class="stat-value">2 <span class="stat-badge blue">Running</span></span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Platform Health</span>
+                    <span class="stat-value">100%</span>
+                </div>
+            </div>
+            
+            <div class="activity-box">
+                <div class="activity-title">Recent Logs</div>
+                <div class="activity-item">
+                    <span class="status-dot success"></span>
+                    <span>Re-imaged switch <b>spine-01</b> successfully</span>
+                    <span class="time">2m ago</span>
+                </div>
+                <div class="activity-item">
+                    <span class="status-dot running"></span>
+                    <span>Running regression script <b>test_bgp_route.py</b></span>
+                    <span class="time">Just now</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mockup 2: Devices -->
+    <div class="mockup-container" id="mockup-2">
+        <div class="mockup-header">
+            <div class="mockup-dots">
+                <div class="dot red"></div>
+                <div class="dot yellow"></div>
+                <div class="dot green"></div>
+            </div>
+            <div class="mockup-title">EKA AUTOMATION &bull; DEVICES</div>
+        </div>
+        <div class="mockup-body">
+            <div>
+                <h3>Network Devices Inventory</h3>
+                <div class="subtitle">Onboard, edit, and check live status of switches</div>
+            </div>
+            
+            <div class="mockup-table-container">
+                <table class="mockup-table">
+                    <colgroup>
+                        <col style="width: 18%;">
+                        <col style="width: 25%;">
+                        <col style="width: 25%;">
+                        <col style="width: 16%;">
+                        <col style="width: 16%;">
+                    </colgroup>
+                    <thead>
+                        <tr>
+                            <th>Device Name</th>
+                            <th>IP Address</th>
+                            <th>OS Type</th>
+                            <th>Status</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><b>spine-01</b></td>
+                            <td>192.168.1.10</td>
+                            <td>Edgecore SONiC</td>
+                            <td><span class="status-pill online">&bull; Online</span></td>
+                            <td><button class="action-btn">Ping</button></td>
+                        </tr>
+                        <tr>
+                            <td><b>leaf-01</b></td>
+                            <td>192.168.1.11</td>
+                            <td>Edgecore SONiC</td>
+                            <td><span class="status-pill online">&bull; Online</span></td>
+                            <td><button class="action-btn">Ping</button></td>
+                        </tr>
+                        <tr>
+                            <td><b>leaf-02</b></td>
+                            <td>192.168.1.12</td>
+                            <td>Bare Metal</td>
+                            <td><span class="status-pill idle">&bull; Idle</span></td>
+                            <td><button class="action-btn">Ping</button></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mockup 3: Execution -->
+    <div class="mockup-container" id="mockup-3">
+        <div class="mockup-header">
+            <div class="mockup-dots">
+                <div class="dot red"></div>
+                <div class="dot yellow"></div>
+                <div class="dot green"></div>
+            </div>
+            <div class="mockup-title">EKA AUTOMATION &bull; EXECUTION</div>
+        </div>
+        <div class="mockup-body">
+            <div>
+                <h3>Testbed Designer & Execution</h3>
+                <div class="subtitle">Draw virtual cabling topologies and dispatch SpyTest script batches</div>
+            </div>
+            
+            <div class="exec-split">
+                <div class="exec-sidebar">
+                    <div class="sidebar-section">
+                        <span class="sidebar-label">Select Server VM</span>
+                        <div class="select-box">vm-hypervisor-01</div>
+                    </div>
+                    <div class="sidebar-section">
+                        <span class="sidebar-label">Select Script</span>
+                        <div class="select-box">test_l3_ipv6.py</div>
+                    </div>
+                    <button class="btn-primary">Run Testbed</button>
+                </div>
+                
+                <div class="topology-canvas">
+                    <div class="canvas-bg-grid"></div>
+                    <!-- Nodes -->
+                    <div class="canvas-node spine">
+                        <span class="node-title">spine-01</span>
+                        <span class="node-desc">192.168.1.10</span>
+                    </div>
+                    <div class="canvas-node leaf1">
+                        <span class="node-title">leaf-01</span>
+                        <span class="node-desc">192.168.1.11</span>
+                    </div>
+                    <div class="canvas-node leaf2">
+                        <span class="node-title">leaf-02</span>
+                        <span class="node-desc">192.168.1.12</span>
+                    </div>
+                    
+                    <!-- SVG Link lines - Coordinates verified for exact node centers -->
+                    <svg style="position: absolute; top:0; left:0; width:100%; height:100%; pointer-events:none;">
+                        <path d="M 250 85 L 95 290" stroke="#b0593e" stroke-width="1.5" stroke-dasharray="3 3" fill="none" />
+                        <path d="M 250 85 L 405 290" stroke="#b0593e" stroke-width="1.5" stroke-dasharray="3 3" fill="none" />
+                    </svg>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mockup 4: VS Manager -->
+    <div class="mockup-container" id="mockup-4">
+        <div class="mockup-header">
+            <div class="mockup-dots">
+                <div class="dot red"></div>
+                <div class="dot yellow"></div>
+                <div class="dot green"></div>
+            </div>
+            <div class="mockup-title">EKA AUTOMATION &bull; VS MANAGER</div>
+        </div>
+        <div class="mockup-body">
+            <div>
+                <h3>Virtual System Manager</h3>
+                <div class="subtitle">Power control and batch image copying for simulator VMs</div>
+            </div>
+            
+            <div class="vs-card-grid">
+                <div class="vs-item-card">
+                    <div class="vs-item-header">
+                        <span class="vs-name">vs-sonic-01</span>
+                        <div class="toggle-container">
+                            <span class="status-pill online" style="padding:0; background:none;">Running</span>
+                            <div class="toggle-switch on"></div>
+                        </div>
+                    </div>
+                    <div class="vs-meta">Server IP: <b>10.0.1.100</b></div>
+                    <div class="vs-meta">Active OS: <b>sonic-broadcom-v3.bin</b></div>
+                    <div style="margin-top: 2px; display: flex; gap: 8px;">
+                        <button class="action-btn">Restart</button>
+                        <button class="action-btn">Upgrade OS</button>
+                    </div>
+                </div>
+                
+                <div class="vs-item-card">
+                    <div class="vs-item-header">
+                        <span class="vs-name">vs-sonic-02</span>
+                        <div class="toggle-container">
+                            <span class="status-pill idle" style="padding:0; background:none;">Stopped</span>
+                            <div class="toggle-switch"></div>
+                        </div>
+                    </div>
+                    <div class="vs-meta">Server IP: <b>10.0.1.101</b></div>
+                    <div class="vs-meta">Active OS: <b>sonic-broadcom-v2.bin</b></div>
+                    <div style="margin-top: 2px; display: flex; gap: 8px;">
+                        <button class="action-btn">Start</button>
+                        <button class="action-btn">Upgrade OS</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mockup 5: Logs -->
+    <div class="mockup-container" id="mockup-5">
+        <div class="mockup-header">
+            <div class="mockup-dots">
+                <div class="dot red"></div>
+                <div class="dot yellow"></div>
+                <div class="dot green"></div>
+            </div>
+            <div class="mockup-title">EKA AUTOMATION &bull; RUN LOGS</div>
+        </div>
+        <div class="mockup-body">
+            <div>
+                <h3>Execution Logs History</h3>
+                <div class="subtitle">Timeline database audit records and diagnostic tracing</div>
+            </div>
+            
+            <div class="exec-split">
+                <div class="mockup-table-container" style="flex: 1.1;">
+                    <table class="mockup-table">
+                        <colgroup>
+                            <col style="width: 15%;">
+                            <col style="width: 45%;">
+                            <col style="width: 20%;">
+                            <col style="width: 20%;">
+                        </colgroup>
+                        <thead>
+                            <tr>
+                                <th>Job ID</th>
+                                <th>Script Name</th>
+                                <th>Result</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr style="background: #fafaf9;">
+                                <td><b>#124</b></td>
+                                <td>test_l3_ipv6.py</td>
+                                <td><span class="status-pill passed">Passed</span></td>
+                                <td>10m ago</td>
+                            </tr>
+                            <tr>
+                                <td><b>#123</b></td>
+                                <td>test_bgp_route.py</td>
+                                <td><span class="status-pill failed">Failed</span></td>
+                                <td>1h ago</td>
+                            </tr>
+                            <tr>
+                                <td><b>#122</b></td>
+                                <td>test_port_toggle.py</td>
+                                <td><span class="status-pill passed">Passed</span></td>
+                                <td>3h ago</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <div class="terminal-box" style="flex: 0.9;">
+                    <div class="terminal-header">
+                        <span>LOG PREVIEW #124</span>
+                    </div>
+                    <div>[INFO] Initializing testbed...</div>
+                    <div style="color: #98c379;">[SUCCESS] Connection established.</div>
+                    <div>[INFO] Sending 120 packets...</div>
+                    <div style="color: #98c379;">[SUCCESS] Verified 120/120 routes.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mockup 6: Terminal -->
+    <div class="mockup-container" id="mockup-6">
+        <div class="mockup-header">
+            <div class="mockup-dots">
+                <div class="dot red"></div>
+                <div class="dot yellow"></div>
+                <div class="dot green"></div>
+            </div>
+            <div class="mockup-title">EKA AUTOMATION &bull; WEB TERMINAL</div>
+        </div>
+        <div class="mockup-body">
+            <div>
+                <h3>Integrated Browser SSH Shell</h3>
+                <div class="subtitle">Access remote device command lines instantly similar to PuTTY</div>
+            </div>
+            
+            <div class="terminal-box">
+                <div class="terminal-header">
+                    <span>SSH SESSION: spine-01 (192.168.1.10)</span>
+                    <span>9600-8-N-1</span>
+                </div>
+                <div>spine-01 login: admin</div>
+                <div>Password: ****************</div>
+                <br>
+                <div style="color: #98c379;">Welcome to Enterprise SONiC OS (v4.2.0) on spine-01</div>
+                <div>Last login: Tue May 26 22:30:15 2026 from 10.0.5.21</div>
+                <br>
+                <div>admin@spine-01:~$ show version</div>
+                <div style="color: #d19a66;">Software Version: Enterprise-SONiC-4.2.0-Broadcom</div>
+                <div>admin@spine-01:~$ _</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mockup 7: Hardware Load -->
+    <div class="mockup-container" id="mockup-7">
+        <div class="mockup-header">
+            <div class="mockup-dots">
+                <div class="dot red"></div>
+                <div class="dot yellow"></div>
+                <div class="dot green"></div>
+            </div>
+            <div class="mockup-title">EKA AUTOMATION &bull; HARDWARE LOAD</div>
+        </div>
+        <div class="mockup-body">
+            <div>
+                <h3>Physical Switch Re-Imaging</h3>
+                <div class="subtitle">Automated image loading and bootloader installation pipeline</div>
+            </div>
+            
+            <div class="exec-split">
+                <div class="exec-sidebar" style="width: 220px;">
+                    <div class="sidebar-section">
+                        <span class="sidebar-label">Switch IP</span>
+                        <div class="select-box">192.168.1.5</div>
+                    </div>
+                    <div class="sidebar-section">
+                        <span class="sidebar-label">Firmware path</span>
+                        <div class="select-box">/images/sonic-broadcom.bin</div>
+                    </div>
+                    <button class="btn-primary" style="background: #b0593e;">Flash Device</button>
+                </div>
+                
+                <div class="process-flow">
+                    <div class="process-step">
+                        <div class="step-num done">&#x2713;</div>
+                        <div class="step-content">
+                            <span class="step-title">1. Detect Switch State</span>
+                            <span class="step-desc">ONIE discovery loop active</span>
+                        </div>
+                    </div>
+                    <div class="process-step">
+                        <div class="step-num done">&#x2713;</div>
+                        <div class="step-content">
+                            <span class="step-title">2. Interrupt Bootloader</span>
+                            <span class="step-desc">ONIE loop successfully stopped</span>
+                        </div>
+                    </div>
+                    <div class="process-step">
+                        <div class="step-num active">3</div>
+                        <div class="step-content">
+                            <span class="step-title" style="color: #b0593e;">3. Copy Image via SCP</span>
+                            <div class="step-bar-container">
+                                <div class="step-bar"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="process-step">
+                        <div class="step-num pending">4</div>
+                        <div class="step-content">
+                            <span class="step-title" style="color: #8a958b;">4. Clean Installation</span>
+                            <span class="step-desc">Awaiting transfer completion</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
