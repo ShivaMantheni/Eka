@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+    <title>Eka Automation Platform - Presentation</title>
+
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reset.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/theme/black.min.css">
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <style>
+        body {
+            background-color: #05080f !important;
+            font-family: 'Poppins', sans-serif;
+            color: #ffffff;
+            overflow: hidden;
+        }
+        .reveal {
+            font-family: 'Poppins', sans-serif;
+            color: #ffffff;
+        }
+        .reveal h1, .reveal h2, .reveal h3, .reveal h4 {
+            font-family: 'Montserrat', sans-serif;
+            text-transform: none;
+            color: #00f0ff;
+            font-weight: 700;
+            text-shadow: 0 0 10px rgba(0, 240, 255, 0.2);
+            letter-spacing: -0.01em;
+        }
+        .reveal h1 {
+            font-size: 2.8em;
+            line-height: 1.1;
+            font-weight: 800;
+            margin-bottom: 12px;
+            color: #ffffff;
+        }
+        .reveal h2 {
+            color: #00f0ff;
+            font-size: 1.7em;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #1a2f4c;
+            padding-bottom: 10px;
+            text-align: left;
+        }
+        .slide-card {
+            background: #0e1624;
+            border: 1px solid #1a2f4c;
+            border-radius: 12px;
+            padding: 24px 30px;
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+            text-align: left;
+            margin-top: 10px;
+            position: relative;
+        }
+        .slide-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 3px;
+            background: linear-gradient(90deg, #00f0ff, #007aff);
+            border-radius: 12px 12px 0 0;
+        }
+        .card-title {
+            color: #00f0ff;
+            font-family: 'Montserrat', sans-serif;
+            font-size: 1.15em;
+            font-weight: 700;
+            margin-bottom: 18px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border-bottom: 1px dashed rgba(26, 47, 76, 0.6);
+            padding-bottom: 8px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+        .reveal ul {
+            font-size: 0.65em;
+            line-height: 1.7;
+            list-style-type: none;
+            margin: 0;
+            padding: 0;
+        }
+        .reveal li {
+            margin-bottom: 12px;
+            position: relative;
+            padding-left: 26px;
+            color: #d1d9e6;
+        }
+        .reveal li::before {
+            content: "✦";
+            color: #00f0ff;
+            text-shadow: 0 0 8px rgba(0, 240, 255, 0.8);
+            position: absolute;
+            left: 0;
+            top: -1px;
+        }
+        .two-column {
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            gap: 30px;
+            width: 100%;
+        }
+        .col-left {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+        }
+        .col-right {
+            flex: 1.2;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .gallery-frame {
+            background: #0e1624;
+            border: 2px solid #00f0ff;
+            padding: 8px;
+            box-shadow: 0 15px 40px rgba(0, 240, 255, 0.15);
+            border-radius: 8px;
+            width: 100%;
+            display: block;
+        }
+        .image-frame {
+            width: 100%;
+            border-radius: 4px;
+            border: 1px solid #1a2f4c;
+            display: block;
+        }
+        .arch-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 15px;
+            width: 100%;
+            margin-top: 10px;
+        }
+        .arch-engine {
+            background: linear-gradient(135deg, #00f0ff, #007aff);
+            color: #05080f;
+            padding: 14px 28px;
+            border-radius: 8px;
+            font-weight: 700;
+            font-family: 'Montserrat', sans-serif;
+            font-size: 0.8em;
+            box-shadow: 0 0 20px rgba(0, 240, 255, 0.4);
+            border: 1px solid #ffffff;
+            text-align: center;
+            letter-spacing: 0.5px;
+        }
+        .arch-grid-row1 {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 12px;
+            width: 100%;
+        }
+        .arch-grid-row2 {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            width: 100%;
+        }
+        .arch-pillar {
+            background: #0e1624;
+            border: 1px solid #1a2f4c;
+            border-radius: 8px;
+            padding: 12px;
+            text-align: center;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+            transition: all 0.4s ease;
+        }
+        .arch-pillar:hover {
+            border-color: #00f0ff;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(0, 240, 255, 0.15);
+        }
+        .arch-pillar-title {
+            color: #00f0ff;
+            font-weight: 700;
+            font-size: 0.6em;
+            margin-bottom: 6px;
+            font-family: 'Montserrat', sans-serif;
+            letter-spacing: 0.5px;
+        }
+        .arch-pillar-desc {
+            color: #a0aec0;
+            font-size: 0.45em;
+            line-height: 1.4;
+        }
+        .arch-line {
+            width: 2px;
+            height: 20px;
+            background: #1a2f4c;
+        }
+        .download-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            background: linear-gradient(135deg, #00f0ff, #007aff);
+            color: #05080f !important;
+            padding: 12px 24px;
+            border-radius: 6px;
+            font-size: 0.52em !important;
+            font-family: 'Montserrat', sans-serif;
+            font-weight: 700;
+            text-decoration: none;
+            box-shadow: 0 6px 20px rgba(0, 240, 255, 0.25);
+            transition: all 0.2s ease;
+            margin-top: 25px;
+        }
+        .download-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 10px 25px rgba(0, 240, 255, 0.4);
+        }
+        .workflow-step {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 12px;
+            text-align: left;
+        }
+        .workflow-number {
+            width: 32px;
+            height: 32px;
+            background: #00f0ff;
+            color: #05080f;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-family: 'Montserrat', sans-serif;
+            font-size: 0.7em;
+            box-shadow: 0 0 10px rgba(0, 240, 255, 0.4);
+            flex-shrink: 0;
+        }
+        .workflow-text {
+            font-size: 0.6em;
+            line-height: 1.4;
+        }
+        .workflow-text strong {
+            color: #00f0ff;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="reveal">
+        <div class="slides">
+
+            <!-- Slide 1: Title -->
+            <section style="text-align: left;">
+                <div style="display: flex; gap: 40px; align-items: stretch; margin-left: 20px;">
+                    <div style="width: 6px; background: linear-gradient(#00f0ff, #007aff); border-radius: 3px; box-shadow: 0 0 15px rgba(0, 240, 255, 0.4);"></div>
+                    <div>
+                        <h1 style="margin: 0; padding: 0; font-size: 2.7em; font-weight: 800;">EKA AUTOMATION PLATFORM</h1>
+                        <p style="color: #00f0ff; font-size: 0.85em; font-family: 'Montserrat', sans-serif; font-weight: 600; margin: 15px 0 25px 0; text-shadow: 0 0 10px rgba(0,240,255,0.2);">
+                            Enterprise-Grade One-Click Network Testbeds & Simulation Control Plane
+                        </p>
+                        <p style="color: #8899b8; font-size: 0.45em; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 25px;">System Operations & Architecture Review</p>
+                        
+                        <a href="Eka_Automation_Presentation.pptx" download class="download-btn">
+                            <span class="material-icons-round" style="font-size: 20px; vertical-align: middle;">download</span> 
+                            Download PowerPoint (.pptx)
+                        </a>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 2: Agenda -->
+            <section>
+                <h2>Presentation Agenda</h2>
+                <div class="two-column">
+                    <div class="col-left">
+                        <div class="slide-card" style="height: 100%;">
+                            <div class="card-title"><span class="material-icons-round" style="color: #00f0ff;">menu_book</span> Operational Core Elements</div>
+                            <ul>
+                                <li><strong>What is Eka?</strong> (Origin, Vision, and Control Plane)</li>
+                                <li><strong>Problem Statement</strong> (Laboratory Staging Roadblocks)</li>
+                                <li><strong>Solution Overview</strong> (Unified Simulation & Imaging Engine)</li>
+                                <li><strong>Modular Architecture</strong> (The 7 Core Subsystem Tabs)</li>
+                                <li><strong>Workflow Pipeline</strong> (Process Step-by-Step Walkthrough)</li>
+                                <li><strong>Benefits & Demo</strong> (Time Savings & Interactive Screenshots)</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="col-right">
+                        <div class="gallery-frame">
+                            <img src="screenshot_dashboard.png" class="image-frame" alt="Eka Dashboard">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 3: Problem Statement -->
+            <section style="text-align: left;">
+                <h2>Problem Statement: Laboratory Friction</h2>
+                <div class="slide-card">
+                    <div class="card-title" style="color: #ff3838; text-shadow: 0 0 10px rgba(255,56,56,0.2);">
+                        <span class="material-icons-round">error_outline</span> Staging & QA Complexities
+                    </div>
+                    <ul>
+                        <li><strong>Manual Staging Delays:</strong> Traditional virtual machines and physical switches staging take hours of complex command-line entry.</li>
+                        <li><strong>Configuration Drift:</strong> Copying firmware versions manually and accessing hypervisors directly leads to error-prone deployments.</li>
+                        <li><strong>Tooling Fragmentation:</strong> Test developers rely on multiple programs (PuTTY, SCP file copy clients, terminal multiplexers).</li>
+                        <li><strong>Resource Collision:</strong> Multiple QA engineers attempting to connect or flash identical switches at the same time.</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Slide 4: Solution Overview -->
+            <section style="text-align: left;">
+                <h2>Solution: Unified Control Plane</h2>
+                <div class="slide-card">
+                    <div class="card-title"><span class="material-icons-round">check_circle</span> Automated Orchestration Plane</div>
+                    <ul>
+                        <li><strong>Unified Control:</strong> Eka pools hypervisors, terminal SSH clients, and switch re-imaging loops into a central browser view.</li>
+                        <li><strong>Automated Provisioning:</strong> Asynchronous SCP copies and flashes firmware packages to targets automatically.</li>
+                        <li><strong>Direct Cable Topologies:</strong> Draw virtual Ethernet inter-interface cable connections directly on an execution canvas.</li>
+                        <li><strong>Heartbeat Locking:</strong> Background resource locking mechanisms block device connection overlap.</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Slide 5: Modular System Architecture -->
+            <section>
+                <h2>Modular System Architecture</h2>
+                <div class="arch-container">
+                    <div class="arch-engine">
+                        EKA CONTROL PLANE ORCHESTRATOR
+                    </div>
+                    <div class="arch-line"></div>
+                    <div class="arch-grid-row1">
+                        <div class="arch-pillar">
+                            <div class="arch-pillar-title">DASHBOARD</div>
+                            <div class="arch-pillar-desc">Real-time stats visualizer.</div>
+                        </div>
+                        <div class="arch-pillar">
+                            <div class="arch-pillar-title">DEVICES</div>
+                            <div class="arch-pillar-desc">Switch and VM register list.</div>
+                        </div>
+                        <div class="arch-pillar">
+                            <div class="arch-pillar-title">EXECUTION</div>
+                            <div class="arch-pillar-desc">Interactive topology canvas.</div>
+                        </div>
+                        <div class="arch-pillar">
+                            <div class="arch-pillar-title">VS MANAGER</div>
+                            <div class="arch-pillar-desc">Hypervisor VM coordinator.</div>
+                        </div>
+                    </div>
+                    <div class="arch-line"></div>
+                    <div class="arch-grid-row2">
+                        <div class="arch-pillar" style="width: 28%;">
+                            <div class="arch-pillar-title">AUDIT LOGS</div>
+                            <div class="arch-pillar-desc">Trace files repository database.</div>
+                        </div>
+                        <div class="arch-pillar" style="width: 28%;">
+                            <div class="arch-pillar-title">SSH TERMINAL</div>
+                            <div class="arch-pillar-desc">Web browser SSH sessions.</div>
+                        </div>
+                        <div class="arch-pillar" style="width: 28%;">
+                            <div class="arch-pillar-title">HARDWARE LOAD</div>
+                            <div class="arch-pillar-desc">Physical switch firmware installer.</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 6: Key Features -->
+            <section style="text-align: left;">
+                <h2>Eka Core Feature Highlights</h2>
+                <div class="slide-card">
+                    <div class="card-title"><span class="material-icons-round">star_outline</span> Powering Modern QA Operations</div>
+                    <ul>
+                        <li><strong>Drag-and-Drop Topology:</strong> Draw cabling paths between switches on a GNS3-style interactive canvas.</li>
+                        <li><strong>ONIE Loop Detection:</strong> Identifies switches stuck in boot loops and flash firmware asynchronously.</li>
+                        <li><strong>Persistent Web SSH:</strong> Multiplex SSH console commands without third-party tools; persists commands in tmux sessions.</li>
+                        <li><strong>Asynchronous SCP Copying:</strong> Update VM and physical switches concurrently via multi-threaded download pools.</li>
+                        <li><strong>Logs Archival database:</strong> Search completed runs, logs output, and execution history.</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Slide 7: Automation Pipeline -->
+            <section>
+                <h2>Workflow & Automation Pipeline</h2>
+                <div class="slide-card">
+                    <div class="card-title"><span class="material-icons-round">alt_route</span> Orchestration Process Flow</div>
+                    <div style="margin-top: 15px;">
+                        <div class="workflow-step">
+                            <div class="workflow-number">1</div>
+                            <div class="workflow-text">
+                                <strong>Register Switches</strong>
+                                Onboard physical switch and hypervisor IP credentials in the Devices register.
+                            </div>
+                        </div>
+                        <div class="workflow-step">
+                            <div class="workflow-number">2</div>
+                            <div class="workflow-text">
+                                <strong>Flash Builds</strong>
+                                Initiate SCP copy transfers to flash switch boot loaders or virtual system disks.
+                            </div>
+                        </div>
+                        <div class="workflow-step">
+                            <div class="workflow-number">3</div>
+                            <div class="workflow-text">
+                                <strong>Draw Topology</strong>
+                                Connect interface ports on the Canvas to construct the target regression topography.
+                            </div>
+                        </div>
+                        <div class="workflow-step">
+                            <div class="workflow-number">4</div>
+                            <div class="workflow-text">
+                                <strong>Run SpyTest</strong>
+                                Dispatch selected Python script batches and watch execution logs stream.
+                            </div>
+                        </div>
+                        <div class="workflow-step">
+                            <div class="workflow-number">5</div>
+                            <div class="workflow-text">
+                                <strong>Trace Audits</strong>
+                                Store all run outputs and standard output text in the Logs query database.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 8: Platform Benefits -->
+            <section style="text-align: left;">
+                <h2>Platform Benefits: Dev & QA Teams</h2>
+                <div class="slide-card">
+                    <div class="card-title"><span class="material-icons-round">trending_up</span> Engineering Advantages</div>
+                    <ul>
+                        <li><strong>Drastic Time Savings:</strong> Automatic ONIE loops and hypervisor flash workflows save up to 45 minutes per setup cycle.</li>
+                        <li><strong>Simplified Access:</strong> Access switch CLI terminal sessions from any browser; zero VPN or client programs (PuTTY) required.</li>
+                        <li><strong>Zero Configuration Drift:</strong> Flashes clean builds and clears residual config files before dispatching runs.</li>
+                        <li><strong>Efficient Resource Pools:</strong> Visual device reservation indicators prevent hardware overlap and collision.</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Slide 9: Scalability & Performance -->
+            <section style="text-align: left;">
+                <h2>Scalability & Performance Metrics</h2>
+                <div class="slide-card">
+                    <div class="card-title"><span class="material-icons-round">speed</span> Engineered for Velocity</div>
+                    <ul>
+                        <li><strong>Multi-Threaded Copy:</strong> Simultaneous SCP downloads flash up to 8 switches concurrently without speed drops.</li>
+                        <li><strong>FastAPI Async Engine:</strong> Lightweight heartbeats fetch status parameters with under 2% controller overhead.</li>
+                        <li><strong>Active Paramiko Pools:</strong> Re-uses backend SSH pools to connect and send CLI commands in under 100ms.</li>
+                        <li><strong>Distributed Docker Scaling:</strong> Server components can be scaled out in containers to manage hundreds of active nodes.</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Slides 10-16: Live Tab Walkthroughs -->
+            <!-- Slide 10: Dashboard -->
+            <section>
+                <h2>1. Dashboard Tab</h2>
+                <div class="two-column">
+                    <div class="col-left">
+                        <div class="slide-card" style="height: 100%;">
+                            <div class="card-title"><span class="material-icons-round">dashboard</span> Control Panel Overview</div>
+                            <ul>
+                                <li>Monitor live connection states of all registered devices in real time.</li>
+                                <li>Display visual counters for total devices, online nodes, and script queues.</li>
+                                <li>Review run outcomes via recent execution telemetry charts.</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="col-right">
+                        <div class="gallery-frame">
+                            <img src="screenshot_dashboard.png" class="image-frame" alt="Eka Dashboard">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 11: Devices -->
+            <section>
+                <h2>2. Devices Tab</h2>
+                <div class="two-column">
+                    <div class="col-left">
+                        <div class="slide-card" style="height: 100%;">
+                            <div class="card-title"><span class="material-icons-round">dns</span> Inventory Management</div>
+                            <ul>
+                                <li>Onboard physical switches and virtual machines with IP credentials.</li>
+                                <li>Modify network parameter mappings (Ports, SSH credentials, paths).</li>
+                                <li>Perform background ping heartbeats to determine device active states.</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="col-right">
+                        <div class="gallery-frame">
+                            <img src="screenshot_devices.png" class="image-frame" alt="Eka Devices">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 12: Execution -->
+            <section>
+                <h2>3. Execution Tab</h2>
+                <div class="two-column">
+                    <div class="col-left">
+                        <div class="slide-card" style="height: 100%;">
+                            <div class="card-title"><span class="material-icons-round">play_circle_outline</span> Interactive Topology</div>
+                            <ul>
+                                <li>Draw cabling connections between virtual device interfaces on a canvas.</li>
+                                <li>Browse hierarchical test script folders and select test groups.</li>
+                                <li>Trigger automated SpyTest executions with a single click.</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="col-right">
+                        <div class="gallery-frame">
+                            <img src="screenshot_execute.png" class="image-frame" alt="Eka Execution">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 13: VS Manager -->
+            <section>
+                <h2>4. VS Manager Tab</h2>
+                <div class="two-column">
+                    <div class="col-left">
+                        <div class="slide-card" style="height: 100%;">
+                            <div class="card-title"><span class="material-icons-round">settings_system_daydream</span> Hypervisor Coordination</div>
+                            <ul>
+                                <li>Query and display VM states from remote hypervisors.</li>
+                                <li>Power on/off individual or groups of virtual switches instantly.</li>
+                                <li>Fetch and copy VM build images from network storage via SCP.</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="col-right">
+                        <div class="gallery-frame">
+                            <img src="screenshot_vs.png" class="image-frame" alt="Eka VS Manager">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 14: Logs -->
+            <section>
+                <h2>5. Logs Tab</h2>
+                <div class="two-column">
+                    <div class="col-left">
+                        <div class="slide-card" style="height: 100%;">
+                            <div class="card-title"><span class="material-icons-round">history</span> Trace Logs Database</div>
+                            <ul>
+                                <li>Access database audit logs for all completed and failed runs.</li>
+                                <li>Expand execution rows to inspect live terminal stdio streams.</li>
+                                <li>Filter records by date, script name, or test engineer.</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="col-right">
+                        <div class="gallery-frame">
+                            <img src="screenshot_logs.png" class="image-frame" alt="Eka Logs">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 15: Terminal -->
+            <section>
+                <h2>6. Terminal Tab</h2>
+                <div class="two-column">
+                    <div class="col-left">
+                        <div class="slide-card" style="height: 100%;">
+                            <div class="card-title"><span class="material-icons-round">terminal</span> Integrated SSH Consoles</div>
+                            <ul>
+                                <li>Open instant SSH terminal sessions to any registered device inside the UI.</li>
+                                <li>Execute standard CLI commands without leaving the web browser.</li>
+                                <li>Preserve console states using background tmux session persistence.</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="col-right">
+                        <div class="gallery-frame">
+                            <img src="screenshot_terminal.png" class="image-frame" alt="Eka Terminal">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 16: Hardware Load -->
+            <section>
+                <h2>7. Hardware Load Tab</h2>
+                <div class="two-column">
+                    <div class="col-left">
+                        <div class="slide-card" style="height: 100%;">
+                            <div class="card-title"><span class="material-icons-round">settings_input_hdmi</span> ONIE Firmware Flasher</div>
+                            <ul>
+                                <li>Update switch builds automatically via a single-button installer.</li>
+                                <li>Auto-detect switches in ONIE boot loops and flash firmware packages.</li>
+                                <li>View real-time console boot sequence logs during re-imaging.</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="col-right">
+                        <div class="gallery-frame">
+                            <img src="screenshot_hardware_load.png" class="image-frame" alt="Eka Hardware Load">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 17: Roadmap -->
+            <section style="text-align: left;">
+                <h2>Conclusion & Future Roadmap</h2>
+                <div class="slide-card">
+                    <div class="card-title"><span class="material-icons-round">map</span> Expanding Automation Capabilities</div>
+                    <ul>
+                        <li><strong>OIDC SSO Auth:</strong> Delegate authorization to corporate platforms (OnePalc portal redirect).</li>
+                        <li><strong>Multi-Hypervisor Canvas:</strong> Connect virtual networks spanning different remote ESXi/KVM hosts.</li>
+                        <li><strong>Machine Learning Diagnostics:</strong> Automatic classification of test run logs to pinpoint root failure causes.</li>
+                        <li><strong>Visual Device Health:</strong> Real-time temperature, memory, and CPU metric charts on the dashboard.</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- End Slide -->
+            <section style="text-align: center;">
+                <h1 style="font-size: 3em; color: #00f0ff;">THANK YOU.</h1>
+                <p style="color: #8899b8; font-size: 1.1em; font-family: 'Montserrat', sans-serif; font-weight: 600;">Innovative Test Automation Orchestration</p>
+                <div style="font-size: 0.38em; color: #5e685f; margin-top: 30px; font-style: italic;">
+                    Press ESC to see slide overview. Use arrow keys to navigate.
+                </div>
+            </section>
+
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.js"></script>
+    <script>
+        Reveal.initialize({
+            hash: true,
+            slideNumber: 'c/t',
+            progress: true,
+            center: true,
+            width: 1280,
+            height: 720,
+            transition: 'slide',
+            backgroundTransition: 'fade',
+            controls: true,
+            keyboard: true
+        });
+    </script>
+</body>
+</html>

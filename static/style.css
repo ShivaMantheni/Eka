@@ -2,28 +2,9 @@
    Eka Automation — Multi-Theme System (Dark / Light / Transparent)
    ============================================================ */
 
-/* ── LOCAL FONTS ── */
-@font-face {
-    font-family: 'Plus Jakarta Sans';
-    src: url('/static/fonts/plus-jakarta-sans.ttf') format('truetype');
-    font-weight: 300 800;
-    font-display: swap;
-}
-
-@font-face {
-    font-family: 'JetBrains Mono';
-    src: url('/static/fonts/jetbrains-mono.woff2') format('woff2');
-    font-weight: 400 500;
-    font-display: swap;
-}
-
-@font-face {
-    font-family: 'Material Icons Round';
-    src: url('/static/fonts/material-icons-round.woff2') format('woff2');
-    font-weight: normal;
-    font-style: normal;
-    font-display: block;
-}
+/* ── GOOGLE FONTS CDN ── */
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Material+Icons+Round');
 
 .material-icons-round {
     font-family: 'Material Icons Round';
@@ -2456,6 +2437,106 @@ input::placeholder {
 
 .btn-icon-sm .material-icons-round {
     font-size: 18px;
+}
+
+/* ── HW History Action Button Group ──────────────────────────────────────────
+   Compact pill-style button cluster for the Actions column in the history
+   table. Each button has an icon + short label, with semantic colour coding.
+   The group uses no-gap so buttons share a single rounded border.
+   ──────────────────────────────────────────────────────────────────────── */
+.hw-action-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: nowrap;
+}
+
+.hw-action-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px 6px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-family: var(--font);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.18s ease;
+    white-space: nowrap;
+    height: 26px;
+    width: 28px;
+}
+
+.hw-action-btn .material-icons-round {
+    font-size: 14px;
+    line-height: 1;
+}
+
+/* View — accent / blue */
+.hw-action-btn.view {
+    color: var(--accent);
+    border-color: rgba(99,102,241,.3);
+    background: rgba(99,102,241,.08);
+}
+.hw-action-btn.view:hover {
+    background: rgba(99,102,241,.18);
+    border-color: var(--accent);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(99,102,241,.2);
+}
+
+/* Retry — orange/amber */
+.hw-action-btn.retry {
+    color: var(--orange);
+    border-color: rgba(245,158,11,.3);
+    background: rgba(245,158,11,.08);
+}
+.hw-action-btn.retry:hover {
+    background: rgba(245,158,11,.18);
+    border-color: var(--orange);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(245,158,11,.2);
+}
+
+/* Delete — red */
+.hw-action-btn.del {
+    color: var(--red);
+    border-color: rgba(239,68,68,.25);
+    background: rgba(239,68,68,.06);
+}
+.hw-action-btn.del:hover {
+    background: rgba(239,68,68,.16);
+    border-color: var(--red);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(239,68,68,.2);
+}
+
+/* cancelled status badge */
+.status-badge.cancelled {
+    background: rgba(245,158,11,.15);
+    color: var(--orange);
+}
+
+/* any mid-flight status that doesn't have an explicit rule */
+.status-badge.connecting,
+.status-badge.saving_config,
+.status-badge.rebooting,
+.status-badge.grub_menu,
+.status-badge.grub_navigation,
+.status-badge.onie_menu,
+.status-badge.onie_install_select,
+.status-badge.onie_loading,
+.status-badge.onie_stop,
+.status-badge.network_config,
+.status-badge.detecting_mode,
+.status-badge.downloading,
+.status-badge.installing {
+    background: rgba(59,130,246,.15);
+    color: var(--blue);
+    animation: pulse 1.8s infinite;
 }
 
 /* Section Header */

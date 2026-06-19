@@ -61,8 +61,15 @@ function updateSourceServerDetails() {
     const serverSelect = document.getElementById('hwSourceServer');
     const selectedOption = serverSelect.options[serverSelect.selectedIndex];
 
-    if (selectedOption && selectedOption.dataset.password) {
-        document.getElementById('hwServerPassword').value = selectedOption.dataset.password;
+    // Auto-fill username and IP from the selected server DUT record.
+    // DO NOT auto-fill the password — the SCP server password is the
+    // Linux account password (e.g. hp_test's password on 192.168.100.175)
+    // which is DIFFERENT from the device's telnet login password.
+    // The user must always type it explicitly.
+    const pwdField = document.getElementById('hwServerPassword');
+    if (pwdField) {
+        pwdField.value = '';          // clear on server change
+        pwdField.focus();             // guide user to fill it
     }
 }
 
@@ -82,7 +89,10 @@ async function startHardwareLoad(event) {
 
     // Validation
     if (!deviceId || !sourceServerId || !imagePath || !serverPassword) {
-        showToast('Please fill all required fields', 'error');
+        showToast('Please fill all required fields including Server Password', 'error');
+        if (!serverPassword) {
+            document.getElementById('hwServerPassword').focus();
+        }
         return;
     }
 

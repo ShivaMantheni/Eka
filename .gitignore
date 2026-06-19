@@ -25,3 +25,10 @@ Thumbs.db
 *.pptx
 screenshot_*.png
 spotlight_*.png
+
+# Docker / Secrets — NEVER commit .env
+.env
+*.env
+
+# Docker volumes (local dev)
+postgres_data/
