@@ -42,6 +42,9 @@
             </div>
             <div class="stat-pill running" id="stat-running" style="display:none"><span
                     class="material-icons-round spin">sync</span> <span>0</span> Running</div>
+            <div class="stat-pill" id="user-badge" style="display:none; cursor:pointer;" title="User Info">
+                <span class="material-icons-round">account_circle</span> <span id="user-badge-name">User</span>
+            </div>
             <div class="health-dot" id="health-dot" title="Session Status"></div>
         </div>
     </header>
@@ -60,14 +63,17 @@
         <button class="tab" data-tab="vs" onclick="switchTab('vs')">
             <span class="material-icons-round">memory</span> VS Manager
         </button>
-        <button class="tab" data-tab="logs" onclick="switchTab('logs')">
-            <span class="material-icons-round">article</span> Logs
+        <button class="tab" data-tab="hardware-load" onclick="switchTab('hardware-load')">
+            <span class="material-icons-round">hardware</span> Hardware Load
         </button>
         <button class="tab" data-tab="terminal" onclick="switchTab('terminal')">
             <span class="material-icons-round">terminal</span> Terminal
         </button>
-        <button class="tab" data-tab="hardware-load" onclick="switchTab('hardware-load')">
-            <span class="material-icons-round">hardware</span> Hardware Load
+        <button class="tab" data-tab="logs" onclick="switchTab('logs')">
+            <span class="material-icons-round">article</span> Logs
+        </button>
+        <button class="tab" data-tab="users" onclick="switchTab('users')">
+            <span class="material-icons-round">manage_accounts</span> Users
         </button>
     </nav>
     </div><!-- /sticky-header -->
@@ -76,37 +82,8 @@
 
         <!-- ============ DASHBOARD TAB ============ -->
         <section id="tab-dashboard" class="tab-content active">
-            <div class="grid-4">
-                <div class="stat-card glass">
-                    <span class="material-icons-round stat-icon blue">dns</span>
-                    <div>
-                        <div class="stat-value" id="dash-total-duts">0</div>
-                        <div class="stat-label">Total Devices</div>
-                    </div>
-                </div>
-                <div class="stat-card glass">
-                    <span class="material-icons-round stat-icon green">wifi</span>
-                    <div>
-                        <div class="stat-value" id="dash-online-duts">0</div>
-                        <div class="stat-label">Online</div>
-                    </div>
-                </div>
-                <div class="stat-card glass">
-                    <span class="material-icons-round stat-icon purple">description</span>
-                    <div>
-                        <div class="stat-value" id="dash-scripts">0</div>
-                        <div class="stat-label">Scripts</div>
-                    </div>
-                </div>
-                <div class="stat-card glass">
-                    <span class="material-icons-round stat-icon orange">history</span>
-                    <div>
-                        <div class="stat-value" id="dash-executions">0</div>
-                        <div class="stat-label">Executions</div>
-                    </div>
-                </div>
-            </div>
-            <div class="grid-2" style="margin-top:24px;">
+            <div class="grid-2" style="margin-top:0;">
+                <!-- Left: Devices -->
                 <div class="card glass">
                     <div class="card-header">
                         <h3><span class="material-icons-round">devices_other</span> Devices</h3>
@@ -115,13 +92,45 @@
                         <p class="muted">Loading...</p>
                     </div>
                 </div>
+                <!-- Right: Execution Dashboard -->
                 <div class="card glass">
                     <div class="card-header">
-                        <h3><span class="material-icons-round">history</span> Recent Executions</h3>
+                        <h3><span class="material-icons-round">bar_chart</span> Script Execution Graph</h3>
+                        <button class="btn outline small" onclick="loadExecutions()" title="Refresh">
+                            <span class="material-icons-round">refresh</span>
+                        </button>
                     </div>
-                    <div class="card-body" id="dash-recent-exec">
+                    <div class="card-body" id="dash-exec-summary">
                         <p class="muted">Loading...</p>
                     </div>
+                </div>
+            </div>
+            <!-- Testcase History Card -->
+            <div class="card glass" style="margin-top:24px">
+                <div class="card-header">
+                    <h3><span class="material-icons-round">timeline</span> Testcase History
+                        <span class="muted" style="font-size:12px;font-weight:400;margin-left:8px">(last 5 runs per test)</span>
+                    </h3>
+                    <input type="text" id="tc-history-filter"
+                        oninput="filterTestcaseHistory(this.value)"
+                        placeholder="Filter by test name..."
+                        style="padding:4px 10px;border:1px solid var(--border);border-radius:6px;
+                               background:var(--bg-tertiary);color:var(--text);font-size:12px;width:220px">
+                </div>
+                <div class="card-body" style="padding:0">
+                    <table class="data-table" id="tc-history-table" style="font-size:12px">
+                        <thead>
+                            <tr>
+                                <th>Test Function</th>
+                                <th>Last 5 Runs</th>
+                                <th>Trend</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tc-history-tbody">
+                            <tr><td colspan="3" class="muted" style="text-align:center;padding:20px">
+                                Loading...</td></tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </section>
@@ -385,6 +394,18 @@
                         </button>
                     </div>
                     <div class="card-body" style="overflow:visible">
+                        <!-- Scripts Base Path Input -->
+                        <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px">
+                            <span class="material-icons-round" style="font-size:16px;color:var(--text-secondary);flex-shrink:0">folder_open</span>
+                            <input type="text" id="scripts-base-path"
+                                placeholder="Enter scripts path on VM (e.g. /home/user/spytest/tests)"
+                                style="flex:1;padding:5px 10px;border:1px solid var(--border);border-radius:6px;
+                                       background:var(--bg-tertiary);color:var(--text);font-size:12px;font-family:var(--font-mono,monospace)"
+                                onkeydown="if(event.key==='Enter') loadScriptsFromPath()">
+                            <button class="btn primary small" onclick="loadScriptsFromPath()" title="Load scripts from this path">
+                                <span class="material-icons-round" style="font-size:15px">play_arrow</span> Load
+                            </button>
+                        </div>
                         <!-- Breadcrumb Navigation -->
                         <label class="field-label"><span class="material-icons-round"
                                 style="font-size:16px;vertical-align:middle">folder_open</span> Current Path</label>
@@ -536,6 +557,49 @@
                 </div>
             </div>
 
+            <!-- Live Results Panel (shown during execution) -->
+            <div class="card glass" id="live-results-panel" style="margin-top:16px;display:none">
+                <div class="card-header">
+                    <h3><span class="material-icons-round">bar_chart</span> Live Results</h3>
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <button class="btn outline small" id="btn-dl-html"
+                            onclick="downloadReport(currentExecId,'html')" disabled>
+                            <span class="material-icons-round">download</span> HTML
+                        </button>
+                        <button class="btn outline small" id="btn-dl-excel"
+                            onclick="downloadReport(currentExecId,'excel')" disabled>
+                            <span class="material-icons-round">table_chart</span> Excel
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body" style="padding:12px 16px">
+                    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+                        <div style="flex:1;background:var(--bg-tertiary);border-radius:4px;height:8px;overflow:hidden">
+                            <div id="live-progress-bar"
+                                style="height:100%;background:var(--green,#22c55e);transition:width .4s;width:0%">
+                            </div>
+                        </div>
+                        <div id="live-results-summary"
+                            style="font-size:12px;white-space:nowrap;color:var(--text-secondary)">
+                            0 of 0 scripts done
+                        </div>
+                    </div>
+                    <table class="data-table" style="font-size:12px">
+                        <thead>
+                            <tr>
+                                <th>Script</th>
+                                <th>Status</th>
+                                <th style="text-align:center">Pass</th>
+                                <th style="text-align:center">Fail</th>
+                                <th style="text-align:center">Skip</th>
+                                <th>Duration</th>
+                            </tr>
+                        </thead>
+                        <tbody id="live-results-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
             <!-- Row 4: Live Logs (full width) -->
             <div class="card glass" style="margin-top:16px">
                 <div class="card-header">
@@ -679,17 +743,30 @@
             <div class="card glass">
                 <div class="card-header">
                     <h3><span class="material-icons-round">history</span> Execution History</h3>
-                    <button class="btn outline small" onclick="loadExecutions()"><span
-                            class="material-icons-round">refresh</span> Refresh</button>
+                    <div style="display:flex;gap:8px">
+                        <button class="btn outline small" id="btn-compare-selected"
+                            onclick="runComparison()" style="display:none">
+                            <span class="material-icons-round">compare</span> Compare Selected
+                        </button>
+                        <button class="btn outline small" onclick="loadExecutions()">
+                            <span class="material-icons-round">refresh</span> Refresh
+                        </button>
+                    </div>
                 </div>
                 <div class="card-body">
                     <table class="data-table">
                         <thead>
                             <tr>
+                                <th style="width:36px">
+                                    <input type="checkbox" id="cmp-select-all"
+                                        onchange="toggleAllCompare(this)"
+                                        title="Select/deselect all">
+                                </th>
                                 <th>ID</th>
                                 <th>Name</th>
                                 <th>Type</th>
                                 <th>Status</th>
+                                <th>Results</th>
                                 <th>Devices</th>
                                 <th>Duration</th>
                                 <th>Created</th>
@@ -700,6 +777,19 @@
                     </table>
                 </div>
             </div>
+            <!-- Comparison Panel -->
+            <div class="card glass" id="compare-panel" style="margin-top:16px;display:none">
+                <div class="card-header">
+                    <h3><span class="material-icons-round">compare</span>
+                        <span id="compare-panel-title">Comparison</span>
+                    </h3>
+                    <button class="btn outline small" onclick="closeComparePanel()">
+                        <span class="material-icons-round">close</span> Close
+                    </button>
+                </div>
+                <div class="card-body" id="compare-panel-body" style="padding:16px"></div>
+            </div>
+
             <!-- Log Viewer Modal Popup -->
             <div id="log-detail-modal-overlay" class="modal-overlay">
                 <div class="modal" style="max-width: 90%; max-height: 90vh; width: 1200px;">
@@ -873,6 +963,55 @@
                 </div>
             </div>
         </section>
+
+        <!-- ========================================== -->
+        <!-- USERS VIEW -->
+        <!-- ========================================== -->
+        <section id="tab-users" class="tab-content">
+            <div class="view-header">
+                <h2>
+                    <span class="material-icons-round">manage_accounts</span>
+                    User Management
+                </h2>
+                <div class="header-actions">
+                    <button class="btn btn-outline" onclick="loadUsers(); loadActiveSessions();">
+                        <span class="material-icons-round">refresh</span> Refresh
+                    </button>
+                </div>
+            </div>
+
+            <div class="um-grid">
+                <!-- Left panel: Registered users from AccessHub -->
+                <div class="um-panel">
+                    <div class="um-panel-head">
+                        <div class="um-panel-title">
+                            <span class="material-icons-round">group</span>
+                            Registered Users
+                        </div>
+                        <span class="users-count-badge" id="users-count-badge" style="display:none"></span>
+                    </div>
+                    <div class="users-list um-scroll" id="users-container">
+                        <!-- Populated via JS -->
+                    </div>
+                </div>
+
+                <!-- Right panel: Active sessions (role-filtered) -->
+                <div class="um-panel">
+                    <div class="um-panel-head">
+                        <div class="um-panel-title">
+                            <span class="material-icons-round">verified_user</span>
+                            Active Sessions
+                        </div>
+                        <span class="users-count-badge" id="sessions-count-badge" style="display:none"></span>
+                    </div>
+                    <div class="um-scroll" id="sessions-container">
+                        <!-- Populated via JS -->
+                    </div>
+                </div>
+            </div>
+        </section>
+
+
     </main>
 
     <!-- HW Job Log Modal (dedicated, avoids "undefined" from generic modal) -->
@@ -939,7 +1078,7 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=53"></script>
+    <script src="/static/app.js?v=73"></script>
 </body>
 
 </html>

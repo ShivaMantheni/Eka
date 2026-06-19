@@ -8,6 +8,18 @@ let ws = null;
 let allLogs = [];           // [{dut_name, script_name, level, message, timestamp}]
 let _queuePollTimer = null; // setInterval handle for queue status polling
 
+// Live Results state
+let _liveScripts = {};       // scriptStem -> {passed,failed,skipped,duration_s,status,row}
+let _liveScriptOrder = [];   // ordered array of scriptStems
+let _liveTotalScripts = 0;
+let _liveDoneScripts = 0;
+
+// Compare state
+let _compareSelected = new Set();   // set of execution IDs (numbers)
+
+// Testcase history data cache
+let _tcHistoryData = [];
+
 // Per-DUT interface cache: {dutId: [{name, speed, mtu, fec, alias, oper, admin}, ...]}
 // Automatically populated when a DUT is added. Falls back to SONIC_PORTS if empty.
 let dutInterfaces = {};
@@ -57,6 +69,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Restore saved theme before anything renders
     const savedTheme = localStorage.getItem('eka-theme') || 'dark';
     setTheme(savedTheme, true);
+
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.has('token') && window.location.pathname === '/') {
+        window.location.href = '/hub-callback?token=' + urlParams.get('token');
+        return; // Stop execution while redirecting
+    }
+
+    // Handle SSO callback before initializing session
+    if (urlParams.get('sso') === '1') {
+        const sessionId = urlParams.get('session_id');
+        if (sessionId) {
+            // Store session_id AND user identity fields passed back from hub_callback
+            localStorage.setItem('eka-session-id', sessionId);
+            const cbUserName  = urlParams.get('user_name');
+            const cbUserEmail = urlParams.get('user_email');
+            const cbUserRole  = urlParams.get('user_role');
+            if (cbUserName)  localStorage.setItem('eka-user-name',  cbUserName);
+            if (cbUserEmail) localStorage.setItem('eka-user-email', cbUserEmail);
+            if (cbUserRole)  localStorage.setItem('eka-user-role',  cbUserRole);
+            // Clean up the URL so tokens don't stay in browser history
+            window.history.replaceState({}, document.title, window.location.pathname);
+        }
+    }
 
     // Add backdrop click handlers for modals (close on backdrop click)
     const logModalOverlay = document.getElementById('log-detail-modal-overlay');
@@ -152,6 +187,7 @@ async function initializeSession() {
         const valid = await validateSession(sessionId);
         if (valid) {
             console.log('Existing session validated:', sessionId);
+            renderUserBadge();
             startSessionKeepAlive();
             return;
         } else {
@@ -163,6 +199,26 @@ async function initializeSession() {
 
     // No valid session - auto-create one without modal
     await autoCreateSession();
+}
+
+/**
+ * Update the user badge in the header with current session info
+ */
+function renderUserBadge() {
+    const badge = document.getElementById('user-badge');
+    const badgeName = document.getElementById('user-badge-name');
+    const userName = localStorage.getItem('eka-user-name');
+    
+    if (badge && badgeName && userName) {
+        badgeName.textContent = userName;
+        badge.style.display = 'inline-flex';
+        
+        // Add role to tooltip if available
+        const role = localStorage.getItem('eka-user-role');
+        if (role) {
+            badge.title = 'User: ' + userName + ' | Role: ' + role;
+        }
+    }
 }
 
 /**
@@ -278,6 +334,7 @@ async function autoCreateSession() {
         startSessionKeepAlive();
 
         console.log('Session auto-created:', userName, sessionId);
+        renderUserBadge();
 
     } catch (error) {
         console.error('Error auto-creating session:', error);
@@ -347,6 +404,7 @@ async function registerUserSession() {
 
         toast(`Welcome, ${userName}! Session started.`, 'success');
         console.log('Session registered:', data);
+        renderUserBadge();
 
     } catch (error) {
         toast(`Error registering session: ${error.message}`, 'error');
@@ -364,6 +422,18 @@ async function validateSession(sessionId) {
 
         if (data.valid) {
             currentSession = data.session;
+
+            if (data.session) {
+                if (data.session.user_name) {
+                    localStorage.setItem('eka-user-name', data.session.user_name);
+                }
+                if (data.session.user_email) {
+                    localStorage.setItem('eka-user-email', data.session.user_email);
+                }
+                if (data.session.user_role) {
+                    localStorage.setItem('eka-user-role', data.session.user_role);
+                }
+            }
 
             // Fetch session diagnostics to get time_remaining_minutes and update health dot
             try {
@@ -421,7 +491,7 @@ function startSessionKeepAlive() {
                 keepaliveState.lastSuccess = new Date();
                 keepaliveState.isRetrying = false;
 
-                console.log(`[KEEPALIVE] ✓ Success: Session ${sessionId.substring(0,8)}... expires in ${data.time_remaining_minutes}m`, data);
+                console.log(`[KEEPALIVE] ✓ Activity recorded for session ${sessionId.substring(0,8)}...`, data);
                 updateSessionStatusDisplay(data);
             } else {
                 handleKeepAliveFailure(sessionId, response.status);
@@ -507,44 +577,29 @@ function debounce(fn, delay) {
 }
 
 /**
- * Update session status display with health information
+ * Update session status display.
+ * Sessions are user-based and persistent — health dot is always green when active.
  */
 function updateSessionStatusDisplay(sessionData) {
-    // Only update the health-dot indicator, no text status display
     const healthDot = document.getElementById('health-dot');
-    const remaining = Math.max(0, sessionData.time_remaining_minutes || 0);
+    const remaining = sessionData.time_remaining_minutes || 0;
 
-    console.log('[SESSION] Updating health-dot, time remaining:', remaining, 'minutes');
-
-    // Update health dot color based on session time remaining
+    // For user-based persistent sessions: dot is green when active, red if terminated
     if (healthDot) {
         healthDot.classList.remove('healthy', 'warning', 'critical');
-        if (remaining <= 10) {
-            // Red: 10 minutes or less (CRITICAL)
+        if (!sessionData || sessionData.status === 'error') {
+            // No session or errored
             healthDot.classList.add('critical');
-            healthDot.title = `Session Status: CRITICAL (${remaining}m remaining)`;
-            console.log('[SESSION] Health-dot set to CRITICAL (red)');
-        } else if (remaining <= 30) {
-            // Yellow: 30 minutes or less (WARNING)
-            healthDot.classList.add('warning');
-            healthDot.title = `Session Status: Warning (${remaining}m remaining)`;
-            console.log('[SESSION] Health-dot set to WARNING (yellow)');
-        } else if (remaining >= 420) {
-            // Green: 7-8 hours (HEALTHY)
+            healthDot.title = 'Session Status: Error';
+        } else if (remaining === 999999 || remaining >= 60) {
+            // Persistent session — always healthy
             healthDot.classList.add('healthy');
-            const hours = Math.floor(remaining / 60);
-            const mins = remaining % 60;
-            healthDot.title = `Session Status: Healthy (${hours}h ${mins}m remaining)`;
-            console.log('[SESSION] Health-dot set to HEALTHY (green)');
+            healthDot.title = 'Session Status: Active (user-based persistent session)';
         } else {
-            // Gray: Between 30m and 7h (NORMAL)
-            const hours = Math.floor(remaining / 60);
-            const mins = remaining % 60;
-            healthDot.title = `Session Status: Active (${hours}h ${mins}m remaining)`;
-            console.log('[SESSION] Health-dot set to NORMAL (gray)');
+            // Fallback for any legacy session data
+            healthDot.classList.add('healthy');
+            healthDot.title = 'Session Status: Active';
         }
-    } else {
-        console.warn('[SESSION] Health-dot element not found!');
     }
 }
 
@@ -669,11 +724,13 @@ function switchTab(tab) {
     }
     if (tab === 'devices') loadDUTs();
     if (tab === 'logs') loadExecutions();
+    if (tab === 'dashboard') { loadExecutions(); loadTestcaseHistory(); }
     if (tab === 'terminal') {
         loadDUTs(); // Load DUTs to populate terminal dropdown
         setupTerminalHandlers(); // Re-setup handlers when entering terminal tab
     }
     if (tab === 'vs') renderVSHostList();
+    if (tab === 'users') { loadUsers(); loadActiveSessions(); }
 }
 
 // ============================================================
@@ -1316,6 +1373,9 @@ async function onSpyVMChange() {
     selectedScriptPaths.clear();
     scriptsData = [];
     currentFolderPath = '';
+    activeBasePath = '';
+    const basePathInput = document.getElementById('scripts-base-path');
+    if (basePathInput) basePathInput.value = '';
     scriptsList.innerHTML = '<p class="muted" style="padding:8px;font-size:12px;margin:0">Select VM to load folders and scripts.</p>';
     updateScriptMultiSelectText();
 
@@ -1323,6 +1383,11 @@ async function onSpyVMChange() {
     if (subfoldersEl) {
         subfoldersEl.innerHTML = '<p class="muted" style="padding:8px;font-size:12px;margin:0">Select VM to load folders.</p>';
     }
+    updateBreadcrumb('');
+    const subfolderCountEl = document.getElementById('subfolder-count');
+    if (subfolderCountEl) subfolderCountEl.textContent = '0';
+    const scriptsCountEl = document.getElementById('scripts-count');
+    if (scriptsCountEl) scriptsCountEl.textContent = '0';
 
     // Reset testbed
     if (testbedSel) {
@@ -1353,8 +1418,11 @@ async function onSpyVMChange() {
         }
     }
 
-    // Automatically navigate to root folder to show top-level categories
-    await navigateToPath('');
+    // Scripts are loaded only when the user explicitly enters a path and clicks Load
+    const subfoldersEl2 = document.getElementById('subfolders-list');
+    const scriptsEl2    = document.getElementById('script-dropdown-list');
+    if (subfoldersEl2) subfoldersEl2.innerHTML = '<p class="muted" style="padding:8px;font-size:12px;margin:0">Enter a path above and click Load.</p>';
+    if (scriptsEl2)    scriptsEl2.innerHTML    = '<p class="muted" style="padding:8px;font-size:12px;margin:0">Enter a path above and click Load.</p>';
 
     updateSpyStartBtn();
 }
@@ -1364,7 +1432,18 @@ async function onSpyVMChange() {
 // ============================================================
 
 let selectedScriptPaths = new Set();
-let currentFolderPath = '';  // Current folder path (e.g., "routing/bgp")
+let currentFolderPath = '';   // Current folder path (e.g., "routing/bgp")
+let activeBasePath    = '';   // User-supplied base path on the VM
+
+function loadScriptsFromPath() {
+    const input = document.getElementById('scripts-base-path');
+    const raw = (input ? input.value : '').trim().replace(/\/+$/, ''); // strip trailing slashes
+    if (!raw) { toast('Please enter a path first', 'warning'); return; }
+    const vmId = document.getElementById('spy-vm-select').value;
+    if (!vmId) { toast('Please select a VM first', 'warning'); return; }
+    activeBasePath = raw;
+    navigateToPath('');
+}
 
 /**
  * Navigate to a specific folder path and load its contents
@@ -1395,12 +1474,25 @@ async function navigateToPath(path) {
 
     try {
         // Fetch folder contents using the new browse API
-        const url = `${API}/api/spytest/browse/${encodeURIComponent(path)}?host_id=${vmId}`;
+        // NOTE: Starlette's {path:path} requires at least one char — use /browse (no slash)
+        // for root and /browse/<path> for sub-folders so routing always matches.
+        const pathSegment = path ? `/${encodeURIComponent(path)}` : '';
+        let url = `${API}/api/spytest/browse${pathSegment}?host_id=${vmId}`;
+        if (activeBasePath) url += `&base_path=${encodeURIComponent(activeBasePath)}`;
         console.log(`Fetching: ${url}`);
         const res = await fetch(url);
         if (!res.ok) throw new Error(`Server returned ${res.status}`);
         const data = await res.json();
         console.log('Browse data:', data);
+
+        // Show warning if the tests directory doesn't exist on this VM
+        if (data.warning) {
+            toast(data.warning, 'warning');
+            if (subfoldersEl) subfoldersEl.innerHTML = `<p class="muted" style="padding:8px;font-size:12px;margin:0">${data.warning}</p>`;
+            if (scriptsEl)    scriptsEl.innerHTML    = '<p class="muted" style="padding:8px;font-size:12px;margin:0">No scripts available.</p>';
+            updateBreadcrumb(path);
+            return;
+        }
 
         // Update breadcrumb
         updateBreadcrumb(path);
@@ -1764,18 +1856,33 @@ async function startExecution() {
     const allocInfoEl = document.getElementById('exec-allocation-info');
 
     // Auto-generate master testbed from topology if devices are selected (silent mode)
+    let generatedTestbedPath = '';  // full remote path returned by generate API
     if (selectedDUTIds.size > 0) {
+        if (!activeBasePath) {
+            const pathInput = document.getElementById('scripts-base-path');
+            if (pathInput) { pathInput.style.border = '2px solid #e74c3c'; pathInput.focus(); setTimeout(() => { pathInput.style.border = ''; }, 4000); }
+            toast('Please enter the Scripts Path on VM and click Load before starting execution.', 'error', 7000);
+            return;
+        }
         try {
-            await generateMasterTestbed(true); // Silent = true (no modal/toasts)
+            const tbData = await generateMasterTestbed(true); // Silent = true (no modal/toasts)
+            generatedTestbedPath = tbData?.master_testbed_path || '';
         } catch (e) {
             console.error('Failed to auto-generate master testbed:', e);
-            toast('Failed to generate testbed. Please check topology and try again.', 'error');
+            const emsg = e.message || '';
+            if (emsg.includes('PATH_NOT_FOUND') || emsg.includes('SCRIPTS_PATH_REQUIRED') || emsg.includes('Scripts Path on VM')) {
+                const pathInput = document.getElementById('scripts-base-path');
+                if (pathInput) { pathInput.style.border = '2px solid #e74c3c'; pathInput.focus(); setTimeout(() => { pathInput.style.border = ''; }, 4000); }
+                toast('Scripts path not set or not found on VM — enter the SPyTest scripts path and click Load first.', 'error', 7000);
+            } else {
+                toast('Failed to generate testbed. Please check topology and try again.', 'error');
+            }
             return;
         }
     }
 
-    // Always use master_testbed.yaml (auto-generated from topology)
-    const testbedFile = 'master_testbed.yaml';
+    // Use the full remote path if available, otherwise fall back to filename
+    const testbedFile = generatedTestbedPath || 'master_testbed.yaml';
 
     let endpoint, body;
 
@@ -1792,18 +1899,23 @@ async function startExecution() {
         try {
             for (const path of scriptPaths) {
                 let dut_count = 1;
+                let min_topology = [];
                 try {
                     const r = await fetch(`${API}/api/spytest/script-info`, {
                         method: 'POST',
                         headers: getSessionHeaders(),
-                        body: JSON.stringify({ host_id: vmId, script_path: path }),
+                        body: JSON.stringify({ host_id: vmId, script_path: path, base_path: activeBasePath || '' }),
                     });
-                    if (r.ok) { const info = await r.json(); dut_count = info.dut_count || 1; }
-                } catch (_) { /* default dut_count 1 */ }
-                scriptsWithCount.push({ path, dut_count });
+                    if (r.ok) {
+                        const info = await r.json();
+                        dut_count    = info.dut_count    || 1;
+                        min_topology = info.min_topology || [];
+                    }
+                } catch (_) { /* default dut_count 1, min_topology [] */ }
+                scriptsWithCount.push({ path, dut_count, min_topology });
             }
         } catch (_) {
-            scriptsWithCount = scriptPaths.map(p => ({ path: p, dut_count: 1 }));
+            scriptsWithCount = scriptPaths.map(p => ({ path: p, dut_count: 1, min_topology: [] }));
         }
 
         // Run allocation: pair scripts to DUT slots from selected + connected DUTs
@@ -1829,6 +1941,7 @@ async function startExecution() {
             options: { log_level: logLevel, skip_init_config: skipInit },
             // Enhancement 3: Pass DUT reservation flag
             reserve_duts: reserveDuts,
+            base_path: activeBasePath || '',
         };
     }
 
@@ -1861,6 +1974,8 @@ async function startExecution() {
         const mode = window._gitConnected ? 'Git' : 'SPyTest';
         toast(`${mode} Execution #${currentExecId} started`, 'success');
         connectWS(currentExecId);
+        // Initialize live results panel with queued scripts
+        showLiveResultsPanel(scriptPaths);
         loadStats();
     } catch (e) {
         toast(`Failed to start execution: ${e.message}`, 'error');
@@ -1877,6 +1992,7 @@ function stopExecution() {
     const qPanel = document.getElementById('queue-status-panel');
     if (qPanel) qPanel.style.display = 'none';
     toast('Execution monitoring stopped', 'info');
+    hideLiveResultsPanel();
 }
 
 function connectWS(execId) {
@@ -1884,18 +2000,23 @@ function connectWS(execId) {
     ws = new WebSocket(`${proto}//${location.host}/ws/execution/${execId}`);
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
+
+        // Handle script_result events (live results table)
+        if (data.type === 'script_result') {
+            updateLiveResults(data);
+            return;
+        }
+
         if (data.type === 'execution_complete') {
-            toast(`Execution ${data.status} (${data.duration || 0}s)`, data.status === 'completed' ? 'success' : 'error');
+            toast(`Execution ${data.status} (${data.duration || 0}s)`,
+                  data.status === 'completed' ? 'success' : 'error');
             document.getElementById('btn-start-exec').style.display = '';
             document.getElementById('btn-stop-exec').style.display = 'none';
-            // Enhancement 2: Hide "Add Scripts" button after execution
             const addScriptsBtn = document.getElementById('btn-add-scripts-exec');
             if (addScriptsBtn) addScriptsBtn.style.display = 'none';
-            // Enhancement 1: Hide "Show Only Running" button after execution
             const showOnlyBtn = document.getElementById('btn-show-only-running');
             if (showOnlyBtn) showOnlyBtn.style.display = 'none';
             stopQueuePolling();
-            // Update queue badge to completed/failed
             const badge = document.getElementById('queue-exec-badge');
             if (badge) {
                 badge.className = `badge ${data.status === 'completed' ? 'completed' : 'failed'}`;
@@ -1904,29 +2025,154 @@ function connectWS(execId) {
             loadStats();
             loadExecutions();
 
-            // BUG FIX: Clear live logs from Execute tab after completion
-            // Users should view completed logs in Logs tab, not Execute tab
+            // Enable download buttons in Live Results panel
+            const btnHtml = document.getElementById('btn-dl-html');
+            const btnXls = document.getElementById('btn-dl-excel');
+            if (btnHtml) btnHtml.disabled = false;
+            if (btnXls) btnXls.disabled = false;
+
             allLogs = [];
             logStreams = {};
             const logContainer = document.getElementById('exec-log-container');
             if (logContainer) {
                 logContainer.innerHTML = '<div class="log-placeholder"><span class="material-icons-round">terminal</span><p>Logs will appear here when an execution starts...</p></div>';
             }
-            // Hide download button
             const downloadBtn = document.getElementById('btn-download-logs');
             if (downloadBtn) downloadBtn.style.display = 'none';
 
-            // Reset UI to normal state: unselect scripts and DUTs
             resetExecutionState();
             return;
         }
-        // Skip QUEUE log entries from appearing in log panes (they're handled by the queue panel)
+
         if (data.message && data.message.startsWith('[QUEUE]')) return;
         allLogs.push(data);
         appendLogEntry(data);
     };
     ws.onerror = () => toast('WebSocket connection error', 'error');
     ws.onclose = () => { ws = null; };
+}
+
+// ── Live Results Panel ─────────────────────────────────────────────────────
+
+function showLiveResultsPanel(scriptPaths) {
+    const panel = document.getElementById('live-results-panel');
+    if (!panel) return;
+    panel.style.display = '';
+
+    // Reset state
+    _liveScripts = {};
+    _liveScriptOrder = [];
+    _liveTotalScripts = scriptPaths.length;
+    _liveDoneScripts = 0;
+
+    // Reset download buttons
+    const btnHtml = document.getElementById('btn-dl-html');
+    const btnXls = document.getElementById('btn-dl-excel');
+    if (btnHtml) btnHtml.disabled = true;
+    if (btnXls) btnXls.disabled = true;
+
+    // Populate table with queued rows
+    const tbody = document.getElementById('live-results-tbody');
+    if (!tbody) return;
+
+    const rows = scriptPaths.map(p => {
+        const stem = p.split('/').pop().replace(/\.py$/, '');
+        _liveScriptOrder.push(stem);
+        _liveScripts[stem] = { passed: 0, failed: 0, skipped: 0, duration_s: 0, status: 'queued' };
+        return `<tr id="lr-row-${CSS.escape(stem)}">
+            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                title="${esc(p)}">${esc(stem)}</td>
+            <td><span class="badge" style="background:var(--bg-tertiary);color:var(--text-secondary)">◌ queued</span></td>
+            <td style="text-align:center">–</td>
+            <td style="text-align:center">–</td>
+            <td style="text-align:center">–</td>
+            <td>–</td>
+        </tr>`;
+    });
+    tbody.innerHTML = rows.join('');
+    _updateLiveProgressBar();
+}
+
+function hideLiveResultsPanel() {
+    const panel = document.getElementById('live-results-panel');
+    if (panel) panel.style.display = 'none';
+}
+
+function updateLiveResults(data) {
+    const stem = data.script_stem || (data.script || '').split('/').pop().replace(/\.py$/, '');
+    if (!stem) return;
+
+    const state = _liveScripts[stem] || {};
+    state.passed = data.passed || 0;
+    state.failed = data.failed || 0;
+    state.skipped = data.skipped || 0;
+    state.duration_s = data.duration_s || 0;
+    state.status = data.status || 'unknown';
+    _liveScripts[stem] = state;
+    _liveDoneScripts = Object.values(_liveScripts).filter(s => s.status !== 'queued').length;
+
+    const row = document.getElementById(`lr-row-${CSS.escape(stem)}`);
+    if (!row) return;
+
+    const statusColor = state.status === 'passed' ? 'var(--green,#22c55e)'
+        : state.status === 'failed' ? 'var(--red,#ef4444)'
+        : 'var(--text-secondary)';
+    const statusIcon = state.status === 'passed' ? '✓' : state.status === 'failed' ? '✗' : '↷';
+    const dur = state.duration_s ? `${state.duration_s}s` : '–';
+
+    row.innerHTML = `
+        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(stem)}</td>
+        <td><span style="color:${statusColor};font-weight:600">${statusIcon} ${state.status}</span></td>
+        <td style="text-align:center;color:var(--green,#22c55e)">${state.passed}</td>
+        <td style="text-align:center;color:var(--red,#ef4444)">${state.failed}</td>
+        <td style="text-align:center;color:var(--text-secondary)">${state.skipped}</td>
+        <td>${dur}</td>`;
+
+    _updateLiveProgressBar();
+}
+
+function _updateLiveProgressBar() {
+    const total = _liveTotalScripts;
+    const done = _liveDoneScripts;
+    const pct = total ? Math.round(done / total * 100) : 0;
+
+    const totalPass = Object.values(_liveScripts).reduce((s, x) => s + (x.passed || 0), 0);
+    const totalFail = Object.values(_liveScripts).reduce((s, x) => s + (x.failed || 0), 0);
+    const totalSkip = Object.values(_liveScripts).reduce((s, x) => s + (x.skipped || 0), 0);
+
+    const bar = document.getElementById('live-progress-bar');
+    if (bar) bar.style.width = pct + '%';
+    const summary = document.getElementById('live-results-summary');
+    if (summary) {
+        summary.textContent = `${done}/${total} scripts done`;
+        if (totalPass + totalFail + totalSkip > 0) {
+            summary.textContent += ` · ✓${totalPass} ✗${totalFail} ↷${totalSkip}`;
+        }
+    }
+}
+
+async function downloadReport(execId, format) {
+    if (!execId) { toast('No execution selected', 'warning'); return; }
+    const endpoint = format === 'excel'
+        ? `${API}/api/executions/${execId}/excel`
+        : `${API}/api/executions/${execId}/dashboard`;
+    try {
+        const res = await fetch(endpoint, { headers: getSessionHeaders() });
+        if (!res.ok) { toast(`Download failed: ${(await res.json()).detail}`, 'error'); return; }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = format === 'excel'
+            ? `eka_results_${execId}.xlsx`
+            : `eka_dashboard_${execId}.html`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+    } catch (e) {
+        toast(`Download error: ${e.message}`, 'error');
+    }
 }
 
 // ============================================================
@@ -2322,28 +2568,381 @@ async function loadExecutions() {
         });
         const execs = await res.json();
         const tbody = document.getElementById('exec-history-tbody');
-        if (!execs.length) { tbody.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No executions yet.</td></tr>'; return; }
-        tbody.innerHTML = execs.map(ex => `
-            <tr>
+        if (!execs.length) {
+            tbody.innerHTML = '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">No executions yet.</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = execs.map(ex => {
+            const totalP = ex.passed || 0;
+            const totalF = ex.failed || 0;
+            const totalS = ex.skipped || 0;
+            const resultsBadge = (totalP + totalF + totalS > 0)
+                ? `<span style="font-size:11px;white-space:nowrap">
+                    <span style="color:var(--green,#22c55e)">✓${totalP}</span>
+                    <span style="color:var(--red,#ef4444)"> ✗${totalF}</span>
+                    <span style="color:var(--text-secondary)"> ↷${totalS}</span>
+                  </span>`
+                : '<span class="muted" style="font-size:11px">–</span>';
+            const checked = _compareSelected.has(ex.id) ? 'checked' : '';
+            return `<tr>
+                <td style="text-align:center"><input type="checkbox" class="cmp-chk"
+                    data-id="${ex.id}" onchange="onCompareCheck(this)" ${checked}></td>
                 <td>#${ex.id}</td>
                 <td>${esc(ex.name)}</td>
                 <td>${esc(ex.type || '-')}</td>
                 <td><span class="badge ${ex.status}">${ex.status}</span></td>
+                <td>${resultsBadge}</td>
                 <td>${ex.dut_count}</td>
                 <td>${ex.duration != null ? ex.duration + 's' : '-'}</td>
                 <td>${ex.created_at ? new Date(ex.created_at).toLocaleString() : '-'}</td>
-                <td><button class="btn outline small" onclick="viewExecLogs(${ex.id})"><span class="material-icons-round" style="font-size:16px">visibility</span></button></td>
-            </tr>`).join('');
+                <td style="display:flex;gap:4px;align-items:center">
+                    <button class="btn outline small" onclick="viewExecLogs(${ex.id})"
+                        title="View logs">
+                        <span class="material-icons-round" style="font-size:16px">visibility</span>
+                    </button>
+                    <button class="btn outline small" onclick="downloadReport(${ex.id},'html')"
+                        title="Download HTML dashboard">
+                        <span class="material-icons-round" style="font-size:14px">download</span>
+                    </button>
+                    <button class="btn outline small" onclick="downloadReport(${ex.id},'excel')"
+                        title="Download Excel">
+                        <span class="material-icons-round" style="font-size:14px">table_chart</span>
+                    </button>
+                </td>
+            </tr>`;
+        }).join('');
 
-        // Dashboard recent
-        const recent = execs.slice(0, 5);
-        const dashEl = document.getElementById('dash-recent-exec');
-        dashEl.innerHTML = recent.map(ex => `
-            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border)">
-                <div><strong>#${ex.id}</strong> <span class="muted">${esc(ex.name)}</span></div>
-                <span class="badge ${ex.status}">${ex.status}</span>
-            </div>`).join('') || '<p class="muted">No executions yet.</p>';
-    } catch { }
+        // Dashboard execution summary panel
+        renderDashExecSummary(execs);
+
+    } catch (e) { console.error('loadExecutions error', e); }
+}
+
+function renderDashExecSummary(execs) {
+    const el = document.getElementById('dash-exec-summary');
+    if (!el) return;
+
+    // Show only script executions (exclude VS/hardware image loads)
+    const scriptExecs = (execs || []).filter(ex => !ex.type || ex.type === 'script' || ex.type === 'spytest');
+    if (!scriptExecs.length) {
+        el.innerHTML = '<p class="muted" style="text-align:center;padding:20px">No script executions yet.</p>';
+        return;
+    }
+
+    const recent = scriptExecs.slice(0, 12);
+
+    // Build per-execution stats
+    const data = recent.map(ex => {
+        const p = ex.passed || 0;
+        const f = ex.failed || 0;
+        const s = ex.skipped || 0;
+        return { id: ex.id, name: ex.name, status: ex.status, p, f, s, total: p + f + s };
+    });
+
+    const maxTotal = Math.max(...data.map(d => d.total), 1);
+
+    // Chart dimensions
+    const W = 560, H = 200, padL = 38, padR = 10, padT = 14, padB = 44;
+    const chartW = W - padL - padR;
+    const chartH = H - padT - padB;
+    const barGroup = chartW / data.length;
+    const barW = Math.max(Math.min(barGroup * 0.65, 40), 8);
+
+    // Y-axis grid lines & labels
+    const ySteps = 4;
+    let gridLines = '';
+    for (let i = 0; i <= ySteps; i++) {
+        const val = Math.round(maxTotal * i / ySteps);
+        const y = padT + chartH - (chartH * i / ySteps);
+        gridLines += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"
+            stroke="var(--border,#334155)" stroke-width="1" stroke-dasharray="${i === 0 ? '' : '3,3'}"/>
+            <text x="${padL - 5}" y="${y + 4}" text-anchor="end" font-size="9"
+            fill="var(--text-secondary,#94a3b8)">${val}</text>`;
+    }
+
+    // Bars
+    let bars = '';
+    let xLabels = '';
+    data.forEach((d, i) => {
+        const cx = padL + barGroup * i + barGroup / 2;
+        const x0 = cx - barW / 2;
+
+        const hP = d.total ? (d.p / maxTotal) * chartH : 0;
+        const hF = d.total ? (d.f / maxTotal) * chartH : 0;
+        const hS = d.total ? (d.s / maxTotal) * chartH : 0;
+        const baseY = padT + chartH;
+
+        const tooltip = `#${d.id} ${d.name} | ✓${d.p} ✗${d.f} ↷${d.s}`;
+
+        if (d.total === 0) {
+            bars += `<rect x="${x0}" y="${baseY - 2}" width="${barW}" height="2"
+                fill="var(--border,#334155)" rx="1"><title>${tooltip}</title></rect>`;
+        } else {
+            // stacked: skipped bottom, failed middle, passed top
+            let curY = baseY;
+            if (hS > 0) {
+                curY -= hS;
+                bars += `<rect x="${x0}" y="${curY}" width="${barW}" height="${hS}"
+                    fill="#94a3b8" rx="1"><title>${tooltip}</title></rect>`;
+            }
+            if (hF > 0) {
+                curY -= hF;
+                bars += `<rect x="${x0}" y="${curY}" width="${barW}" height="${hF}"
+                    fill="#ef4444"><title>${tooltip}</title></rect>`;
+            }
+            if (hP > 0) {
+                curY -= hP;
+                bars += `<rect x="${x0}" y="${curY}" width="${barW}" height="${hP}"
+                    fill="#22c55e" ${hS === 0 && hF === 0 ? 'rx="2"' : ''}><title>${tooltip}</title></rect>`;
+            }
+        }
+
+        // X-axis label
+        const label = `#${d.id}`;
+        xLabels += `<text x="${cx}" y="${padT + chartH + 14}" text-anchor="middle"
+            font-size="9" fill="var(--text-secondary,#94a3b8)">${label}</text>`;
+    });
+
+    // Legend
+    const legend = `<div style="display:flex;gap:16px;justify-content:center;margin-top:6px;font-size:11px">
+        <span style="display:flex;align-items:center;gap:4px">
+            <span style="width:10px;height:10px;background:#22c55e;border-radius:2px;display:inline-block"></span>
+            <span style="color:var(--text-secondary)">Passed</span>
+        </span>
+        <span style="display:flex;align-items:center;gap:4px">
+            <span style="width:10px;height:10px;background:#ef4444;border-radius:2px;display:inline-block"></span>
+            <span style="color:var(--text-secondary)">Failed</span>
+        </span>
+        <span style="display:flex;align-items:center;gap:4px">
+            <span style="width:10px;height:10px;background:#94a3b8;border-radius:2px;display:inline-block"></span>
+            <span style="color:var(--text-secondary)">Skipped</span>
+        </span>
+    </div>`;
+
+    el.innerHTML = `
+        <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
+            ${gridLines}
+            ${bars}
+            ${xLabels}
+            <!-- Y-axis line -->
+            <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + chartH}"
+                stroke="var(--border,#334155)" stroke-width="1"/>
+        </svg>
+        ${legend}`;
+}
+
+// ── Compare ────────────────────────────────────────────────────────────────
+
+function onCompareCheck(checkbox) {
+    const id = parseInt(checkbox.dataset.id);
+    if (checkbox.checked) {
+        if (_compareSelected.size >= 2) {
+            // Deselect oldest
+            const oldest = [..._compareSelected][0];
+            _compareSelected.delete(oldest);
+            const oldChk = document.querySelector(`.cmp-chk[data-id="${oldest}"]`);
+            if (oldChk) oldChk.checked = false;
+        }
+        _compareSelected.add(id);
+    } else {
+        _compareSelected.delete(id);
+    }
+    const btn = document.getElementById('btn-compare-selected');
+    if (btn) btn.style.display = _compareSelected.size === 2 ? '' : 'none';
+}
+
+function toggleAllCompare(masterChk) {
+    const chks = document.querySelectorAll('.cmp-chk');
+    _compareSelected.clear();
+    chks.forEach(c => { c.checked = false; });
+    if (masterChk.checked) {
+        let count = 0;
+        chks.forEach(c => {
+            if (count < 2) { c.checked = true; _compareSelected.add(parseInt(c.dataset.id)); count++; }
+        });
+    }
+    const btn = document.getElementById('btn-compare-selected');
+    if (btn) btn.style.display = _compareSelected.size === 2 ? '' : 'none';
+}
+
+async function runComparison() {
+    if (_compareSelected.size !== 2) { toast('Select exactly 2 executions', 'warning'); return; }
+    const [a, b] = [..._compareSelected];
+    try {
+        const res = await fetch(`${API}/api/executions/compare?a=${a}&b=${b}`,
+            { headers: getSessionHeaders() });
+        if (!res.ok) { toast('Comparison failed', 'error'); return; }
+        const data = await res.json();
+        renderComparePanel(data);
+    } catch (e) { toast(`Compare error: ${e.message}`, 'error'); }
+}
+
+function renderComparePanel(data) {
+    const panel = document.getElementById('compare-panel');
+    const body = document.getElementById('compare-panel-body');
+    const title = document.getElementById('compare-panel-title');
+    if (!panel || !body) return;
+    title.textContent = `Run #${data.run_a.id} vs Run #${data.run_b.id}`;
+    panel.style.display = '';
+
+    const section = (label, color, icon, items) => {
+        if (!items.length) return '';
+        const rows = items.map(i =>
+            `<tr><td style="color:${color}">${icon}</td>
+             <td style="font-family:var(--font-mono,monospace);font-size:11px">${esc(i.test_function)}</td>
+             <td style="color:var(--text-secondary);font-size:12px">${esc(i.result_a)}</td>
+             <td style="color:var(--text-secondary);font-size:12px">→</td>
+             <td style="font-size:12px;color:${color}">${esc(i.result_b)}</td></tr>`
+        ).join('');
+        return `<div style="margin-bottom:16px">
+            <div style="font-weight:600;font-size:12px;text-transform:uppercase;
+                letter-spacing:1px;color:${color};margin-bottom:6px">
+                ${label} (${items.length})</div>
+            <table class="data-table" style="font-size:12px">
+                <tbody>${rows}</tbody></table></div>`;
+    };
+
+    const stableSection = (label, items) => {
+        if (!items.length) return '';
+        const preview = items.slice(0, 3).map(i =>
+            `<span style="font-size:11px;background:var(--bg-tertiary);padding:2px 8px;
+             border-radius:4px;font-family:monospace">${esc(i.test_function)}</span>`
+        ).join(' ');
+        const more = items.length > 3 ? ` <span class="muted">+${items.length - 3} more</span>` : '';
+        return `<div style="margin-bottom:10px;font-size:12px">
+            <span class="muted" style="font-weight:600">${label} (${items.length}):</span>
+            <span style="margin-left:8px">${preview}${more}</span></div>`;
+    };
+
+    body.innerHTML =
+        section('REGRESSED', 'var(--red,#ef4444)', '🔴', data.regressed) +
+        section('NEW FAILURES', 'var(--red,#ef4444)', '🆕', data.new_failures) +
+        section('FIXED', 'var(--green,#22c55e)', '🟢', data.fixed) +
+        stableSection('STABLE PASS', data.stable_pass) +
+        stableSection('STABLE FAIL', data.stable_fail) +
+        stableSection('STABLE SKIP', data.stable_skip) +
+        ((!data.regressed.length && !data.new_failures.length && !data.fixed.length)
+            ? '<p class="muted" style="text-align:center;padding:20px">No regressions or fixes found between these two runs.</p>'
+            : '');
+
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function closeComparePanel() {
+    const panel = document.getElementById('compare-panel');
+    if (panel) panel.style.display = 'none';
+}
+
+// ── Testcase History ───────────────────────────────────────────────────────
+
+async function loadTestcaseHistory() {
+    const tbody = document.getElementById('tc-history-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '<tr><td colspan="3" class="muted" style="text-align:center;padding:20px">Loading...</td></tr>';
+    try {
+        const res = await fetch(`${API}/api/testcases/summary?limit=50`,
+            { headers: getSessionHeaders() });
+        if (!res.ok) { tbody.innerHTML = '<tr><td colspan="3" class="muted" style="text-align:center;padding:20px">No data.</td></tr>'; return; }
+        _tcHistoryData = await res.json();
+        renderTestcaseHistory(_tcHistoryData);
+    } catch {
+        tbody.innerHTML = '<tr><td colspan="3" class="muted" style="text-align:center;padding:20px">Failed to load.</td></tr>';
+    }
+}
+
+function renderTestcaseHistory(data) {
+    const tbody = document.getElementById('tc-history-tbody');
+    if (!tbody) return;
+    if (!data.length) {
+        tbody.innerHTML = '<tr><td colspan="3" class="muted" style="text-align:center;padding:20px">No testcase data yet. Run a SpyTest execution first.</td></tr>';
+        return;
+    }
+    tbody.innerHTML = data.map(tc => {
+        const dots = tc.results.map(r => {
+            const n = (r.result || '').toLowerCase();
+            const color = n === 'pass' ? '#22c55e' : n === 'fail' ? '#ef4444' : '#94a3b8';
+            const sym = n === 'pass' ? '✓' : n === 'fail' ? '✗' : '↷';
+            return `<span title="${esc(r.result)} (exec #${r.execution_id})"
+                style="color:${color};font-size:14px;margin-right:4px">${sym}</span>`;
+        }).join('');
+        const trendInfo = _trendLabel(tc.trend);
+        const fn = tc.test_function || '';
+        const shortFn = fn.length > 55 ? fn.slice(0, 52) + '…' : fn;
+        return `<tr style="cursor:pointer" onclick="showTcPopover(this,'${encodeURIComponent(JSON.stringify(tc))}')">
+            <td style="font-family:monospace;font-size:11px" title="${esc(fn)}">${esc(shortFn)}</td>
+            <td>${dots}</td>
+            <td><span style="color:${trendInfo.color};font-size:12px">${trendInfo.label}</span></td>
+        </tr>`;
+    }).join('');
+}
+
+function _trendLabel(trend) {
+    const map = {
+        stable_pass: { label: 'Stable ✓', color: '#22c55e' },
+        stable_fail: { label: 'Stable ✗', color: '#ef4444' },
+        regressing:  { label: 'Regressing 🔴', color: '#ef4444' },
+        fixing:      { label: 'Fixing 🟢', color: '#22c55e' },
+        flaky:       { label: 'Flaky ⚠', color: '#f59e0b' },
+        unknown:     { label: '–', color: '#94a3b8' },
+    };
+    return map[trend] || map.unknown;
+}
+
+function filterTestcaseHistory(query) {
+    const q = query.toLowerCase();
+    const filtered = _tcHistoryData.filter(tc =>
+        (tc.test_function || '').toLowerCase().includes(q));
+    renderTestcaseHistory(filtered);
+}
+
+function showTcPopover(row, encoded) {
+    // Remove any existing popover
+    document.querySelectorAll('.tc-popover').forEach(p => p.remove());
+
+    let tc;
+    try { tc = JSON.parse(decodeURIComponent(encoded)); }
+    catch { return; }
+
+    const rows = tc.results.map(r => {
+        const color = (r.result || '').toLowerCase() === 'pass' ? '#22c55e'
+            : (r.result || '').toLowerCase() === 'fail' ? '#ef4444' : '#94a3b8';
+        return `<tr>
+            <td style="padding:3px 8px">#${r.execution_id}</td>
+            <td style="padding:3px 8px;color:${color}">${esc(r.result || '')}</td>
+            <td style="padding:3px 8px;color:#94a3b8">${r.time_seconds || 0}s</td>
+        </tr>`;
+    }).join('');
+
+    const pop = document.createElement('div');
+    pop.className = 'tc-popover';
+    pop.style.cssText = 'position:absolute;z-index:999;background:var(--bg-secondary);' +
+        'border:1px solid var(--border);border-radius:8px;padding:12px;min-width:200px;' +
+        'box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:12px';
+    pop.innerHTML = `<div style="font-family:monospace;font-size:10px;color:#94a3b8;
+        margin-bottom:8px;word-break:break-all">${esc(tc.test_function)}</div>
+        <table style="border-collapse:collapse;width:100%">
+        <thead><tr><th style="padding:2px 8px;color:#64748b;text-align:left">Exec</th>
+            <th style="padding:2px 8px;color:#64748b;text-align:left">Result</th>
+            <th style="padding:2px 8px;color:#64748b;text-align:left">Time</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+        <div style="margin-top:8px;text-align:right">
+            <button onclick="this.closest('.tc-popover').remove()"
+                style="border:none;background:none;color:#64748b;cursor:pointer;font-size:11px">
+                close ✕</button></div>`;
+
+    // Position below the row
+    const rect = row.getBoundingClientRect();
+    pop.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+    pop.style.left = (rect.left + window.scrollX) + 'px';
+    document.body.appendChild(pop);
+
+    // Close on outside click
+    setTimeout(() => {
+        document.addEventListener('click', function handler(e) {
+            if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener('click', handler); }
+        });
+    }, 10);
 }
 
 // Store current viewing execution ID for delete operations
@@ -2893,14 +3492,14 @@ function closeModal() { document.getElementById('modal-overlay').classList.remov
 // TOAST NOTIFICATIONS
 // ============================================================
 
-function toast(msg, type = 'info') {
+function toast(msg, type = 'info', duration = 4000) {
     const icons = { success: 'check_circle', error: 'error', info: 'info' };
     const container = document.getElementById('toast-container');
     const el = document.createElement('div');
     el.className = `toast ${type}`;
     el.innerHTML = `<span class="material-icons-round">${icons[type] || 'info'}</span> ${esc(msg)}`;
     container.appendChild(el);
-    setTimeout(() => { el.style.opacity = '0'; el.style.transform = 'translateX(40px)'; setTimeout(() => el.remove(), 300); }, 4000);
+    setTimeout(() => { el.style.opacity = '0'; el.style.transform = 'translateX(40px)'; setTimeout(() => el.remove(), 300); }, duration);
 }
 
 // ============================================================
@@ -3417,20 +4016,45 @@ async function generateMasterTestbed(silent = false) {
         throw new Error('No connections');
     }
 
+    if (!activeBasePath) {
+        const pathInput = document.getElementById('scripts-base-path');
+        if (pathInput) { pathInput.style.border = '2px solid #e74c3c'; pathInput.focus(); setTimeout(() => { pathInput.style.border = ''; }, 4000); }
+        if (!silent) toast('Please enter the Scripts Path on VM first, then click Load before generating the testbed.', 'error', 7000);
+        throw new Error('SCRIPTS_PATH_REQUIRED');
+    }
+
     try {
         const res = await fetch(`${API}/api/topology/generate-master-testbed`, {
             method: 'POST',
             headers: getSessionHeaders(),
             body: JSON.stringify({
                 host_id: parseInt(vmId),
-                master_filename: 'master_testbed.yaml'
+                master_filename: 'master_testbed.yaml',
+                base_path: activeBasePath || ''
             })
         });
 
         if (!res.ok) {
             const err = await res.json();
-            if (!silent) toast(`Failed to generate master testbed: ${err.detail || 'Unknown error'}`, 'error');
-            throw new Error(err.detail || 'Failed to generate testbed');
+            const detail = err.detail || 'Unknown error';
+            if (!silent) {
+                if (detail.includes('PATH_NOT_FOUND') || detail.includes('SCRIPTS_PATH_REQUIRED') || detail.includes('Scripts Path on VM')) {
+                    // Path not set or not found on VM — highlight the path input and guide the user
+                    const pathInput = document.getElementById('scripts-base-path');
+                    if (pathInput) {
+                        pathInput.style.border = '2px solid #e74c3c';
+                        pathInput.focus();
+                        setTimeout(() => { pathInput.style.border = ''; }, 4000);
+                    }
+                    const msg = detail.includes('SCRIPTS_PATH_REQUIRED')
+                        ? 'Please enter the Scripts Path on VM and click Load before generating the testbed.'
+                        : 'Testbed directory not found on VM — verify the Scripts Path on VM field is correct and try again.';
+                    toast(msg, 'error', 7000);
+                } else {
+                    toast(`Failed to generate master testbed: ${detail}`, 'error');
+                }
+            }
+            throw new Error(detail);
         }
 
         const data = await res.json();
@@ -3911,8 +4535,8 @@ async function fetchScriptInfo(scriptPath) {
     try {
         const res = await fetch(`${API}/api/spytest/script-info`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ host_id: parseInt(vmId), script_path: scriptPath }),
+            headers: { 'Content-Type': 'application/json', ...getSessionHeaders() },
+            body: JSON.stringify({ host_id: parseInt(vmId), script_path: scriptPath, base_path: activeBasePath || '' }),
         });
         if (!res.ok) throw new Error(`Server ${res.status}`);
         const info = await res.json();
@@ -4218,14 +4842,31 @@ async function loadVSList(dutId) {
                     <th>VM Name</th>
                     <th>State</th>
                     <th>Target Image Name</th>
-                    <th style="width:60px">Action</th>
+                    <th style="width:100px">Action</th>
                 </tr>
             </thead>
             <tbody>`;
 
         data.vms.forEach(vm => {
-            const isRunning = vm.state.includes('running');
-            const stateClass = isRunning ? 'online' : (vm.state.includes('shut') ? 'offline' : 'pending');
+            const state = (vm.state || '').toLowerCase();
+            const isRunning = state.includes('running');
+            const isPaused  = state.includes('paused');
+            const isShutoff = state.includes('shut') || state === 'off';
+
+            // Badge colour class
+            const stateClass = isRunning ? 'online'
+                             : isPaused  ? 'paused'
+                             : isShutoff ? 'offline'
+                             : 'pending';
+
+            // Icon
+            const iconName = isRunning ? 'play_circle'
+                           : isPaused  ? 'pause_circle'
+                           : 'stop_circle';
+            const iconColor = isRunning ? 'var(--green)'
+                            : isPaused  ? 'var(--yellow, #f59e0b)'
+                            : 'var(--text-muted)';
+
             const checked = selectedVSNames.has(vm.name) ? 'checked' : '';
             // Auto-generate target: sp-Sonic-102 → Dlink-sonic-vs2.img
             const numMatch = vm.name.match(/(\d+)\s*$/);
@@ -4234,6 +4875,37 @@ async function loadVSList(dutId) {
             const rawNum = numMatch ? parseInt(numMatch[1], 10) % 100 : 0;
             const defaultTarget = rawNum > 0 ? `Dlink-sonic-vs${rawNum}.img` : `${vm.name}.img`;
 
+            // Action button based on state
+            let actionBtn = '';
+            if (isRunning) {
+                // Running → Pause + Destroy
+                actionBtn = `
+                <div style="display:flex;gap:4px">
+                    <button class="btn outline small" onclick="vsQuickAction('${esc(vm.name)}','suspend')"
+                        title="Pause (virsh suspend ${esc(vm.name)})"
+                        style="color:var(--yellow,#f59e0b);padding:5px 8px;border-color:var(--yellow,#f59e0b)">
+                        <span class="material-icons-round" style="font-size:16px">pause</span>
+                    </button>
+                    <button class="btn outline small" onclick="vsQuickAction('${esc(vm.name)}','destroy')"
+                        title="Destroy (hard stop)" style="color:var(--red);padding:5px 8px">
+                        <span class="material-icons-round" style="font-size:16px">stop</span>
+                    </button>
+                </div>`;
+            } else if (isPaused) {
+                // Paused → Resume only
+                actionBtn = `<button class="btn outline small" onclick="vsQuickAction('${esc(vm.name)}','resume')"
+                    title="Resume (virsh resume ${esc(vm.name)})"
+                    style="color:var(--yellow,#f59e0b);padding:5px 8px;border-color:var(--yellow,#f59e0b)">
+                    <span class="material-icons-round" style="font-size:16px">play_arrow</span>
+                </button>`;
+            } else {
+                // Shut off / unknown → Start only
+                actionBtn = `<button class="btn outline small" onclick="vsQuickAction('${esc(vm.name)}','start')"
+                    title="Start" style="color:var(--green);padding:5px 8px">
+                    <span class="material-icons-round" style="font-size:16px">play_arrow</span>
+                </button>`;
+            }
+
             html += `<tr class="vs-vm-row ${selectedVSNames.has(vm.name) ? 'selected' : ''}" data-vm="${esc(vm.name)}">
                 <td>
                     <input type="checkbox" class="vs-cb" value="${esc(vm.name)}" ${checked}
@@ -4241,7 +4913,7 @@ async function loadVSList(dutId) {
                 </td>
                 <td>
                     <div style="display:flex;align-items:center;gap:8px">
-                        <span class="material-icons-round" style="font-size:18px;color:var(--${isRunning ? 'green' : 'text-muted'})">${isRunning ? 'play_circle' : 'stop_circle'}</span>
+                        <span class="material-icons-round" style="font-size:18px;color:${iconColor}">${iconName}</span>
                         <span style="font-weight:600;font-size:0.9rem">${esc(vm.name)}</span>
                     </div>
                 </td>
@@ -4252,12 +4924,7 @@ async function loadVSList(dutId) {
                         placeholder="${esc(defaultTarget)}"
                         style="width:100%;padding:5px 8px;font-size:0.82rem;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:var(--mono)">
                 </td>
-                <td>
-                    ${isRunning
-                    ? `<button class="btn outline small" onclick="vsQuickAction('${esc(vm.name)}','destroy')" title="Destroy" style="color:var(--red);padding:5px 8px"><span class="material-icons-round" style="font-size:16px">stop</span></button>`
-                    : `<button class="btn outline small" onclick="vsQuickAction('${esc(vm.name)}','start')" title="Start" style="color:var(--green);padding:5px 8px"><span class="material-icons-round" style="font-size:16px">play_arrow</span></button>`
-                }
-                </td>
+                <td>${actionBtn}</td>
             </tr>`;
         });
 
@@ -4321,28 +4988,44 @@ async function vsQuickAction(vmName, action) {
     const dutId = document.getElementById('vs-host').value;
     if (!dutId) { toast('Select a host device first', 'error'); return; }
 
-    // For destroy action, require VS name confirmation
+    // Confirmation messages per action
     if (action === 'destroy') {
         const confirmed = await showVSDestroyConfirmation(vmName);
         if (!confirmed) return;
+    } else if (action === 'resume') {
+        // Resume is safe — just a simple confirm
+        if (!confirm(`Resume paused VM "${vmName}"?\n\nThis will run:\n  sudo virsh resume ${vmName}`)) return;
+    } else if (action === 'suspend') {
+        if (!confirm(`Suspend (pause) VM "${vmName}"?\n\nThis will run:\n  sudo virsh suspend ${vmName}`)) return;
     } else {
         if (!confirm(`${action.toUpperCase()} VM "${vmName}"?`)) return;
     }
 
-    toast(`Executing ${action} on ${vmName}...`, 'info');
+    const actionLabel = {
+        start: 'Starting', destroy: 'Destroying', reboot: 'Rebooting',
+        shutdown: 'Shutting down', resume: 'Resuming', suspend: 'Suspending'
+    }[action] || action;
+
+    toast(`${actionLabel} ${vmName}...`, 'info');
     try {
         const res = await fetch(`${API}/api/vs/${dutId}/action`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ vs_name: vmName, action: action }),
         });
-        const data = await res.json();
-        if (data.status === 'success') {
-            toast(`${action} on '${vmName}' — ${data.message}`, 'success');
+
+        let data = {};
+        try { data = await res.json(); } catch (_) {}
+
+        // FastAPI errors use 'detail'; app-level errors use 'message'
+        const errMsg = data.detail || data.message || data.error || `HTTP ${res.status}`;
+
+        if (res.ok && data.status === 'success') {
+            toast(`✓ ${vmName}: ${data.message || action + ' completed'}`, 'success');
         } else {
-            toast(`${action} on '${vmName}' failed: ${data.message}`, 'error');
+            toast(`${action} on '${vmName}' failed: ${errMsg}`, 'error');
         }
-        // Refresh VM list after a short delay
+        // Refresh VM list after a short delay to show updated state
         setTimeout(() => loadVSList(dutId), 1500);
     } catch (e) { toast(`Action failed: ${e.message}`, 'error'); }
 }
@@ -5727,3 +6410,230 @@ function formatDateTime(dateString) {
 
     return date.toLocaleString();
 }
+
+// ============================================================
+// USER MANAGEMENT (OnePalC Integration)
+// ============================================================
+
+async function loadUsers() {
+    const container = document.getElementById('users-container');
+    const countBadge = document.getElementById('users-count-badge');
+    if (!container) return;
+
+    // Show loading state
+    container.innerHTML = `
+        <div class="user-row" style="justify-content:center; padding:32px; border:none;">
+            <span class="loader"></span>
+            <span style="margin-left:12px; color:var(--text-muted); font-size:0.9rem;">Loading users…</span>
+        </div>`;
+    if (countBadge) countBadge.style.display = 'none';
+
+    try {
+        const res = await fetch('/api/onepalc/users?_t=' + Date.now());
+        if (!res.ok) throw new Error('Failed to fetch users. Ensure SSO is enabled and the API Token is correct.');
+
+        let data = await res.json();
+        console.log('Hub API Payload:', data);
+
+        if (data.error) throw new Error(data.error);
+
+        let users = Array.isArray(data) ? data : (data.users || data.data || []);
+        console.log('Extracted users array length:', users.length);
+
+        // Filter: only show users who have at least one application role assigned
+        const ekaUsers = users.filter(u =>
+            Array.isArray(u.application_roles) && u.application_roles.length > 0
+        );
+        console.log(`Filtered to ${ekaUsers.length} Eka users (with application_roles)`);
+
+        if (ekaUsers.length === 0) {
+            container.innerHTML = `
+                <div class="user-row" style="justify-content:center; padding:40px; border:none; color:var(--text-muted);">
+                    No users found. Check AccessHub assignment for this application.
+                </div>`;
+            return;
+        }
+
+        // Update count badge
+        if (countBadge) {
+            countBadge.textContent = ekaUsers.length;
+            countBadge.style.display = 'inline-flex';
+        }
+
+        container.innerHTML = '';
+        ekaUsers.forEach(u => {
+            // Extract application roles
+            let rolesArr = [];
+            if (u.application_roles && Array.isArray(u.application_roles)) {
+                rolesArr = u.application_roles.map(r => r.role_name);
+            } else if (u.roles) {
+                if (typeof u.roles === 'string') rolesArr = [u.roles];
+                else if (Array.isArray(u.roles)) rolesArr = u.roles;
+                else rolesArr = Object.values(u.roles);
+            }
+
+            const rolesHtml = rolesArr.length > 0
+                ? rolesArr.map(r => `<span class="user-role-badge">${r}</span>`).join('')
+                : '<span class="user-role-badge" style="opacity:0.45">No Role</span>';
+
+            const displayName = u.display_name || u.name || '—';
+            const email      = u.email || 'No email';
+            const initial    = (displayName !== '—' ? displayName : email).charAt(0).toUpperCase();
+
+            const row = document.createElement('div');
+            row.className = 'user-row';
+            row.innerHTML = `
+                <div class="user-row-avatar">${initial}</div>
+                <div class="user-row-info">
+                    <div class="user-row-name">${displayName}</div>
+                    <div class="user-row-email">${email}</div>
+                </div>
+                <div class="user-row-roles">${rolesHtml}</div>
+            `;
+            container.appendChild(row);
+        });
+
+    } catch (err) {
+        console.error('loadUsers error:', err);
+        container.innerHTML = `
+            <div class="user-row" style="justify-content:center; padding:40px; border:none; flex-direction:column; gap:8px; color:var(--danger);">
+                <span class="material-icons-round" style="font-size:36px;">error_outline</span>
+                <span style="font-size:0.88rem; text-align:center;">${err.message}</span>
+            </div>`;
+    }
+}
+
+
+function _timeAgo(isoStr) {
+    if (!isoStr) return '—';
+    const diff = Math.floor((Date.now() - new Date(isoStr).getTime()) / 1000);
+    if (diff < 60)  return 'just now';
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    return `${Math.floor(diff / 86400)}d ago`;
+}
+
+async function loadActiveSessions() {
+    const container = document.getElementById('sessions-container');
+    const countBadge = document.getElementById('sessions-count-badge');
+    if (!container) return;
+
+    container.innerHTML = `
+        <div style="display:flex;align-items:center;justify-content:center;padding:32px;gap:10px;color:var(--text-muted);font-size:0.875rem;">
+            <span class="loader"></span> Loading sessions…
+        </div>`;
+    if (countBadge) countBadge.style.display = 'none';
+
+    try {
+        // X-Session-ID header required — without it the backend returns 401
+        const res = await fetch('/api/sessions/active', { headers: getSessionHeaders() });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        const sessions = data.sessions || [];
+        const isAdmin  = data.is_admin === true;
+        const myId     = getSessionId() || '';
+
+        if (countBadge) {
+            countBadge.textContent = sessions.length;
+            countBadge.style.display = 'inline-flex';
+        }
+
+        if (sessions.length === 0) {
+            container.innerHTML = `
+                <div style="padding:40px;text-align:center;color:var(--text-muted);font-size:0.875rem;">
+                    No active sessions.
+                </div>`;
+            return;
+        }
+
+        // Sort: own session first, then alphabetically
+        sessions.sort((a, b) => {
+            if (a.session_id === myId) return -1;
+            if (b.session_id === myId) return 1;
+            return (a.user_name || '').localeCompare(b.user_name || '');
+        });
+
+        container.innerHTML = '';
+        sessions.forEach(s => {
+            const displayName = s.user_name || s.user_email || 'Unknown';
+            const initial     = displayName.charAt(0).toUpperCase();
+            const role        = (s.user_role || 'user').toLowerCase();
+            const isAdmin_row = role === 'admin';
+            const isSelf      = s.session_id === myId;
+            const dutCount    = s.allocated_dut_count || 0;
+
+            const selfTag = isSelf
+                ? `<span class="session-you-tag">You</span>` : '';
+
+            const roleBadge = `<span class="session-role-badge ${isAdmin_row ? 'admin' : 'user'}">${esc(role)}</span>`;
+
+            const metaChips = `
+                <div class="session-meta-chip">
+                    <span class="material-icons-round">schedule</span>
+                    ${_timeAgo(s.last_activity)}
+                </div>
+                <div class="session-meta-chip">
+                    <span class="material-icons-round">devices</span>
+                    ${dutCount} DUT${dutCount !== 1 ? 's' : ''}
+                </div>
+                <div class="session-meta-chip">
+                    <span class="material-icons-round">login</span>
+                    Since ${s.created_at ? new Date(s.created_at).toLocaleDateString() : '—'}
+                </div>`;
+
+            const footer = (isAdmin && !isSelf)
+                ? `<div class="session-card-footer">
+                       <button class="btn outline small" style="color:var(--red);"
+                           onclick="revokeSession('${esc(s.session_id)}','${esc(displayName)}')"
+                           title="Revoke this session">
+                           <span class="material-icons-round" style="font-size:14px">block</span> Revoke
+                       </button>
+                   </div>`
+                : '';
+
+            const card = document.createElement('div');
+            card.className = 'session-card';
+            card.innerHTML = `
+                <div class="session-card-top">
+                    <div class="session-avatar ${isAdmin_row ? 'session-avatar-admin' : ''}">${initial}</div>
+                    <div class="session-info">
+                        <div class="session-name">
+                            ${esc(displayName)}${selfTag}
+                            <span style="margin-left:auto">${roleBadge}</span>
+                        </div>
+                        <div class="session-email">${esc(s.user_email || '—')}</div>
+                    </div>
+                </div>
+                <div class="session-card-meta">${metaChips}</div>
+                ${footer}`;
+            container.appendChild(card);
+        });
+
+    } catch (err) {
+        console.error('loadActiveSessions error:', err);
+        container.innerHTML = `
+            <div style="padding:32px;text-align:center;color:var(--red);font-size:0.875rem;">
+                <span class="material-icons-round" style="font-size:28px;display:block;margin-bottom:8px">error_outline</span>
+                ${esc(err.message)}
+            </div>`;
+    }
+}
+
+
+async function revokeSession(sessionId, userName) {
+    if (!confirm(`Revoke session for "${userName}"?\n\nThis will immediately end their access.`)) return;
+    try {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/revoke`, {
+            method: 'POST',
+            headers: getSessionHeaders()
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        toast(`Session revoked for ${userName}`, 'success');
+        loadActiveSessions();
+    } catch (err) {
+        toast(`Revoke failed: ${err.message}`, 'error');
+    }
+}
+
+

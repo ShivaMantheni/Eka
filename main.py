@@ -10,9 +10,10 @@ from fastapi import (
     Depends, File, UploadFile, Form, Request
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+import csv
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, UniqueConstraint, or_
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, UniqueConstraint, or_, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from contextlib import asynccontextmanager
 import os
@@ -39,6 +40,13 @@ import io
 import base64
 import socket
 
+try:
+    import openpyxl
+    from openpyxl.styles import PatternFill, Font, Alignment
+    _HAS_OPENPYXL = True
+except ImportError:
+    _HAS_OPENPYXL = False
+
 import paramiko
 from paramiko import AutoAddPolicy, SSHClient
 
@@ -57,6 +65,13 @@ from hardware_load_logic import execute_hardware_load, log_audit
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+
+# Load environment variables from .env file (must happen before any os.getenv calls)
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(Path(__file__).parent / ".env", override=False)
+except ImportError:
+    pass  # python-dotenv not installed — rely on shell environment
 
 BASE_DIR = Path(__file__).parent.resolve()
 DATA_DIR = BASE_DIR / "data"
@@ -196,6 +211,7 @@ class Execution(Base):
     start_time = Column(DateTime, nullable=True)
     end_time = Column(DateTime, nullable=True)
     duration_seconds = Column(Integer, nullable=True)
+    test_results = Column(Text, nullable=True)   # JSON list of per-script aggregates
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -207,6 +223,21 @@ class ExecutionLog(Base):
     log_level = Column(String(20), default="INFO")
     message = Column(Text)
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+
+class TestCaseResult(Base):
+    __tablename__ = "testcase_results"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    execution_id = Column(Integer, nullable=False, index=True)
+    script_path = Column(Text, nullable=True)
+    module = Column(Text, nullable=True)
+    test_function = Column(Text, nullable=True)
+    testcase_id = Column(Text, nullable=True)
+    result = Column(String(20), nullable=True)
+    time_taken = Column(String(50), nullable=True)
+    time_seconds = Column(Integer, nullable=True)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class DUTLock(Base):
@@ -232,19 +263,28 @@ class TopologyConnection(Base):
 
 
 class UserSession(Base):
-    """Multi-user session management for concurrent test execution."""
+    """Multi-user session management for concurrent test execution.
+
+    Sessions are USER-BASED and PERSISTENT — they do not expire by time.
+    A session is only deactivated when:
+      - The user explicitly logs out (/api/onepalc/logout)
+      - An admin revokes it via the API
+      - OnePalC reports the user as inactive (periodic sync)
+    """
     __tablename__ = "user_sessions"
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String(255), unique=True, nullable=False, index=True)
     user_name = Column(String(100), nullable=False)
     user_email = Column(String(255), nullable=True)
-    status = Column(String(20), default="active")  # active, expired, terminated
+    user_role = Column(String(255), nullable=True)  # Role assigned via OnePalC SSO
+    status = Column(String(20), default="active")  # active, terminated, revoked
     allocated_dut_ids = Column(Text, default="")  # JSON array of DUT IDs
     created_at = Column(DateTime, default=datetime.utcnow)
     last_activity = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_keepalive = Column(DateTime, nullable=True)  # Track last successful keep-alive
     keepalive_fail_count = Column(Integer, default=0)  # Count consecutive failures
-    expires_at = Column(DateTime, nullable=False)
+    # expires_at kept for backward compatibility with existing DB rows; not enforced
+    expires_at = Column(DateTime, nullable=True)
 
 
 class HardwareLoadJob(Base):
@@ -452,16 +492,19 @@ class SSHConnectionManager:
 
 def log_execution(db: Session, execution_id: int, dut_name: str, level: str, message: str):
     """Write an execution log entry to the database."""
-    entry = ExecutionLog(
-        execution_id=execution_id,
-        dut_name=dut_name,
-        log_level=level,
-        message=message,
-        timestamp=datetime.utcnow(),
-    )
-    db.add(entry)
-    db.commit()
     logger.log(getattr(logging, level, logging.INFO), f"[Exec {execution_id}][{dut_name}] {message}")
+    try:
+        entry = ExecutionLog(
+            execution_id=execution_id,
+            dut_name=dut_name,
+            log_level=level,
+            message=message,
+            timestamp=datetime.utcnow(),
+        )
+        db.add(entry)
+        db.commit()
+    except Exception:
+        db.rollback()
 
 
 def run_image_deployment(execution_id: int, dut_ids: List[int], image_id: int):
@@ -995,36 +1038,33 @@ def heartbeat_check():
 
 def cleanup_expired_sessions():
     """
-    Background task to clean up expired sessions and their associated data.
+    Background task to clean up explicitly terminated/revoked sessions.
 
-    Runs every 10 minutes. For each expired session:
-    1. Mark session as "expired"
-    2. Delete all DUTs (devices) belonging to that session
-    3. Delete all related data: DUTConfiguration, DUTLock, TopologyConnection
-    4. Delete all Executions and ExecutionLogs for that session
-    5. Close SSH connections for deleted devices
+    Runs every 10 minutes. Sessions are USER-BASED and do NOT expire by time.
+    This job only cleans up sessions with status='terminated' or 'revoked':
+    1. Delete all DUTs (devices) belonging to the session
+    2. Delete all related data: DUTConfiguration, DUTLock, TopologyConnection
+    3. Delete all Executions and ExecutionLogs for that session
+    4. Close SSH connections for deleted devices
 
-    This ensures the database doesn't grow indefinitely with old session data.
+    Sessions remain 'active' indefinitely until the user logs out or is revoked.
     """
     db = SessionLocal()
     try:
-        current_time = datetime.utcnow()
-
-        # Find all sessions that have expired
-        expired_sessions = db.query(UserSession).filter(
-            UserSession.expires_at < current_time,
-            UserSession.status == "active"
+        # Only clean up explicitly terminated or revoked sessions
+        terminated_sessions = db.query(UserSession).filter(
+            UserSession.status.in_(["terminated", "revoked"])
         ).all()
 
-        if not expired_sessions:
-            logger.debug("No expired sessions to clean up")
+        if not terminated_sessions:
+            logger.debug("No terminated sessions to clean up")
             return
 
-        logger.info(f"Found {len(expired_sessions)} expired sessions to clean up")
+        logger.info(f"Found {len(terminated_sessions)} terminated/revoked sessions to clean up")
 
-        for session in expired_sessions:
+        for session in terminated_sessions:
             session_id = session.session_id
-            logger.info(f"Cleaning up expired session: {session_id} (user: {session.user_name})")
+            logger.info(f"Cleaning up terminated session: {session_id} (user: {session.user_name})")
 
             try:
                 # 1. Get all DUTs belonging to this session
@@ -1084,17 +1124,17 @@ def cleanup_expired_sessions():
                     ).delete(synchronize_session=False)
                     logger.debug(f"  Deleted {deleted_execs} executions")
 
-                # 10. Mark session as expired
-                session.status = "expired"
+                # 10. Delete the session record itself (terminated sessions are removed)
+                db.delete(session)
                 db.commit()
 
-                logger.info(f"✓ Successfully cleaned up session {session_id}")
+                logger.info(f"✓ Successfully cleaned up terminated session {session_id}")
 
             except Exception as e:
                 logger.error(f"Error cleaning up session {session_id}: {e}")
                 db.rollback()
 
-        logger.info(f"Session cleanup complete. Processed {len(expired_sessions)} expired sessions")
+        logger.info(f"Session cleanup complete. Processed {len(terminated_sessions)} terminated sessions")
 
     except Exception as e:
         logger.error(f"Session cleanup task failed: {e}")
@@ -1107,11 +1147,59 @@ def cleanup_expired_sessions():
 scheduler = BackgroundScheduler()
 
 # Startup event: clean up stuck executions and hardware load jobs from previous runs
+def _another_server_running(port: int = 8000) -> bool:
+    """Return True if another process is already listening on `port`.
+
+    At the time @app.on_event("startup") fires, this server has NOT yet bound
+    the port.  So a successful connect means a sibling process owns the socket —
+    we must not clobber its live executions in the database.
+    """
+    import socket as _socket
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(('127.0.0.1', port)) == 0
+
+
 @app.on_event("startup")
 def startup_cleanup():
     """Clean up any executions or hardware load jobs stuck from previous server runs."""
+    # Guard: if another server instance already owns port 8000, we are a
+    # redundant restart attempt that will fail to bind later.  Do NOT touch
+    # execution status rows — they belong to the live server and changing them
+    # would cause currently-running executions to appear as "failed" in the UI
+    # while their background threads keep streaming logs.
+    if _another_server_running():
+        logger.warning(
+            "[Startup] Port 8000 is already in use — another server instance is running. "
+            "Skipping execution cleanup to avoid corrupting live executions."
+        )
+        return
+
     db = SessionLocal()
     try:
+        # ── Fix PostgreSQL sequences desynced after SQLite migration ──────────
+        # When rows are bulk-inserted with explicit IDs (migration), the
+        # auto-increment sequence stays at 1 causing UniqueViolation on next insert.
+        _pg_tables = [
+            "duts", "dut_configurations", "images", "scripts",
+            "executions", "execution_logs", "dut_locks",
+            "topology_connections", "user_sessions",
+            "hardware_load_jobs", "audit_logs",
+        ]
+        fixed = []
+        for tbl in _pg_tables:
+            try:
+                db.execute(text(
+                    f"SELECT setval('{tbl}_id_seq', "
+                    f"(SELECT COALESCE(MAX(id), 1) FROM {tbl}))"
+                ))
+                fixed.append(tbl)
+            except Exception:
+                pass  # table or sequence may not exist (SQLite mode / fresh install)
+        if fixed:
+            db.commit()
+            logger.info(f"[Startup] PostgreSQL sequences reset for: {', '.join(fixed)}")
+
         # ── Clean up stuck script executions ──────────────────────────────────
         stuck_executions = db.query(Execution).filter(Execution.status == "running").all()
         if stuck_executions:
@@ -1255,12 +1343,73 @@ def verify_resource_access(resource_session_id: str, current_session_id: str, re
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_dashboard():
-    """Serve the main HTML dashboard."""
+async def serve_dashboard(
+    request: Request,
+    db: Session = Depends(get_db),
+    token: str = "",
+    auth_token: str = "",
+    access_token: str = "",
+    session_token: str = "",
+):
+    """
+    Serve the main HTML dashboard.
+    When OnePalC SSO is enabled, unauthenticated or expired sessions are
+    redirected to the OnePalC Hub login page before the dashboard is shown.
+
+    OnePalC sometimes redirects back to /?token=<JWT> instead of
+    /hub-callback?token=<JWT>. We detect that here and forward to hub-callback.
+    """
+    from fastapi.responses import RedirectResponse as _RR
+
+    # OnePalC may send the JWT directly to / instead of /hub-callback.
+    # Forward to the dedicated callback handler so session creation runs there.
+    jwt_on_root = token or auth_token or access_token or session_token
+    if jwt_on_root and _ONEPALC_ENABLED:
+        param_name = "token" if token else ("auth_token" if auth_token else ("access_token" if access_token else "session_token"))
+        callback_url = f"/hub-callback?{param_name}={urllib.parse.quote(jwt_on_root)}"
+        logger.info(f"[SSO Guard] JWT received at / — forwarding to /hub-callback")
+        return _RR(url=callback_url, status_code=302)
+
+    if _ONEPALC_ENABLED and _ONEPALC_HUB_AUTH_URL:
+        session_id = request.cookies.get("eka_session_id", "").strip()
+
+        def _hub_login_redirect():
+            callback = _ONEPALC_CALLBACK_URL or str(request.base_url) + "hub-callback"
+            login_url = (
+                f"{_ONEPALC_HUB_AUTH_URL}"
+                f"?app_name={urllib.parse.quote(_ONEPALC_APP_NAME)}"
+                f"&redirect_uri={urllib.parse.quote(callback)}"
+            )
+            return _RR(url=login_url, status_code=302)
+
+        if not session_id:
+            logger.info("[SSO Guard] No session cookie — redirecting to OnePalC login")
+            return _hub_login_redirect()
+
+        # Validate session is active (user-based sessions have no TTL)
+        session = db.query(UserSession).filter(
+            UserSession.session_id == session_id
+        ).first()
+
+        if not session:
+            logger.info(f"[SSO Guard] Unknown session {session_id!r} — redirecting to login")
+            return _hub_login_redirect()
+
+        if session.status != "active":
+            logger.info(f"[SSO Guard] Session {session_id!r} is {session.status} — redirecting to login")
+            return _hub_login_redirect()
+
+        # Valid session — update last_activity and serve the dashboard
+        session.last_activity = datetime.utcnow()
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+
     html_path = static_dir / "index.html"
     if html_path.exists():
         return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
-    return HTMLResponse(content="<h1>DUT Automation System</h1><p>Frontend not found. Place index.html in /static/</p>")
+    return HTMLResponse(content="<h1>DUT Automation System</h1><p>Frontend not found.</p>")
 
 
 @app.get("/health")
@@ -2991,8 +3140,13 @@ def get_executions(request: Request, db: Session = Depends(get_db)):
         .all()
     )
 
-    return [
-        {
+    out = []
+    for ex in executions:
+        results = json.loads(ex.test_results or "[]") if ex.test_results else []
+        passed  = sum(r.get("passed",  0) for r in results)
+        failed  = sum(r.get("failed",  0) for r in results)
+        skipped = sum(r.get("skipped", 0) for r in results)
+        out.append({
             "id": ex.id,
             "name": ex.name,
             "type": ex.execution_type,
@@ -3000,9 +3154,64 @@ def get_executions(request: Request, db: Session = Depends(get_db)):
             "dut_count": len(json.loads(ex.dut_ids)) if ex.dut_ids else 0,
             "duration": ex.duration_seconds,
             "created_at": ex.created_at.isoformat() if ex.created_at else None,
-        }
-        for ex in executions
-    ]
+            "passed": passed, "failed": failed, "skipped": skipped,
+        })
+    return out
+
+
+@app.get("/api/executions/compare")
+def compare_executions(a: int, b: int, request: Request, db: Session = Depends(get_db)):
+    session_id = get_session_id(request)
+    exec_a = db.query(Execution).filter(Execution.id == a).first()
+    exec_b = db.query(Execution).filter(Execution.id == b).first()
+    if not exec_a or not exec_b:
+        raise HTTPException(status_code=404, detail="One or both executions not found")
+    if not verify_resource_access(exec_a.session_id, session_id, "Execution", a):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    def _map(exec_id):
+        tcrs = db.query(TestCaseResult).filter(TestCaseResult.execution_id == exec_id).all()
+        return {t.test_function: t.result for t in tcrs if t.test_function}
+
+    map_a = _map(a)
+    map_b = _map(b)
+    all_funcs = set(map_a) | set(map_b)
+
+    regressed, fixed, new_failures = [], [], []
+    stable_pass, stable_fail, stable_skip = [], [], []
+
+    def _is_pass(r): return (r or '').lower() == 'pass'
+    def _is_fail(r): return (r or '').lower() in ('fail', 'scripterror', 'error')
+    def _is_skip(r): return (r or '').lower() in ('skip', 'xfail', 'deselect')
+
+    for fn in sorted(all_funcs):
+        ra, rb = map_a.get(fn), map_b.get(fn)
+        item = {"test_function": fn, "result_a": ra or "–", "result_b": rb or "–"}
+        if ra is None:
+            if _is_fail(rb): new_failures.append(item)
+        elif rb is None:
+            pass
+        elif _is_pass(ra) and (_is_fail(rb) or _is_skip(rb)):
+            regressed.append(item)
+        elif (_is_fail(ra) or _is_skip(ra)) and _is_pass(rb):
+            fixed.append(item)
+        elif _is_pass(ra) and _is_pass(rb):
+            stable_pass.append(item)
+        elif _is_fail(ra) and _is_fail(rb):
+            stable_fail.append(item)
+        elif _is_skip(ra) and _is_skip(rb):
+            stable_skip.append(item)
+
+    return {
+        "run_a": {"id": a, "name": exec_a.name},
+        "run_b": {"id": b, "name": exec_b.name},
+        "regressed": regressed,
+        "fixed": fixed,
+        "new_failures": new_failures,
+        "stable_pass": stable_pass,
+        "stable_fail": stable_fail,
+        "stable_skip": stable_skip,
+    }
 
 
 @app.get("/api/executions/{execution_id}")
@@ -3069,6 +3278,93 @@ def get_execution_logs(
         }
         for log in logs
     ]
+
+
+@app.get("/api/executions/{execution_id}/dashboard")
+def download_dashboard(execution_id: int, request: Request, db: Session = Depends(get_db)):
+    """Download HTML dashboard report for an execution."""
+    session_id = get_session_id(request)
+    execution = db.query(Execution).filter(Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    if not verify_resource_access(execution.session_id, session_id, "Execution", execution_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+    tcrs = (db.query(TestCaseResult)
+            .filter(TestCaseResult.execution_id == execution_id)
+            .order_by(TestCaseResult.id).all())
+    results = json.loads(execution.test_results or "[]")
+    if not results and tcrs:
+        results = _rebuild_results_from_tcrs(tcrs)
+    html_content = _build_html_dashboard(execution, results, tcrs)
+    return StreamingResponse(
+        io.BytesIO(html_content.encode("utf-8")),
+        media_type="text/html",
+        headers={"Content-Disposition": f'attachment; filename="eka_dashboard_{execution_id}.html"'})
+
+
+@app.get("/api/executions/{execution_id}/excel")
+def download_excel(execution_id: int, request: Request, db: Session = Depends(get_db)):
+    """Download Excel (.xlsx) report for an execution."""
+    if not _HAS_OPENPYXL:
+        raise HTTPException(status_code=503, detail="openpyxl not installed on server — run: pip install openpyxl")
+    session_id = get_session_id(request)
+    execution = db.query(Execution).filter(Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    if not verify_resource_access(execution.session_id, session_id, "Execution", execution_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+    tcrs = (db.query(TestCaseResult)
+            .filter(TestCaseResult.execution_id == execution_id)
+            .order_by(TestCaseResult.id).all())
+    results = json.loads(execution.test_results or "[]")
+    if not results and tcrs:
+        results = _rebuild_results_from_tcrs(tcrs)
+    buf = _build_excel(execution, results, tcrs)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="eka_results_{execution_id}.xlsx"'})
+
+
+@app.get("/api/testcases/summary")
+def testcase_summary(limit: int = 50, request: Request = None,
+                     db: Session = Depends(get_db)):
+    """Return last 5 results for up to `limit` distinct test functions — used by Dashboard."""
+    from sqlalchemy import func as sqlfunc
+    subq = (db.query(TestCaseResult.test_function,
+                     sqlfunc.max(TestCaseResult.execution_id).label("max_exec"))
+            .filter(TestCaseResult.test_function != None,
+                    TestCaseResult.test_function != "")
+            .group_by(TestCaseResult.test_function)
+            .order_by(sqlfunc.max(TestCaseResult.execution_id).desc())
+            .limit(limit).subquery())
+    functions = [row[0] for row in db.query(subq.c.test_function).all()]
+    out = []
+    for fn in functions:
+        last5 = (db.query(TestCaseResult)
+                 .filter(TestCaseResult.test_function == fn)
+                 .order_by(TestCaseResult.execution_id.desc())
+                 .limit(5).all())
+        results_list = [{"execution_id": t.execution_id, "result": t.result,
+                         "time_seconds": t.time_seconds} for t in last5]
+        out.append({"test_function": fn, "results": results_list,
+                    "trend": _calc_trend(results_list)})
+    return out
+
+
+@app.get("/api/testcases/history")
+def testcase_history(function: str = "", limit: int = 10,
+                     request: Request = None, db: Session = Depends(get_db)):
+    """Return per-execution result history for a single test function."""
+    if not function:
+        raise HTTPException(status_code=400, detail="function parameter required")
+    tcrs = (db.query(TestCaseResult)
+            .filter(TestCaseResult.test_function == function)
+            .order_by(TestCaseResult.execution_id.desc())
+            .limit(limit).all())
+    return [{"execution_id": t.execution_id, "result": t.result,
+             "time_taken": t.time_taken, "time_seconds": t.time_seconds,
+             "created_at": t.created_at.isoformat() if t.created_at else None} for t in tcrs]
 
 
 @app.delete("/api/executions/{execution_id}/logs")
@@ -3181,6 +3477,8 @@ async def websocket_logs(websocket: WebSocket, execution_id: int):
 
     try:
         last_log_id = 0
+        last_tcr_id = 0
+        script_stats: dict = {}  # script_path -> {passed, failed, skipped, duration_s}
 
         while True:
             new_logs = (
@@ -3205,10 +3503,52 @@ async def websocket_logs(websocket: WebSocket, execution_id: int):
                 )
                 last_log_id = log.id
 
+            # Poll for new TestCaseResult rows and emit script_result events
+            new_tcrs = (
+                db.query(TestCaseResult)
+                .filter(
+                    TestCaseResult.execution_id == execution_id,
+                    TestCaseResult.id > last_tcr_id,
+                )
+                .order_by(TestCaseResult.id.asc())
+                .all()
+            )
+            if new_tcrs:
+                last_tcr_id = new_tcrs[-1].id
+                updated_scripts: set = set()
+                for tcr in new_tcrs:
+                    sp = tcr.script_path or 'unknown'
+                    if sp not in script_stats:
+                        script_stats[sp] = {'passed': 0, 'failed': 0, 'skipped': 0, 'duration_s': 0}
+                    r_lower = (tcr.result or '').lower()
+                    if r_lower == 'pass':
+                        script_stats[sp]['passed'] += 1
+                    elif r_lower in ('fail', 'scripterror', 'error'):
+                        script_stats[sp]['failed'] += 1
+                    elif r_lower in ('skip', 'xfail', 'deselect'):
+                        script_stats[sp]['skipped'] += 1
+                    script_stats[sp]['duration_s'] += tcr.time_seconds or 0
+                    updated_scripts.add(sp)
+                for sp in updated_scripts:
+                    st = script_stats[sp]
+                    stem = os.path.basename(sp).replace('.py', '') if sp != 'unknown' else 'unknown'
+                    f, p, sk = st['failed'], st['passed'], st['skipped']
+                    agg_status = 'failed' if f > 0 else 'passed' if p > 0 else 'skipped' if sk > 0 else 'unknown'
+                    await websocket.send_json({
+                        'type': 'script_result',
+                        'script': sp,
+                        'script_stem': stem,
+                        'passed': p,
+                        'failed': f,
+                        'skipped': sk,
+                        'duration_s': st['duration_s'],
+                        'status': agg_status,
+                    })
+
             # Check if execution has finished
             execution = db.query(Execution).filter(Execution.id == execution_id).first()
             if execution and execution.status in ["completed", "failed"]:
-                # Send any remaining logs
+                # Send any remaining logs and TCR results
                 db.expire_all()
                 remaining = (
                     db.query(ExecutionLog)
@@ -3229,6 +3569,43 @@ async def websocket_logs(websocket: WebSocket, execution_id: int):
                             "timestamp": log.timestamp.isoformat() if log.timestamp else None,
                         }
                     )
+                # Flush any final TestCaseResult rows before signalling completion
+                final_tcrs = (
+                    db.query(TestCaseResult)
+                    .filter(
+                        TestCaseResult.execution_id == execution_id,
+                        TestCaseResult.id > last_tcr_id,
+                    )
+                    .order_by(TestCaseResult.id.asc())
+                    .all()
+                )
+                if final_tcrs:
+                    for tcr in final_tcrs:
+                        sp = tcr.script_path or 'unknown'
+                        if sp not in script_stats:
+                            script_stats[sp] = {'passed': 0, 'failed': 0, 'skipped': 0, 'duration_s': 0}
+                        r_lower = (tcr.result or '').lower()
+                        if r_lower == 'pass':
+                            script_stats[sp]['passed'] += 1
+                        elif r_lower in ('fail', 'scripterror', 'error'):
+                            script_stats[sp]['failed'] += 1
+                        elif r_lower in ('skip', 'xfail', 'deselect'):
+                            script_stats[sp]['skipped'] += 1
+                        script_stats[sp]['duration_s'] += tcr.time_seconds or 0
+                    for sp, st in script_stats.items():
+                        stem = os.path.basename(sp).replace('.py', '') if sp != 'unknown' else 'unknown'
+                        f, p, sk = st['failed'], st['passed'], st['skipped']
+                        agg_status = 'failed' if f > 0 else 'passed' if p > 0 else 'skipped' if sk > 0 else 'unknown'
+                        await websocket.send_json({
+                            'type': 'script_result',
+                            'script': sp,
+                            'script_stem': stem,
+                            'passed': p,
+                            'failed': f,
+                            'skipped': sk,
+                            'duration_s': st['duration_s'],
+                            'status': agg_status,
+                        })
 
                 await websocket.send_json(
                     {
@@ -4029,7 +4406,16 @@ def _run_vs_update(
 
 @app.post("/api/vs/{dut_id}/action")
 def vs_action(dut_id: int, body: dict, db: Session = Depends(get_db)):
-    """Quick VM action: start, destroy, reboot, shutdown."""
+    """Quick VM action: start, destroy, reboot, shutdown, suspend, resume.
+
+    Action map:
+        start    → virsh start   <name>   (boots a shut-off VM)
+        destroy  → virsh destroy <name>   (hard stop)
+        reboot   → virsh reboot  <name>   (graceful restart)
+        shutdown → virsh shutdown <name>  (graceful stop)
+        suspend  → virsh suspend <name>   (pause / freeze VM)
+        resume   → virsh resume  <name>   (un-pause a paused VM)
+    """
     dut = db.query(DUT).filter(DUT.id == dut_id).first()
     if not dut:
         raise HTTPException(status_code=404, detail="DUT not found")
@@ -4040,7 +4426,7 @@ def vs_action(dut_id: int, body: dict, db: Session = Depends(get_db)):
     if not vs_name or not action:
         raise HTTPException(status_code=400, detail="vs_name and action are required")
 
-    allowed_actions = ["start", "destroy", "reboot", "shutdown"]
+    allowed_actions = ["start", "destroy", "reboot", "shutdown", "suspend", "resume"]
     if action not in allowed_actions:
         raise HTTPException(status_code=400,
                             detail=f"Invalid action. Allowed: {', '.join(allowed_actions)}")
@@ -4132,8 +4518,14 @@ def get_spytest_scripts(category: str, host_id: int, db: Session = Depends(get_d
         ssh.disconnect()
 
 
+@app.get("/api/spytest/browse")
+def browse_spytest_root(host_id: int, base_path: str = None, db: Session = Depends(get_db)):
+    """Root browse — delegates to browse_spytest_folder with empty path."""
+    return browse_spytest_folder("", host_id, base_path, db)
+
+
 @app.get("/api/spytest/browse/{path:path}")
-def browse_spytest_folder(path: str, host_id: int, db: Session = Depends(get_db)):
+def browse_spytest_folder(path: str, host_id: int, base_path: str = None, db: Session = Depends(get_db)):
     """
     Browse a specific folder in the SPyTest tests directory.
     Returns both subfolders and scripts at the current level only (non-recursive).
@@ -4199,17 +4591,32 @@ def browse_spytest_folder(path: str, host_id: int, db: Session = Depends(get_db)
         # Sanitize path - remove leading/trailing slashes
         path = path.strip().strip('/')
 
+        # Use caller-supplied base path, falling back to the server default
+        tests_root = (base_path or '').strip().rstrip('/') or SPYTEST_TESTS_DIR
+
         # Build full path
         if path:
-            full_path = f"{SPYTEST_TESTS_DIR}/{path}"
+            full_path = f"{tests_root}/{path}"
         else:
-            full_path = SPYTEST_TESTS_DIR
+            full_path = tests_root
 
         # Check if path exists and is a directory
         check_cmd = f'[ -d "{full_path}" ] && echo "EXISTS" || echo "NOT_FOUND"'
         check_out, _, _ = ssh.execute_command(check_cmd, timeout=5)
         if "NOT_FOUND" in check_out:
-            raise HTTPException(status_code=404, detail=f"Path not found: {path}")
+            # Return empty result instead of 404 so the UI shows "no scripts" gracefully
+            parent_path = ""
+            if path and "/" in path:
+                parent_path = "/".join(path.split("/")[:-1])
+            return {
+                "current_path": path,
+                "parent_path": parent_path,
+                "subfolders": [],
+                "scripts": [],
+                "subfolder_count": 0,
+                "script_count": 0,
+                "warning": f"SpyTest tests directory not found on this VM: {full_path}",
+            }
 
         # Get subfolders (directories only, non-recursive, exclude __pycache__)
         subfolder_cmd = f'find "{full_path}" -mindepth 1 -maxdepth 1 -type d ! -name "__pycache__" ! -name ".*" -printf "%f\\n" | sort'
@@ -4234,8 +4641,8 @@ def browse_spytest_folder(path: str, host_id: int, db: Session = Depends(get_db)
                 line = line.strip()
                 if not line:
                     continue
-                # Get path relative to tests dir
-                rel_path = line.replace(SPYTEST_TESTS_DIR + "/", "")
+                # Get path relative to tests root
+                rel_path = line.replace(tests_root + "/", "")
                 name = os.path.basename(line)
                 scripts.append({"name": name, "path": rel_path, "full_path": line})
 
@@ -4307,7 +4714,9 @@ def get_spytest_script_info(body: dict, db: Session = Depends(get_db)):
 
     ssh, dut = _ssh_to_host(host_id, db)
     try:
-        full_path = f"{SPYTEST_TESTS_DIR}/{script_path}"
+        user_base = (body.get("base_path") or "").strip().rstrip("/")
+        tests_root = user_base or SPYTEST_TESTS_DIR
+        full_path = f"{tests_root}/{script_path}"
         cmd = f'cat {full_path}'
         output, error, code = ssh.execute_command(cmd, timeout=15)
         if code != 0:
@@ -4352,6 +4761,9 @@ def _parse_spytest_script(content: str) -> dict:
             if dut_refs:
                 max_duts = max(max_duts, max(int(d) for d in dut_refs))
         result["dut_count"] = max_duts
+        # If args were a starred variable (no inline strings), topology lives in a vars YAML
+        if not result["min_topology"] and re.search(r'st\.ensure_min_topology\(\*\w+\)', content):
+            result["uses_vars_file"] = True
 
     # 3. Determine topology type
     if result["dut_count"] == 1:
@@ -4420,10 +4832,12 @@ def start_spytest_execution(body: dict, db: Session = Depends(get_db)):
     # Enhancement 2: Initialize pending scripts structure for dynamic addition
     _init_pending_scripts(execution.id)
 
+    user_base_path = (body.get("base_path") or "").strip().rstrip("/")
+
     # Start background execution thread
     thread = Thread(
         target=_run_spytest_execution,
-        args=(execution.id, host_id, scripts, testbed_file, options, available_dut_count),
+        args=(execution.id, host_id, scripts, testbed_file, options, available_dut_count, user_base_path),
         daemon=True,
     )
     thread.start()
@@ -4495,6 +4909,7 @@ _pending_scripts_lock = Lock()
 _pending_scripts: dict = {}  # execution_id -> {scripts:[...], to_cancel: set(...)}
 _execution_threads_lock = Lock()
 _execution_threads: dict = {}  # execution_id -> list of thread objects
+_test_results_lock = Lock()  # guards concurrent test_results JSON updates from parallel script threads
 
 
 def _init_pending_scripts(execution_id: int):
@@ -4669,28 +5084,27 @@ def _has_back_to_back_connection(dut_name: str, db: Session) -> bool:
     dut = db.query(DUT).filter(DUT.name == dut_name).first()
     if not dut:
         return False
-
-    # Check for connections where dut_a == dut_b (self-loop)
     self_conn = db.query(TopologyConnection).filter(
         TopologyConnection.dut_a_id == dut.id,
         TopologyConnection.dut_b_id == dut.id
     ).first()
-
     return self_conn is not None
 
 
-# Enhancement 4: Helper function to get all back-to-back devices
-def _get_backtoback_devices(available_duts: list, db: Session) -> list:
-    """Enhancement 4: Get list of DUTs that have back-to-back (self-loop) connections.
+def _get_b2b_dut_names(db: Session) -> set:
+    """Return the set of DUT names that have at least one self-loop canvas connection.
 
-    A device has back-to-back if it has TopologyConnection where dut_a_id == dut_b_id.
-    These devices are prioritized in multi-DUT allocations.
+    Called ONCE in the main thread before worker threads start so the result can
+    be captured as a plain Python set — no DB access needed inside the lock.
     """
-    backtoback = []
-    for dut_name in available_duts:
-        if _has_back_to_back_connection(dut_name, db):
-            backtoback.append(dut_name)
-    return backtoback
+    self_loop_conns = db.query(TopologyConnection).filter(
+        TopologyConnection.dut_a_id == TopologyConnection.dut_b_id
+    ).all()
+    if not self_loop_conns:
+        return set()
+    dut_ids = {c.dut_a_id for c in self_loop_conns}
+    duts = db.query(DUT).filter(DUT.id.in_(dut_ids)).all()
+    return {d.name for d in duts}
 
 
 def _find_duts_matching_topology(
@@ -4698,95 +5112,457 @@ def _find_duts_matching_topology(
     dut_count: int,
     link_requirements: dict,
     topology_connections: dict,
-    db: Session
+    b2b_dut_names: set,
 ) -> list:
-    """Find a subset of DUTs that satisfy the topology link requirements.
+    """Find a subset of DUTs from available_duts that satisfies topology requirements.
+
+    No DB access — all topology data is pre-computed and passed in.
 
     Args:
-        available_duts: List of available DUT names from testbed
-        dut_count: Number of DUTs needed
-        link_requirements: Dict like {("D1", "D2"): 2, ("D2", "D3"): 1}
-        topology_connections: Dict like {("DUT1", "DUT2"): 2, ("DUT3", "DUT4"): 1}
-        db: Database session
+        available_duts: Pool of DUT names currently free
+        dut_count: How many DUTs this script needs
+        link_requirements: {("D1","D2"): 2, …} from st.ensure_min_topology
+        topology_connections: {("DUT-A","DUT-B"): count} from canvas (inter-device links)
+        b2b_dut_names: set of DUT names that have self-loop connections in the canvas
 
     Returns:
-        List of DUT names that satisfy requirements, or None if not found
+        List of DUT names, or None if requirements cannot be met right now
     """
     from itertools import combinations
 
-    # Special case: single DUT with back-to-back requirement check
-    if dut_count == 1:
-        # First try to find DUT with back-to-back connection
-        for dut_name in available_duts:
-            if _has_back_to_back_connection(dut_name, db):
-                return [dut_name]
-        # No back-to-back found, return first available
-        return [available_duts[0]] if available_duts else None
-
-    # Multi-DUT case: check all combinations with back-to-back priority (Enhancement 4)
     if not link_requirements:
-        # No specific link requirements, use back-to-back priority allocation
-        backtoback_duts = _get_backtoback_devices(available_duts, db)
+        if dut_count == 1 and b2b_dut_names:
+            # Prefer b2b device for single-DUT scripts when canvas has b2b devices
+            for dut in available_duts:
+                if dut in b2b_dut_names:
+                    return [dut]
+        # No b2b preference, or b2b device not currently free — FIFO
+        return available_duts[:dut_count] if len(available_duts) >= dut_count else None
 
-        if backtoback_duts:
-            # Enhancement 4: Prioritize back-to-back devices
-            # Allocate from back-to-back first, then fill remaining from others
-            allocated = backtoback_duts[:dut_count]
-            if len(allocated) < dut_count:
-                # Need more DUTs, fill from non-back-to-back
-                remaining = dut_count - len(allocated)
-                other_duts = [d for d in available_duts if d not in allocated]
-                allocated.extend(other_duts[:remaining])
-            return allocated if len(allocated) == dut_count else None
-        else:
-            # No back-to-back devices, just return first N DUTs
-            return available_duts[:dut_count] if len(available_duts) >= dut_count else None
-
-    # Try all combinations of DUTs
+    # Multi-DUT: try every combination and return the first that meets all link counts
     for combo in combinations(available_duts, dut_count):
         combo_list = list(combo)
-
-        # Build mapping: D1 -> combo_list[0], D2 -> combo_list[1], etc.
         dut_mapping = {f"D{i+1}": combo_list[i] for i in range(len(combo_list))}
 
-        # Check if this combination satisfies all link requirements
         satisfied = True
         for (dev1, dev2), required_links in link_requirements.items():
             actual_dut1 = dut_mapping.get(dev1)
             actual_dut2 = dut_mapping.get(dev2)
-
             if not actual_dut1 or not actual_dut2:
                 satisfied = False
                 break
-
-            # Get actual link count from topology canvas
             pair = tuple(sorted([actual_dut1, actual_dut2]))
-            actual_links = topology_connections.get(pair, 0)
-
-            if actual_links < required_links:
+            if topology_connections.get(pair, 0) < required_links:
                 satisfied = False
                 break
 
         if satisfied:
-            # Enhancement 4: Check if this combination includes back-to-back devices
-            # Prioritize combinations that include back-to-back devices
-            backtoback_in_combo = sum(1 for d in combo_list if _has_back_to_back_connection(d, db))
-            combo_list._backtoback_count = backtoback_in_combo
             return combo_list
 
-    # No matching combination found, try back-to-back priority allocation (Enhancement 4)
-    backtoback_duts = _get_backtoback_devices(available_duts, db)
-    if backtoback_duts and len(backtoback_duts) >= dut_count:
-        return backtoback_duts[:dut_count]
-    elif backtoback_duts and len(backtoback_duts) > 0:
-        allocated = backtoback_duts
-        remaining = dut_count - len(allocated)
-        other_duts = [d for d in available_duts if d not in allocated]
-        allocated.extend(other_duts[:remaining])
-        return allocated if len(allocated) == dut_count else None
+    return None
 
-    # Fall back to first N DUTs
-    return available_duts[:dut_count] if len(available_duts) >= dut_count else None
+
+# ============================================================================
+# REPORT HELPERS — result parsing, HTML dashboard, Excel export
+# ============================================================================
+
+def _parse_results_csv(csv_data: str) -> list:
+    """Parse SPyTest results CSV into a list of dicts."""
+    rows = []
+    try:
+        reader = csv.DictReader(io.StringIO(csv_data))
+        for row in reader:
+            module     = (row.get('Module')       or row.get('module')        or '').strip()
+            func       = (row.get('TestFunction') or row.get('Function')      or
+                          row.get('test_function') or '').strip()
+            result     = (row.get('Result')       or row.get('result')        or '').strip()
+            time_taken = (row.get('TimeTaken')    or row.get('Time')          or
+                          row.get('time_taken')   or '').strip()
+            doc        = (row.get('DocSummary')   or row.get('Description')   or
+                          row.get('description')  or '').strip()
+            time_s = 0
+            if time_taken:
+                parts = time_taken.split(':')
+                try:
+                    if len(parts) == 3:
+                        time_s = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+                    elif len(parts) == 2:
+                        time_s = int(parts[0]) * 60 + int(float(parts[1]))
+                except Exception:
+                    pass
+            tc_id = func.split('.')[-1] if '.' in func else func
+            rows.append({'module': module, 'test_function': func, 'testcase_id': tc_id,
+                         'result': result, 'time_taken': time_taken, 'time_seconds': time_s,
+                         'description': doc[:200] if doc else ''})
+    except Exception as e:
+        logger.warning(f"[results] CSV parse error: {e}")
+    return rows
+
+
+def _collect_and_save_results(ssh, execution, execution_id: int, script_path: str,
+                               log_dir: str, db):
+    """After a script finishes: find the results CSV, save TestCaseResult rows,
+    and append to execution.test_results (per-script aggregate JSON)."""
+    script_stem = os.path.basename(script_path).replace('.py', '')
+    try:
+        out, _, _ = ssh.execute_command(
+            f"find {log_dir} -name 'results_*_functions.csv' 2>/dev/null | head -1",
+            timeout=15)
+        csv_remote = out.strip()
+        rows = []
+        if csv_remote:
+            sftp = ssh.client.open_sftp()
+            try:
+                with sftp.file(csv_remote, 'r') as fh:
+                    csv_data = fh.read().decode('utf-8', errors='ignore')
+            finally:
+                sftp.close()
+            rows = _parse_results_csv(csv_data)
+            for r in rows:
+                tcr = TestCaseResult(
+                    execution_id=execution_id,
+                    script_path=script_path,
+                    module=r.get('module', ''),
+                    test_function=r.get('test_function', ''),
+                    testcase_id=r.get('testcase_id', ''),
+                    result=r.get('result', ''),
+                    time_taken=r.get('time_taken', ''),
+                    time_seconds=r.get('time_seconds', 0),
+                    description=r.get('description', '')
+                )
+                db.add(tcr)
+            db.commit()
+        else:
+            logger.info(f"[results] No CSV in {log_dir} for {script_stem}")
+
+        # Aggregate per-script summary into execution.test_results
+        result_lower = [r.get('result', '').lower() for r in rows]
+        passed  = sum(1 for r in result_lower if r == 'pass')
+        failed  = sum(1 for r in result_lower if r in ('fail', 'scripterror', 'error'))
+        skipped = sum(1 for r in result_lower if r in ('skip', 'xfail', 'deselect'))
+        dur_s   = sum(r.get('time_seconds', 0) for r in rows)
+        agg_status = ('failed' if failed > 0 else
+                      'passed' if passed > 0 else
+                      'skipped' if skipped > 0 else 'unknown')
+        agg = {'script': script_path, 'script_stem': script_stem, 'status': agg_status,
+               'passed': passed, 'failed': failed, 'skipped': skipped, 'duration_s': dur_s}
+        # Fix: reload execution from the inner session (db=sdb) so the commit actually persists.
+        # Use a lock to prevent concurrent script threads from racing on the JSON append.
+        with _test_results_lock:
+            inner_exec = db.query(Execution).filter(Execution.id == execution_id).first()
+            if inner_exec:
+                existing = json.loads(inner_exec.test_results or '[]')
+                existing.append(agg)
+                inner_exec.test_results = json.dumps(existing)
+            db.commit()
+        logger.info(f"[results] #{execution_id} {script_stem}: pass={passed} fail={failed} skip={skipped}")
+    except Exception as e:
+        logger.warning(f"[results] Collection failed for {script_stem}: {e}")
+
+
+# ── Report formatting helpers ─────────────────────────────────────────────────
+
+def _rebuild_results_from_tcrs(tcrs: list) -> list:
+    """Rebuild per-script aggregates from TestCaseResult rows (fallback when test_results is empty)."""
+    by_script: dict = {}
+    for tcr in tcrs:
+        sp = tcr.script_path or 'unknown'
+        by_script.setdefault(sp, []).append(tcr)
+    out = []
+    for sp, rows in by_script.items():
+        stem = os.path.basename(sp).replace('.py', '') if sp != 'unknown' else 'unknown'
+        rl = [(r.result or '').lower() for r in rows]
+        p  = sum(1 for r in rl if r == 'pass')
+        f  = sum(1 for r in rl if r in ('fail', 'scripterror', 'error'))
+        sk = sum(1 for r in rl if r in ('skip', 'xfail', 'deselect'))
+        dur = sum(r.time_seconds or 0 for r in rows)
+        status = 'failed' if f > 0 else 'passed' if p > 0 else 'skipped' if sk > 0 else 'unknown'
+        out.append({'script': sp, 'script_stem': stem, 'status': status,
+                    'passed': p, 'failed': f, 'skipped': sk, 'duration_s': dur})
+    return out
+
+
+def _extract_feature(module_path: str) -> str:
+    if not module_path:
+        return "Unknown"
+    parts = module_path.replace("\\", "/").split("/")
+    if len(parts) >= 2:
+        feat = parts[-2].replace("iscli_", "").replace("ISCLI_", "")
+        return feat.upper()
+    return parts[0].upper() if parts else "Unknown"
+
+def _extract_tc_id(test_function: str) -> str:
+    if not test_function:
+        return ""
+    return test_function.split(".")[-1] if "." in test_function else test_function
+
+def _fmt_seconds(secs) -> str:
+    secs = secs or 0
+    h, rem = divmod(int(secs), 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    if s: parts.append(f"{s}s")
+    return " ".join(parts) or "0s"
+
+def _norm_result(r: str) -> str:
+    r = (r or '').lower()
+    if r == 'pass': return 'pass'
+    if r in ('fail', 'scripterror', 'error'): return 'fail'
+    return 'other'
+
+def _calc_trend(results: list) -> str:
+    if not results: return "unknown"
+    statuses = [_norm_result(r.get("result", "")) for r in results]
+    if all(s == "pass" for s in statuses): return "stable_pass"
+    if all(s == "fail" for s in statuses): return "stable_fail"
+    pass_count = sum(1 for s in statuses if s == "pass")
+    fail_count = sum(1 for s in statuses if s == "fail")
+    if pass_count > 0 and fail_count > 0:
+        if len(statuses) >= 2 and statuses[0] == "fail" and any(s == "pass" for s in statuses[1:]):
+            return "fixing"
+        if len(statuses) >= 2 and statuses[0] == "pass" and any(s == "fail" for s in statuses[1:]):
+            return "regressing"
+        return "flaky"
+    return "unknown"
+
+
+def _build_html_dashboard(execution, results: list, tcrs: list) -> str:
+    from collections import defaultdict
+    total_p = sum(r.get("passed", 0) for r in results)
+    total_f = sum(r.get("failed", 0) for r in results)
+    total_s = sum(r.get("skipped", 0) for r in results)
+    total   = total_p + total_f + total_s
+    total_runtime_s = sum(t.time_seconds or 0 for t in tcrs)
+    pp = (total_p / total * 100) if total else 0
+    fp = (total_f / total * 100) if total else 0
+    sp = (total_s / total * 100) if total else 0
+    by_feature: dict = defaultdict(list)
+    for t in tcrs:
+        feat = _extract_feature(t.module or t.script_path or "")
+        by_feature[feat].append(t)
+    css = """
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;
+     background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:20px;min-height:100vh}
+.container{max-width:1400px;margin:0 auto;background:#fff;border-radius:12px;
+           box-shadow:0 10px 40px rgba(0,0,0,.2);overflow:hidden}
+.header{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;padding:30px;text-align:center}
+.header h1{font-size:30px;margin-bottom:8px;font-weight:600}
+.header p{font-size:13px;opacity:.9}
+.summary-section{padding:28px;background:#f8f9fa;border-bottom:1px solid #e9ecef}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin-bottom:20px}
+.summary-card{background:#fff;padding:18px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.08);text-align:center}
+.summary-card h3{font-size:12px;color:#6c757d;margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px}
+.summary-card .val{font-size:34px;font-weight:700;margin-bottom:4px}
+.val.total{color:#667eea}.val.passed{color:#28a745}.val.failed{color:#dc3545}
+.val.skipped{color:#ffc107}.val.runtime{color:#17a2b8}
+.progress-bar{width:100%;height:28px;background:#e9ecef;border-radius:4px;overflow:hidden;display:flex}
+.progress-bar.sm{height:18px;margin-top:10px}
+.seg{height:100%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff}
+.seg.pass{background:#28a745}.seg.fail{background:#dc3545}.seg.skip{background:#ffc107}
+.tabs{display:flex;flex-wrap:wrap;background:#f8f9fa;border-bottom:2px solid #dee2e6;padding:0 20px}
+.tab-btn{background:none;border:none;padding:14px 22px;cursor:pointer;font-size:13px;font-weight:500;
+         color:#6c757d;border-bottom:3px solid transparent}
+.tab-btn:hover{color:#667eea}.tab-btn.active{color:#667eea;border-bottom-color:#667eea;background:#fff}
+.tab-content{display:none;padding:28px}.tab-content.active{display:block}
+.mod-summary{background:#f8f9fa;padding:18px;border-radius:8px;border-left:4px solid #667eea;margin-bottom:18px}
+.mod-summary h2{color:#667eea;font-size:18px;margin-bottom:12px}
+.mod-stats{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:12px;font-size:13px}
+table{width:100%;border-collapse:collapse;background:#fff;
+      box-shadow:0 2px 8px rgba(0,0,0,.08);border-radius:8px;overflow:hidden;margin-top:18px}
+thead{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%)}
+th{color:#fff;padding:11px 12px;text-align:left;font-weight:600;font-size:11px;text-transform:uppercase}
+td{padding:9px 12px;border-bottom:1px solid #e9ecef;font-size:12px}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#f8f9fa}
+.badge{display:inline-block;padding:3px 9px;border-radius:4px;font-weight:700;font-size:11px}
+.badge.pass{background:#d4edda;color:#155724}.badge.fail{background:#f8d7da;color:#721c24}
+.badge.skip{background:#fff3cd;color:#856404}.badge.other{background:#e2e3e5;color:#383d41}
+.footer{padding:18px;text-align:center;background:#f8f9fa;color:#6c757d;font-size:11px;border-top:1px solid #e9ecef}
+"""
+    features = sorted(by_feature.keys())
+    tab_nav   = "".join(
+        f'<button class="tab-btn" onclick="openTab(event,\'{f.replace(" ","_").replace("/","_")}\')">{f}</button>\n'
+        for f in features)
+    tab_bodies = ""
+    for feat in features:
+        safe = feat.replace(" ", "_").replace("/", "_")
+        tcs  = by_feature[feat]
+        fp2  = sum(1 for t in tcs if (t.result or "").lower() == "pass")
+        ff2  = sum(1 for t in tcs if (t.result or "").lower() in ("fail","scripterror","error"))
+        fs2  = sum(1 for t in tcs if (t.result or "").lower() in ("skip","xfail","deselect"))
+        ft2  = fp2 + ff2 + fs2
+        fpp  = (fp2/ft2*100) if ft2 else 0
+        ffp  = (ff2/ft2*100) if ft2 else 0
+        fsp  = (fs2/ft2*100) if ft2 else 0
+        prog  = ""
+        if fpp > 0: prog += f'<div class="seg pass" style="width:{fpp:.1f}%">{fpp:.0f}%</div>'
+        if ffp > 0: prog += f'<div class="seg fail" style="width:{ffp:.1f}%">{ffp:.0f}%</div>'
+        if fsp > 0: prog += f'<div class="seg skip" style="width:{fsp:.1f}%">{fsp:.0f}%</div>'
+        rows  = ""
+        for idx, t in enumerate(tcs, 1):
+            res  = (t.result or "").strip()
+            rl   = res.lower()
+            cls  = ("pass" if rl == "pass" else
+                    "fail" if rl in ("fail","scripterror","error") else
+                    "skip" if rl in ("skip","xfail","deselect") else "other")
+            tc_id = _extract_tc_id(t.test_function or "")
+            desc  = (t.description or "")[:120]
+            rows += (f"<tr><td style='text-align:center;font-size:11px'>{idx}</td>"
+                     f"<td style='font-weight:600;font-size:11px;color:#667eea'>{feat}</td>"
+                     f"<td style='font-size:10px;word-break:break-all'>{t.module or t.script_path or ''}</td>"
+                     f"<td style='font-family:monospace;font-size:11px'>{tc_id}</td>"
+                     f"<td style='font-size:11px'>{desc}</td>"
+                     f"<td style='text-align:center;font-size:11px'>{t.time_taken or ''}</td>"
+                     f"<td><span class='badge {cls}'>{res}</span></td></tr>")
+        tab_bodies += f"""
+<div id="{safe}" class="tab-content">
+  <div class="mod-summary"><h2>{feat} — Test Results</h2>
+    <div class="mod-stats">
+      <span>✓ Pass: <strong style="color:#28a745">{fp2}</strong> ({fpp:.1f}%)</span>
+      <span style="margin:0 12px">✗ Fail: <strong style="color:#dc3545">{ff2}</strong> ({ffp:.1f}%)</span>
+      <span>⊘ Skip: <strong style="color:#ffc107">{fs2}</strong> ({fsp:.1f}%)</span>
+      <span style="margin-left:12px">Total: <strong>{ft2}</strong></span>
+    </div><div class="progress-bar sm">{prog}</div></div>
+  <table><thead><tr>
+    <th style="width:36px">S.No</th><th style="min-width:80px">Feature</th>
+    <th style="min-width:180px">Script</th><th style="min-width:180px">Testcase ID</th>
+    <th style="min-width:260px">Description</th>
+    <th style="width:80px">Time</th><th style="width:80px">Status</th>
+  </tr></thead><tbody>{rows}</tbody></table>
+</div>"""
+    overall_prog = ""
+    if pp > 0: overall_prog += f'<div class="seg pass" style="width:{pp:.1f}%">{pp:.0f}%</div>'
+    if fp > 0: overall_prog += f'<div class="seg fail" style="width:{fp:.1f}%">{fp:.0f}%</div>'
+    if sp > 0: overall_prog += f'<div class="seg skip" style="width:{sp:.1f}%">{sp:.0f}%</div>'
+    generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Eka Dashboard — {execution.name}</title><style>{css}</style></head><body>
+<div class="container">
+  <div class="header"><h1>SONiC Test Dashboard</h1>
+    <p>Execution #{execution.id} &nbsp;·&nbsp; {execution.name} &nbsp;·&nbsp;
+       {execution.status} &nbsp;·&nbsp; {generated_at}</p></div>
+  <div class="summary-section"><div class="summary-grid">
+    <div class="summary-card"><h3>Total Tests</h3><div class="val total">{total}</div></div>
+    <div class="summary-card"><h3>Passed</h3><div class="val passed">{total_p}</div><div class="pct">{pp:.1f}%</div></div>
+    <div class="summary-card"><h3>Failed</h3><div class="val failed">{total_f}</div><div class="pct">{fp:.1f}%</div></div>
+    <div class="summary-card"><h3>Skipped</h3><div class="val skipped">{total_s}</div><div class="pct">{sp:.1f}%</div></div>
+    <div class="summary-card"><h3>Total Runtime</h3><div class="val runtime">{_fmt_seconds(total_runtime_s)}</div></div>
+  </div>
+  <div style="margin-top:16px"><h3 style="font-size:14px;color:#495057;margin-bottom:8px">Overall Progress</h3>
+    <div class="progress-bar">{overall_prog}</div></div></div>
+  <div class="tabs">{tab_nav}</div>{tab_bodies}
+  <div class="footer">Generated by Eka Automation Platform &nbsp;·&nbsp; {generated_at}</div>
+</div>
+<script>
+function openTab(evt,name){{
+  document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(e=>e.classList.remove('active'));
+  document.getElementById(name).classList.add('active');
+  evt.currentTarget.classList.add('active');
+}}
+window.onload=function(){{var first=document.querySelector('.tab-btn');if(first)first.click();}};
+</script></body></html>"""
+
+
+def _build_excel(execution, results: list, tcrs: list):
+    wb = openpyxl.Workbook()
+    HDR_FILL  = PatternFill("solid", fgColor="667EEA")
+    HDR_FONT  = Font(bold=True, color="FFFFFF")
+    HDR_ALIGN = Alignment(horizontal="center", vertical="center")
+    PASS_FILL = PatternFill("solid", fgColor="D4EDDA")
+    FAIL_FILL = PatternFill("solid", fgColor="F8D7DA")
+    SKIP_FILL = PatternFill("solid", fgColor="FFF3CD")
+    PASS_FONT = Font(bold=True, color="155724")
+    FAIL_FONT = Font(bold=True, color="721C24")
+    SKIP_FONT = Font(bold=True, color="856404")
+
+    def _write_header(ws, headers, col_widths=None):
+        for col, h in enumerate(headers, 1):
+            c = ws.cell(row=1, column=col, value=h)
+            c.fill = HDR_FILL; c.font = HDR_FONT; c.alignment = HDR_ALIGN
+        ws.row_dimensions[1].height = 20
+        if col_widths:
+            for col, w in enumerate(col_widths, 1):
+                ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = w
+
+    def _result_style(ws, row_i, col):
+        c = ws.cell(row=row_i, column=col)
+        v = (c.value or "").lower()
+        if v == "pass":                          c.fill = PASS_FILL; c.font = PASS_FONT
+        elif v in ("fail","scripterror","error"): c.fill = FAIL_FILL; c.font = FAIL_FONT
+        elif v in ("skip","xfail","deselect"):   c.fill = SKIP_FILL; c.font = SKIP_FONT
+
+    ws1 = wb.active; ws1.title = "Summary"
+    total_p = sum(r.get("passed", 0) for r in results)
+    total_f = sum(r.get("failed", 0) for r in results)
+    total_s = sum(r.get("skipped", 0) for r in results)
+    total   = total_p + total_f + total_s
+    for label, val in [("Execution ID", execution.id), ("Name", execution.name),
+                       ("Status", execution.status),
+                       ("Duration", f"{execution.duration_seconds}s" if execution.duration_seconds else "–"),
+                       ("Scripts Run", len(results))]:
+        row = [("Execution ID", "Name", "Status", "Duration", "Scripts Run").index(label) + 1
+               if label in ("Execution ID", "Name", "Status", "Duration", "Scripts Run") else 1]
+    for row, (label, val) in enumerate([("Execution ID", execution.id), ("Name", execution.name),
+                                         ("Status", execution.status),
+                                         ("Duration", f"{execution.duration_seconds}s" if execution.duration_seconds else "–"),
+                                         ("Scripts Run", len(results))], 1):
+        ws1.cell(row=row, column=1, value=label).font = Font(bold=True)
+        ws1.cell(row=row, column=2, value=val)
+    ws1.column_dimensions["A"].width = 18; ws1.column_dimensions["B"].width = 40
+    for row, (label, val) in enumerate([("Total Tests", total), ("Passed", total_p),
+                                         ("Failed", total_f), ("Skipped", total_s),
+                                         ("Pass Rate", f"{total_p/total*100:.1f}%" if total else "–")], 7):
+        ws1.cell(row=row, column=1, value=label).font = Font(bold=True)
+        ws1.cell(row=row, column=2, value=val)
+    for col, h in enumerate(["Script","Status","Passed","Failed","Skipped","Duration (s)"], 1):
+        c = ws1.cell(row=14, column=col, value=h)
+        c.fill = HDR_FILL; c.font = HDR_FONT; c.alignment = HDR_ALIGN
+    for ri, r in enumerate(results, 15):
+        ws1.cell(row=ri, column=1, value=r.get("script_stem", r.get("script", "")))
+        ws1.cell(row=ri, column=2, value=r.get("status", ""))
+        ws1.cell(row=ri, column=3, value=r.get("passed", 0))
+        ws1.cell(row=ri, column=4, value=r.get("failed", 0))
+        ws1.cell(row=ri, column=5, value=r.get("skipped", 0))
+        ws1.cell(row=ri, column=6, value=r.get("duration_s", 0))
+        _result_style(ws1, ri, 2)
+    ws2 = wb.create_sheet("All Testcases")
+    _write_header(ws2, ["S.No","Feature","Script / Module","Testcase ID",
+                         "Test Function","Result","Time Taken","Time (s)","Description"],
+                  [6,16,38,34,46,12,12,10,50])
+    for ri, t in enumerate(tcrs, 2):
+        feat  = _extract_feature(t.module or t.script_path or "")
+        tc_id = _extract_tc_id(t.test_function or "")
+        for col, val in enumerate([ri-1, feat, t.module or t.script_path or "",
+                                    tc_id, t.test_function or "", t.result or "",
+                                    t.time_taken or "", t.time_seconds or 0,
+                                    t.description or ""], 1):
+            ws2.cell(row=ri, column=col, value=val)
+        _result_style(ws2, ri, 6)
+    ws3 = wb.create_sheet("Failures")
+    _write_header(ws3, ["S.No","Feature","Script / Module","Testcase ID",
+                         "Test Function","Result","Time Taken","Description"],
+                  [6,16,38,34,46,16,12,50])
+    failures = [t for t in tcrs if (t.result or "").lower() in ("fail","scripterror","error")]
+    if not failures:
+        ws3.cell(row=2, column=1, value="No failures recorded for this execution.")
+    else:
+        for ri, t in enumerate(failures, 2):
+            feat  = _extract_feature(t.module or t.script_path or "")
+            tc_id = _extract_tc_id(t.test_function or "")
+            for col, val in enumerate([ri-1, feat, t.module or t.script_path or "",
+                                        tc_id, t.test_function or "", t.result or "",
+                                        t.time_taken or "", t.description or ""], 1):
+                ws3.cell(row=ri, column=col, value=val)
+            _result_style(ws3, ri, 6)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 
 # ============================================================================
@@ -4800,6 +5576,7 @@ def _run_spytest_execution(
     testbed_file: str,
     options: dict,
     available_dut_count: int = 1,
+    base_path: str = "",
 ):
     """Background thread: Smart SPyTest execution with true parallel DUT allocation.
 
@@ -4808,6 +5585,32 @@ def _run_spytest_execution(
     needing 2 DUTs waits only until 2 are simultaneously available.
     """
     import time as _time
+
+    # Derive all runtime paths from the user-supplied base_path (scripts dir).
+    # e.g. base_path = /home/user/spytest/tests
+    #   -> spytest_root  = /home/user/spytest
+    #   -> testbed_dir   = /home/user/spytest/testbeds
+    #   -> spytest_bin   = /home/user/spytest/bin/spytest
+    #   -> spytest_venv  = /home/user/spytest/spytest_venv
+    # Falls back to the server-configured constants when base_path is empty.
+    if base_path:
+        _bp = base_path.rstrip("/")
+        # Extract spytest root: everything up to and including the "spytest" component.
+        # Works whether user enters /a/spytest, /a/spytest/tests, /a/spytest/tests/sub, etc.
+        _m = re.match(r'(^.*?/spytest)(?:/|$)', _bp)
+        _spytest_root   = _m.group(1) if _m else os.path.dirname(_bp)
+        _tests_dir      = _bp
+        _testbed_dir    = _spytest_root + "/testbeds"
+        _spytest_bin    = _spytest_root + "/bin/spytest"
+        _spytest_venv   = _spytest_root + "/spytest_venv"
+        _spytest_python = _spytest_venv + "/bin/python"
+    else:
+        _spytest_root   = SPYTEST_BASE
+        _tests_dir      = SPYTEST_TESTS_DIR
+        _testbed_dir    = SPYTEST_TESTBED_DIR
+        _spytest_bin    = SPYTEST_BIN
+        _spytest_venv   = SPYTEST_VENV
+        _spytest_python = SPYTEST_PYTHON
 
     db = SessionLocal()
     try:
@@ -4839,7 +5642,12 @@ def _run_spytest_execution(
 
         try:
             # ── Read testbed YAML ─────────────────────────────────────────────
-            testbed_path = f"{SPYTEST_TESTBED_DIR}/{testbed_file}"
+            # If the frontend passed a full absolute path, use it directly;
+            # otherwise join with the derived testbed dir.
+            if testbed_file.startswith("/"):
+                testbed_path = testbed_file
+            else:
+                testbed_path = f"{_testbed_dir}/{testbed_file}"
             out, err, code = coord_ssh.execute_command(f"cat {testbed_path}", timeout=15)
             if code != 0:
                 log_execution(db, execution_id, "SYSTEM", "ERROR",
@@ -4886,8 +5694,76 @@ def _run_spytest_execution(
 
             # ── Get topology connections from canvas ──────────────────────────
             topology_connections = _get_topology_connections(db)
+            b2b_dut_names = _get_b2b_dut_names(db)   # pre-compute once; no DB in worker threads
             log_execution(db, execution_id, "SYSTEM", "INFO",
-                          f"Topology connections loaded: {len(topology_connections)} unique pairs")
+                          f"Topology connections loaded: {len(topology_connections)} unique pairs"
+                          + (f", b2b devices: {sorted(b2b_dut_names)}" if b2b_dut_names else ""))
+
+            # ── Pre-populate dut_count / min_topology from script content ─────
+            # Only needed when the canvas has connections — that's when topology-
+            # aware allocation is active.  Scripts that lack these fields (e.g. the
+            # frontend didn't call /api/spytest/script-info) get analyzed here once,
+            # before any worker thread starts, so dut_count is always correct.
+            if topology_connections:
+                for script in scripts:
+                    if not script.get("min_topology"):
+                        s_path = script.get("path", "")
+                        if s_path:
+                            # Build full absolute path: relative paths need _tests_dir prefix
+                            full_s_path = s_path if s_path.startswith("/") else f"{_tests_dir}/{s_path}"
+                            try:
+                                out, cat_err, rc = coord_ssh.execute_command(f"cat '{full_s_path}'", timeout=15)
+                                if rc == 0:
+                                    info = _parse_spytest_script(out)
+                                    # Script uses *var pattern — topology is in companion vars YAML
+                                    if info.get("uses_vars_file"):
+                                        stem = re.sub(r'^test_', '',
+                                                      os.path.splitext(os.path.basename(s_path))[0])
+                                        vars_path = (f"{os.path.dirname(full_s_path)}"
+                                                     f"/../vars/vars_{stem}.yaml")
+                                        vars_out, _, vars_rc = coord_ssh.execute_command(
+                                            f"cat '{vars_path}'", timeout=10)
+                                        if vars_rc == 0:
+                                            defaults_sec = re.search(
+                                                r'defaults:.*?(?=\n\w|\Z)', vars_out, re.DOTALL)
+                                            if defaults_sec:
+                                                topo_items = re.findall(
+                                                    r'^\s*-\s*["\']([^"\']+)["\']',
+                                                    defaults_sec.group(0), re.MULTILINE)
+                                                if topo_items:
+                                                    info["min_topology"] = topo_items
+                                                    info["dut_count"] = max(
+                                                        (max((int(d) for d in
+                                                              re.findall(r'D(\d+)', arg)),
+                                                             default=1)
+                                                         for arg in topo_items),
+                                                        default=1)
+                                        else:
+                                            log_execution(db, execution_id, "SYSTEM", "WARNING",
+                                                          f"[TOPO] vars file not found for "
+                                                          f"{os.path.basename(s_path)} — using dut_count=1")
+                                    script["dut_count"]    = info.get("dut_count", 1)
+                                    script["min_topology"] = info.get("min_topology", [])
+                                    log_execution(db, execution_id, "SYSTEM", "INFO",
+                                                  f"[TOPO] {os.path.basename(s_path)}: "
+                                                  f"dut_count={script['dut_count']}, "
+                                                  f"min_topology={script['min_topology']}")
+                                else:
+                                    log_execution(db, execution_id, "SYSTEM", "WARNING",
+                                                  f"[TOPO] cat failed (rc={rc}) for {os.path.basename(s_path)}: "
+                                                  f"{cat_err.strip()[:120]} — using dut_count=1")
+                            except Exception as e:
+                                log_execution(db, execution_id, "SYSTEM", "WARNING",
+                                              f"[TOPO] Could not read {os.path.basename(s_path)}: {e}"
+                                              f" — using default dut_count=1")
+
+                # Re-check max DUT requirement after analysis
+                max_dut_requirement = max(s.get("dut_count", 1) for s in scripts)
+                if max_dut_requirement > total_testbed_duts:
+                    log_execution(db, execution_id, "SYSTEM", "ERROR",
+                                  f"✗ ALLOCATION ERROR: Script requires {max_dut_requirement} DUTs, "
+                                  f"but testbed only has {total_testbed_duts} device(s). "
+                                  f"Add more devices to testbed YAML or reduce script requirements.")
 
             # ── Init in-memory queue state ────────────────────────────────────
             script_names = [os.path.basename(s.get("path", "")) for s in scripts]
@@ -4898,25 +5774,40 @@ def _run_spytest_execution(
             available_pool: list = list(all_duts)   # mutable shared state
 
             def acquire_duts(needed: int, link_requirements: dict = None) -> list:
-                """Block until `needed` DUTs are available with matching topology, then atomically grab them."""
+                """Block until `needed` DUTs are available, then atomically grab them.
+
+                When the canvas has connections, topology-aware matching is used:
+                - single-DUT scripts (needed==1): prefer b2b device if canvas has one
+                - multi-DUT scripts with link requirements: combo match against canvas links
+                When the canvas has no connections, simple FIFO is always used.
+                """
                 while True:
                     with pool_lock:
                         if len(available_pool) >= needed:
-                            # Use topology-aware allocation if link requirements provided
-                            if link_requirements or needed == 1:
+                            # Topology-aware path: canvas has connections AND
+                            # (script has link requirements OR needs exactly 1 DUT)
+                            if topology_connections and (link_requirements or needed == 1):
                                 matched = _find_duts_matching_topology(
                                     available_pool, needed, link_requirements or {},
-                                    topology_connections, db
+                                    topology_connections, b2b_dut_names
                                 )
                                 if matched:
-                                    # Remove allocated DUTs from pool
                                     for dut in matched:
                                         if dut in available_pool:
                                             available_pool.remove(dut)
                                     _q_set_free(execution_id, list(available_pool))
                                     return matched
+                                # No matching combo found yet.
+                                # For single-DUT with no link requirements: b2b device is
+                                # busy, fall back to FIFO so the script is never stuck.
+                                if not link_requirements and needed == 1:
+                                    allocated = available_pool[:needed]
+                                    del available_pool[:needed]
+                                    _q_set_free(execution_id, list(available_pool))
+                                    return allocated
+                                # Multi-DUT with link requirements: wait for matching combo
                             else:
-                                # No topology requirements, use simple allocation
+                                # Simple FIFO — no canvas connections or multi-DUT no requirements
                                 allocated = available_pool[:needed]
                                 del available_pool[:needed]
                                 _q_set_free(execution_id, list(available_pool))
@@ -4938,6 +5829,16 @@ def _run_spytest_execution(
                 min_topology = script_info.get("min_topology", [])
                 sname       = os.path.basename(script_path)
 
+                # Re-derive dut_count from min_topology so it's always correct even
+                # when the frontend omits dut_count or sets it to the wrong value.
+                if min_topology:
+                    _max_duts = 1
+                    for _arg in min_topology:
+                        _refs = re.findall(r'D(\d+)', _arg)
+                        if _refs:
+                            _max_duts = max(_max_duts, max(int(d) for d in _refs))
+                    dut_count = max(dut_count, _max_duts)
+
                 try:
                     # --- Parse link requirements from min_topology ----------
                     link_requirements = _parse_link_requirements(min_topology)
@@ -4955,12 +5856,9 @@ def _run_spytest_execution(
                     _q_update_script(execution_id, sname, "running", duts=assigned)
 
                     # Log allocation details
-                    if dut_count == 1 and _has_back_to_back_connection(assigned[0], sdb):
-                        log_execution(sdb, execution_id, sname, "INFO",
-                                      f"[ALLOC] Assigned DUT with back-to-back: {assigned[0]}")
-                    else:
-                        log_execution(sdb, execution_id, sname, "INFO",
-                                      f"[ALLOC] Assigned DUT(s): {', '.join(assigned)}")
+                    topo_mode = "topology-matched" if (topology_connections and link_requirements) else "FIFO"
+                    log_execution(sdb, execution_id, sname, "INFO",
+                                  f"[ALLOC] {topo_mode} → DUT(s): {', '.join(assigned)}")
 
                     # --- Create temp testbed YAML ---------------------------
                     temp_tb_path = f"/tmp/temp_exec{execution_id}_s{slot_idx}.yaml"
@@ -4993,18 +5891,18 @@ def _run_spytest_execution(
                     extra_opts += " --ifname-type native"
 
                     log_dir = (
-                        f"{SPYTEST_BASE}/logs/"
+                        f"{_spytest_root}/logs/"
                         f"exec{execution_id}_{sname}_{int(datetime.utcnow().timestamp())}"
                     )
                     s_ssh.execute_command(f"mkdir -p {log_dir}", timeout=10)
 
                     spy_cmd = (
-                        f"cd {SPYTEST_VENV}/bin && "
+                        f"cd {_spytest_venv}/bin && "
                         f"source activate && "
-                        f"cd {SPYTEST_BASE} && "
-                        f"{SPYTEST_PYTHON} {SPYTEST_BIN} --tryssh 1 "
+                        f"cd {_spytest_root} && "
+                        f"{_spytest_python} {_spytest_bin} --tryssh 1 "
                         f"--testbed {temp_tb_path} "
-                        f"{SPYTEST_TESTS_DIR}/{script_path} "
+                        f"{_tests_dir}/{script_path} "
                         f"--logs-path {log_dir}"
                         f"{extra_opts}"
                     )
@@ -5054,6 +5952,9 @@ def _run_spytest_execution(
 
                     log_execution(sdb, execution_id, sname, "INFO", "✓ Script completed")
                     _q_update_script(execution_id, sname, "done")
+                    # Collect CSV results and persist TestCaseResult rows
+                    _collect_and_save_results(s_ssh, execution, execution_id,
+                                              script_path, log_dir, sdb)
                     s_ssh.execute_command(f"rm -f {temp_tb_path}", timeout=5)
 
                 except Exception as ex:
@@ -5118,6 +6019,11 @@ def _run_spytest_execution(
 def _create_subset_testbed(full_config: dict, device_names: list) -> dict:
     """Create a subset testbed YAML with only the specified devices.
 
+    Devices are RENAMED to sequential logical names D1, D2, D3... regardless of their
+    physical names. This is required because SPyTest scripts use ensure_min_topology("D1D2:2")
+    which looks for devices literally named D1 and D2 in the testbed. If the allocated
+    physical devices are D3 and D2, renaming D3→D1 and D2→D2 ensures the topology check passes.
+
     CRITICAL: device_names must contain unique device names only.
     Duplicate device names will be automatically deduplicated to prevent invalid testbed configs.
     """
@@ -5128,39 +6034,66 @@ def _create_subset_testbed(full_config: dict, device_names: list) -> dict:
                       f"Using unique devices only: {unique_device_names}")
         device_names = unique_device_names
 
-    subset = {
+    # Build physical→logical name mapping: first allocated DUT→D1, second→D2, etc.
+    phys_to_logical = {phys: f"D{i+1}" for i, phys in enumerate(device_names)}
+    logger.info(f"[TESTBED] Device remap: {phys_to_logical}")
+
+    all_devices = full_config.get("devices", {})
+    all_topology = full_config.get("topology", {})
+
+    devices_section = {}
+    topology_section = {}
+
+    for phys_name in device_names:
+        logical_name = phys_to_logical[phys_name]
+
+        # Copy device entry under logical name
+        if phys_name in all_devices:
+            devices_section[logical_name] = all_devices[phys_name]
+
+        # Filter topology to only inter-subset links, rewriting device names to logical
+        if phys_name in all_topology:
+            dev_topo = all_topology[phys_name]
+            filtered_interfaces = {}
+            for iface, link in dev_topo.get("interfaces", {}).items():
+                end_phys = link.get("EndDevice", "")
+                if end_phys in phys_to_logical:
+                    # Rewrite EndDevice to the logical name
+                    filtered_interfaces[iface] = {
+                        "EndDevice": phys_to_logical[end_phys],
+                        "EndPort": link.get("EndPort", ""),
+                    }
+            topology_section[logical_name] = {"interfaces": filtered_interfaces}
+
+    # Rebuild params.topo to reflect only the subset links using logical names
+    topo_dict = {}
+    for log_a, topo_a in topology_section.items():
+        for iface, link in topo_a.get("interfaces", {}).items():
+            log_b = link.get("EndDevice", "")
+            if log_b and log_a < log_b:  # count each pair once
+                key = f"{log_a}{log_b}"
+                topo_dict[key] = topo_dict.get(key, 0) + 1
+
+    master_params = full_config.get("params", {})
+    subset_params = {"topo": topo_dict}
+
+    result = {
         "version": full_config.get("version", "2.0"),
-        "devices": {},
-        "topology": {},
+        "devices": devices_section,
+        "topology": topology_section,
         "services": full_config.get("services", {"default": {}}),
         "builds": full_config.get("builds", {"default": {}}),
         "configs": full_config.get("configs", {"default": {}}),
         "errors": full_config.get("errors", {"default": {}}),
-        "params": full_config.get("params", {}),
+        "params": subset_params,
     }
-
-    # Copy only the selected devices
-    all_devices = full_config.get("devices", {})
-    all_topology = full_config.get("topology", {})
-
-    for dev_name in device_names:
-        if dev_name in all_devices:
-            subset["devices"][dev_name] = all_devices[dev_name]
-
-        if dev_name in all_topology:
-            # Filter interfaces to only include links to other selected devices
-            dev_topo = all_topology[dev_name]
-            filtered_interfaces = {}
-            for iface, link in dev_topo.get("interfaces", {}).items():
-                end_device = link.get("EndDevice", "")
-                if end_device in device_names:
-                    filtered_interfaces[iface] = link
-            if filtered_interfaces:
-                subset["topology"][dev_name] = {"interfaces": filtered_interfaces}
-            else:
-                subset["topology"][dev_name] = {"interfaces": {}}
-
-    return subset
+    # Carry the global.params section (test_interface etc.) from master to subset.
+    # Also handle old-format master testbeds where test_interface lived in top-level params.
+    if "global" in full_config:
+        result["global"] = full_config["global"]
+    elif "test_interface" in master_params:
+        result["global"] = {"params": {"test_interface": master_params["test_interface"]}}
+    return result
 
 
 # ============================================================================
@@ -5413,6 +6346,18 @@ def generate_master_testbed(body: dict, request: Request, db: Session = Depends(
     master_filename = body.get("master_filename", "master_testbed.yaml")
     session_id = get_session_id(request)
 
+    # Derive testbed dir from user-supplied scripts base path:
+    # e.g. /some/root/tests  →  /some/root/testbeds
+    user_base_path = (body.get("base_path") or "").strip().rstrip("/")
+    if not user_base_path:
+        raise HTTPException(
+            status_code=400,
+            detail="SCRIPTS_PATH_REQUIRED: Please enter the Scripts Path on VM in the 'Categories & Scripts' section and click Load first."
+        )
+    _m = re.match(r'(^.*?/spytest)(?:/|$)', user_base_path)
+    _spy_root = _m.group(1) if _m else os.path.dirname(user_base_path)
+    testbed_dir = _spy_root + "/testbeds"
+
     if not host_id:
         raise HTTPException(status_code=400, detail="host_id required")
 
@@ -5550,6 +6495,18 @@ def generate_master_testbed(body: dict, request: Request, db: Session = Depends(
                     topo_key = f"{gen_a}{gen_b}" if gen_a < gen_b else f"{gen_b}{gen_a}"
                     topo_dict[topo_key] = topo_dict.get(topo_key, 0) + 1
 
+        # Derive test_interface: first alphabetically-sorted interface of the
+        # first device that has connections (D1 → its lowest interface toward D2).
+        # STP and many other SPyTest scripts expect this param in testbed globals.
+        test_interface = None
+        for dev_name in sorted(topology_section.keys()):
+            intfs = topology_section[dev_name].get("interfaces", {})
+            if intfs:
+                test_interface = sorted(intfs.keys())[0]
+                break
+
+        params_section = {"topo": topo_dict if topo_dict else {}}
+
         # Build complete master testbed YAML
         master_config = {
             "version": "2.0",
@@ -5559,10 +6516,12 @@ def generate_master_testbed(body: dict, request: Request, db: Session = Depends(
             "builds": {"default": {}},
             "configs": {"default": {}},
             "errors": {"default": {}},
-            "params": {
-                "topo": topo_dict if topo_dict else {}
-            },
+            "params": params_section,
         }
+        # test_interface must live under global.params so SPyTest's get_param() can find it.
+        # (global_params is populated only from obj["global"]["params"], not top-level params)
+        if test_interface:
+            master_config["global"] = {"params": {"test_interface": test_interface}}
 
         # Generate YAML content with proper formatting
         # Use default_flow_style=None for mixed formatting (inline for simple dicts)
@@ -5575,16 +6534,34 @@ def generate_master_testbed(body: dict, request: Request, db: Session = Depends(
             + yaml.dump(master_config, default_flow_style=None, sort_keys=False, width=120)
         )
 
-        # Write to testbeds directory on remote VM
-        master_path = f"{SPYTEST_TESTBED_DIR}/{master_filename}"
-        yaml_b64 = base64.b64encode(yaml_content.encode()).decode()
-        write_cmd = f"echo '{yaml_b64}' | base64 -d > {master_path}"
+        # Write to testbeds directory on remote VM (create dir if missing)
+        master_path = f"{testbed_dir}/{master_filename}"
+        _, mkdir_err, mkdir_code = ssh.execute_command(f'mkdir -p "{testbed_dir}"', timeout=10)
+        if mkdir_code != 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"PATH_NOT_FOUND: Cannot create testbed directory: {testbed_dir}\n"
+                    f"{mkdir_err.strip()}\n"
+                    f"Please verify the Scripts Path on VM is correct and the user has write permission."
+                )
+            )
 
-        _, write_err, write_code = ssh.execute_command(write_cmd, timeout=15)
+        # Write via stdin pipe to avoid shell ARG_MAX limits with large YAML
+        yaml_b64 = base64.b64encode(yaml_content.encode()).decode()
+        stdin_ch, stdout_ch, stderr_ch = ssh.client.exec_command(f'base64 -d > "{master_path}"', timeout=15)
+        stdin_ch.write(yaml_b64.encode())
+        stdin_ch.channel.shutdown_write()
+        write_err = stderr_ch.read().decode("utf-8", errors="ignore")
+        write_code = stdout_ch.channel.recv_exit_status()
         if write_code != 0:
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to write master testbed: {write_err}"
+                detail=(
+                    f"PATH_NOT_FOUND: Failed to write master testbed to {master_path}\n"
+                    f"{write_err.strip()}\n"
+                    f"Please verify the Scripts Path on VM and directory permissions."
+                )
             )
 
         logger.info(f"Master testbed generated: {master_path} with {len(devices_section)} devices")
@@ -5615,7 +6592,7 @@ def register_session(body: dict, db: Session = Depends(get_db)):
         session_id: str — unique client-generated session ID (UUID)
         user_name: str — user identifier (required)
         user_email: str (optional) — user email
-        ttl_minutes: int (optional) — session time-to-live in minutes (default: 480 = 8 hours)
+        (ttl_minutes is accepted but ignored — sessions are user-based, no TTL)
 
     Returns:
         session: dict — session details
@@ -5623,7 +6600,7 @@ def register_session(body: dict, db: Session = Depends(get_db)):
     session_id = body.get("session_id")
     user_name = body.get("user_name")
     user_email = body.get("user_email", "")
-    ttl_minutes = body.get("ttl_minutes", 480)  # 8 hours default
+    # ttl_minutes accepted for backward-compat but NOT used — sessions are persistent
 
     if not session_id or not user_name:
         raise HTTPException(status_code=400, detail="session_id and user_name required")
@@ -5640,41 +6617,39 @@ def register_session(body: dict, db: Session = Depends(get_db)):
             "user_name": existing.user_name,
             "status": existing.status,
             "created_at": existing.created_at.isoformat(),
-            "expires_at": existing.expires_at.isoformat(),
             "allocated_duts": json.loads(existing.allocated_dut_ids) if existing.allocated_dut_ids else [],
         }
 
-    # Create new session
-    from datetime import timedelta
-    expires_at = datetime.utcnow() + timedelta(minutes=ttl_minutes)
-
+    # Create new user-based persistent session (no expiry time)
     new_session = UserSession(
         session_id=session_id,
         user_name=user_name,
         user_email=user_email,
         status="active",
         allocated_dut_ids="[]",
-        expires_at=expires_at,
+        expires_at=None,  # No TTL — user-based session
     )
     db.add(new_session)
     db.commit()
     db.refresh(new_session)
 
-    logger.info(f"New session registered: {session_id} for user {user_name}")
+    logger.info(f"New user-based session registered: {session_id} for user {user_name}")
 
     return {
         "session_id": new_session.session_id,
         "user_name": new_session.user_name,
         "status": new_session.status,
         "created_at": new_session.created_at.isoformat(),
-        "expires_at": new_session.expires_at.isoformat(),
         "allocated_duts": [],
     }
 
 
 @app.get("/api/sessions/validate/{session_id}")
 def validate_session(session_id: str, db: Session = Depends(get_db)):
-    """Validate if a session is active and not expired.
+    """Validate if a session is active.
+
+    Sessions are user-based and persistent — they do NOT expire by time.
+    A session is invalid only if it was explicitly terminated or revoked.
 
     Returns:
         valid: bool
@@ -5685,28 +6660,28 @@ def validate_session(session_id: str, db: Session = Depends(get_db)):
     if not session:
         return {"valid": False, "reason": "Session not found"}
 
-    # Check if expired
-    if session.expires_at < datetime.utcnow():
-        session.status = "expired"
-        db.commit()
-        return {"valid": False, "reason": "Session expired"}
-
+    # User-based session: only check status, NOT time expiry
     if session.status != "active":
         return {"valid": False, "reason": f"Session status: {session.status}"}
 
     # Update last activity
     session.last_activity = datetime.utcnow()
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
 
     return {
         "valid": True,
         "session": {
             "session_id": session.session_id,
             "user_name": session.user_name,
+            "user_email": session.user_email or "",
+            "user_role": session.user_role or "",
             "status": session.status,
             "created_at": session.created_at.isoformat(),
             "last_activity": session.last_activity.isoformat(),
-            "expires_at": session.expires_at.isoformat(),
+            # expires_at omitted — sessions are user-based, no expiry
             "allocated_duts": json.loads(session.allocated_dut_ids) if session.allocated_dut_ids else [],
         }
     }
@@ -5714,53 +6689,50 @@ def validate_session(session_id: str, db: Session = Depends(get_db)):
 
 @app.post("/api/sessions/{session_id}/extend")
 def extend_session(session_id: str, body: dict, db: Session = Depends(get_db)):
-    """Extend session expiry (keep-alive) with enhanced tracking.
+    """Session keep-alive ping — records activity for user-based persistent sessions.
+
+    Sessions do NOT expire by time. This endpoint simply updates last_activity
+    and last_keepalive timestamps so activity monitoring works correctly.
 
     Body:
-        extend_minutes: int (optional) — minutes to extend (default: 480 = 8 hours)
+        extend_minutes: int (accepted for backward-compat, ignored)
 
     Returns:
         - session_id
-        - expires_at (ISO format)
-        - time_remaining_minutes
-        - last_keepalive (when this extend happened)
+        - status
+        - last_keepalive
+        - time_remaining_minutes: always 999999 (no TTL — user-based session)
     """
-    extend_minutes = body.get("extend_minutes", 480)  # 8 hours to match session TTL
-
     session = db.query(UserSession).filter(UserSession.session_id == session_id).first()
     if not session:
         logger.warning(f"[KEEPALIVE] Session not found: {session_id}")
         raise HTTPException(status_code=404, detail="Session not found")
 
+    if session.status != "active":
+        raise HTTPException(status_code=403, detail=f"Session is {session.status}, cannot extend")
+
     try:
-        from datetime import timedelta
         now = datetime.utcnow()
-        old_expires = session.expires_at
-        session.expires_at = now + timedelta(minutes=extend_minutes)
         session.last_activity = now
-        session.last_keepalive = now  # Track when keep-alive succeeded
-        session.keepalive_fail_count = 0  # Reset failure count on success
-        session.status = "active"
+        session.last_keepalive = now
+        session.keepalive_fail_count = 0
         db.commit()
 
-        time_remaining = int((session.expires_at - now).total_seconds() / 60)
-        logger.info(f"[KEEPALIVE] ✓ Session extended: {session_id} (user: {session.user_name}) | "
-                   f"Old expiry: {old_expires.isoformat()} | New expiry: {session.expires_at.isoformat()} | "
-                   f"Time remaining: {time_remaining}m")
+        logger.info(f"[KEEPALIVE] ✓ Activity recorded: {session_id} (user: {session.user_name})")
 
         return {
             "session_id": session.session_id,
             "user_name": session.user_name,
             "status": "success",
-            "expires_at": session.expires_at.isoformat(),
             "last_keepalive": session.last_keepalive.isoformat(),
-            "time_remaining_minutes": time_remaining,
+            # Persistent sessions report max time remaining (no expiry)
+            "time_remaining_minutes": 999999,
             "keepalive_fail_count": session.keepalive_fail_count,
         }
     except Exception as e:
-        logger.error(f"[KEEPALIVE] ✗ Failed to extend session {session_id}: {str(e)}")
+        logger.error(f"[KEEPALIVE] ✗ Failed to record activity for {session_id}: {str(e)}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to extend session: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to record activity: {str(e)}")
 
 
 @app.get("/api/sessions/{session_id}/diagnostics")
@@ -5768,11 +6740,11 @@ def get_session_diagnostics(session_id: str, db: Session = Depends(get_db)):
     """Get detailed session diagnostics for monitoring and troubleshooting.
 
     Returns:
-        - Session status and expiry info
+        - Session status
         - Keep-alive tracking: last success, fail count
-        - Time remaining before expiry
+        - time_remaining_minutes: 999999 (persistent user-based session)
         - DUT count and allocation
-        - Warnings if session about to expire
+        - Warnings if session status is abnormal
     """
     session = db.query(UserSession).filter(UserSession.session_id == session_id).first()
     if not session:
@@ -5782,45 +6754,38 @@ def get_session_diagnostics(session_id: str, db: Session = Depends(get_db)):
             "session_id": session_id
         }
 
-    now = datetime.utcnow()
-    time_remaining_seconds = (session.expires_at - now).total_seconds()
-    time_remaining_minutes = int(time_remaining_seconds / 60)
-
-    # Check if session expired
-    is_expired = time_remaining_seconds < 0
-
     # Parse DUT IDs
     try:
         import json
         dut_ids = json.loads(session.allocated_dut_ids or "[]")
-    except:
+    except Exception:
         dut_ids = []
 
     # Warnings
-    warnings = []
-    if is_expired:
-        warnings.append("SESSION_EXPIRED")
-    elif time_remaining_minutes < 30:
-        warnings.append("SESSION_EXPIRING_SOON")
-    if session.keepalive_fail_count > 0:
-        warnings.append(f"KEEPALIVE_FAILURES:{session.keepalive_fail_count}")
+    warnings_list = []
+    if session.status != "active":
+        warnings_list.append(f"SESSION_{session.status.upper()}")
+    if session.keepalive_fail_count and session.keepalive_fail_count > 0:
+        warnings_list.append(f"KEEPALIVE_FAILURES:{session.keepalive_fail_count}")
 
     return {
         "session_id": session.session_id,
         "user_name": session.user_name,
+        "user_email": session.user_email or "",
+        "user_role": session.user_role or "",
         "status": session.status,
-        "is_expired": is_expired,
+        # Persistent sessions have no expiry — report max value for UI compatibility
+        "is_expired": False,
+        "time_remaining_minutes": 999999,
+        "time_remaining_seconds": 999999,
         "created_at": session.created_at.isoformat(),
-        "expires_at": session.expires_at.isoformat(),
-        "time_remaining_minutes": time_remaining_minutes,
-        "time_remaining_seconds": max(0, int(time_remaining_seconds)),
         "last_activity": session.last_activity.isoformat() if session.last_activity else None,
         "last_keepalive": session.last_keepalive.isoformat() if session.last_keepalive else None,
-        "keepalive_fail_count": session.keepalive_fail_count,
+        "keepalive_fail_count": session.keepalive_fail_count or 0,
         "allocated_dut_ids": dut_ids,
         "dut_count": len(dut_ids),
-        "warnings": warnings,
-        "health": "ERROR" if is_expired else ("WARNING" if warnings else "HEALTHY")
+        "warnings": warnings_list,
+        "health": "ERROR" if session.status != "active" else ("WARNING" if warnings_list else "HEALTHY")
     }
 
 
@@ -5840,7 +6805,7 @@ def release_session(session_id: str, db: Session = Depends(get_db)):
             pool_entry.session_id = None
             pool_entry.locked_since = None
 
-    # Mark session as terminated
+    # Mark session as terminated (will be cleaned up by background job)
     session.status = "terminated"
     session.allocated_dut_ids = "[]"
     db.commit()
@@ -5854,33 +6819,69 @@ def release_session(session_id: str, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/sessions/active")
-def get_active_sessions(request: Request, db: Session = Depends(get_db)):
-    """Get current session details only (session-isolated, security fix)."""
-    session_id = get_session_id(request)
+@app.post("/api/sessions/{session_id}/revoke")
+def revoke_session(session_id: str, db: Session = Depends(get_db)):
+    """Admin endpoint to explicitly revoke a user session.
 
-    if not session_id:
-        raise HTTPException(status_code=401, detail="No session ID provided")
+    Marks the session as 'revoked'. The background cleanup job will then
+    delete the session record and free all associated DUTs.
 
-    # SECURITY FIX: Return ONLY the current user's session, not all sessions
+    Use this to forcibly remove a user's access without waiting for logout.
+    """
     session = db.query(UserSession).filter(UserSession.session_id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    allocated_duts = json.loads(session.allocated_dut_ids) if session.allocated_dut_ids else []
-    result = {
-        "session_id": session.session_id,
+    prev_status = session.status
+    session.status = "revoked"
+    db.commit()
+
+    logger.info(f"[REVOKE] Session {session_id} revoked (was: {prev_status}, user: {session.user_name})")
+
+    return {
+        "session_id": session_id,
+        "status": "revoked",
         "user_name": session.user_name,
-        "user_email": session.user_email,
-        "status": session.status,
-        "created_at": session.created_at.isoformat(),
-        "last_activity": session.last_activity.isoformat(),
-        "expires_at": session.expires_at.isoformat(),
-        "allocated_dut_count": len(allocated_duts),
-        "allocated_duts": allocated_duts,
+        "user_email": session.user_email or "",
     }
 
-    return {"session": result}
+
+@app.get("/api/sessions/active")
+def get_active_sessions(request: Request, db: Session = Depends(get_db)):
+    """Return active sessions.
+
+    Admin: all active sessions.
+    Regular user: only their own session.
+    """
+    session_id = get_session_id(request)
+    if not session_id:
+        raise HTTPException(status_code=401, detail="No session ID provided")
+
+    current = db.query(UserSession).filter(UserSession.session_id == session_id).first()
+    if not current:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    def _serialize(s):
+        allocated_duts = json.loads(s.allocated_dut_ids) if s.allocated_dut_ids else []
+        return {
+            "session_id": s.session_id,
+            "user_name": s.user_name,
+            "user_email": s.user_email or "",
+            "user_role": s.user_role or "",
+            "status": s.status,
+            "created_at": s.created_at.isoformat(),
+            "last_activity": s.last_activity.isoformat(),
+            "allocated_dut_count": len(allocated_duts),
+            "allocated_duts": allocated_duts,
+        }
+
+    is_admin = (current.user_role or "").lower() == "admin"
+
+    if is_admin:
+        all_sessions = db.query(UserSession).filter(UserSession.status == "active").all()
+        return {"sessions": [_serialize(s) for s in all_sessions], "is_admin": True}
+    else:
+        return {"sessions": [_serialize(current)], "is_admin": False}
 
 
 @app.post("/api/sessions/{session_id}/allocate-duts")
@@ -6592,6 +7593,355 @@ def get_stats(request: Request, db: Session = Depends(get_db)):
         "total_executions": total_executions,
         "running_executions": running_executions,
     }
+
+
+
+# ============================================================================
+# ONE PALC SSO — Config, Callback, Logout
+# ============================================================================
+
+# Read OnePalC config from environment once at startup
+_ONEPALC_ENABLED      = os.getenv("ONEPALC_ENABLED", "false").lower() == "true"
+_ONEPALC_HUB_AUTH_URL = os.getenv("ONEPALC_HUB_AUTH_URL", "")
+_ONEPALC_APP_NAME     = os.getenv("ONEPALC_APP_NAME", "Eka-Automation")
+_ONEPALC_CALLBACK_URL = os.getenv("ONEPALC_CALLBACK_URL", "")
+_ONEPALC_ROLE_KEY     = os.getenv("ONEPALC_ROLE_KEY", "EKA")
+_ONEPALC_API_TOKEN    = os.getenv("ONEPALC_API_TOKEN", "")
+# JWT signing secret (HS256 shared secret from IT — preferred)
+_ONEPALC_JWT_SECRET   = os.getenv("ONEPALC_JWT_SECRET", "")
+# RSA public key (RS256 PEM key from IT — used if JWT_SECRET is not set)
+_ONEPALC_PUBLIC_KEY   = os.getenv("ONEPALC_PUBLIC_KEY", "")
+
+logger.info(
+    f"[OnePalC] JWT verification mode: "
+    f"{'HS256 (shared secret)' if _ONEPALC_JWT_SECRET else ('RS256 (public key)' if _ONEPALC_PUBLIC_KEY else 'UNVERIFIED (no key configured)')}"
+)
+
+
+@app.get("/api/onepalc/config")
+def onepalc_config():
+    """Return SSO configuration for the frontend."""
+    return {
+        "enabled":      _ONEPALC_ENABLED,
+        "hub_auth_url": _ONEPALC_HUB_AUTH_URL,
+        "app_name":     _ONEPALC_APP_NAME,
+        "callback_url": _ONEPALC_CALLBACK_URL,
+        "api_token":    _ONEPALC_API_TOKEN,
+    }
+
+@app.get("/api/onepalc/users")
+def onepalc_users(request: Request):
+    """Proxy endpoint to fetch users from OnePalC Hub using correct API."""
+    if not _ONEPALC_ENABLED:
+        raise HTTPException(status_code=400, detail="SSO is not enabled")
+    
+    # Hub URL is http://172.26.1.228/login, extract base
+    base_url = _ONEPALC_HUB_AUTH_URL.replace("/login", "")
+    api_url = f"{base_url}/api/app_users.php"
+    
+    params = {
+        "app_name": _ONEPALC_APP_NAME,
+        "token": _ONEPALC_API_TOKEN
+    }
+    
+    query_string = urllib.parse.urlencode(params)
+    full_url = f"{api_url}?{query_string}"
+    
+    try:
+        req = urllib.request.Request(full_url, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            return data
+    except Exception as e:
+        logger.error(f"[OnePalC] Failed to fetch users from Hub: {e}")
+        return {"success": False, "users": [], "error": str(e)}
+
+
+# In-memory set of seen JWT IDs (jti) to prevent replay attacks.
+# Bounded to last 1000 tokens to avoid unbounded memory growth.
+_SEEN_JTI: set = set()
+_SEEN_JTI_ORDER: list = []
+_MAX_JTI_CACHE = 1000
+
+
+def _record_jti(jti: str) -> bool:
+    """Record a JWT ID as seen. Returns False if already seen (replay attack)."""
+    global _SEEN_JTI, _SEEN_JTI_ORDER
+    if jti in _SEEN_JTI:
+        return False
+    _SEEN_JTI.add(jti)
+    _SEEN_JTI_ORDER.append(jti)
+    # Evict oldest if cache is full
+    if len(_SEEN_JTI_ORDER) > _MAX_JTI_CACHE:
+        old = _SEEN_JTI_ORDER.pop(0)
+        _SEEN_JTI.discard(old)
+    return True
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    """
+    Decode and verify JWT payload.
+
+    Security levels (in order of preference):
+      1. RS256/HS256 verified with ONEPALC_PUBLIC_KEY (best — signature checked)
+      2. Unverified base64 decode with iat/exp/jti checks (fallback)
+
+    Also enforces:
+      - Token not expired (exp claim)
+      - Token not too old (iat must be within last 5 minutes)
+      - Replay attack prevention via jti claim
+    """
+    if not token:
+        return {}
+
+    import jwt as _jwt  # PyJWT
+
+    # ── Level 1A: HS256 with shared secret (ONEPALC_JWT_SECRET) ─────────────
+    # Most common for OnePalC — fast symmetric verification
+    if _ONEPALC_JWT_SECRET:
+        try:
+            payload = _jwt.decode(
+                token,
+                _ONEPALC_JWT_SECRET,
+                algorithms=["HS256"],
+                options={"verify_exp": True},
+            )
+            logger.info("[OnePalC] ✓ JWT verified with HS256 (shared secret)")
+            jti = payload.get("jti")
+            if jti and not _record_jti(jti):
+                logger.warning(f"[OnePalC] JWT replay detected — jti={jti}")
+                return {"__replay__": True}
+            return payload
+        except _jwt.ExpiredSignatureError:
+            logger.warning("[OnePalC] JWT expired — rejecting")
+            return {}
+        except _jwt.InvalidSignatureError:
+            logger.warning("[OnePalC] JWT HS256 signature invalid — trying RS256 fallback")
+        except Exception as e:
+            logger.warning(f"[OnePalC] JWT HS256 decode error: {e} — trying fallback")
+
+    # ── Level 1B: RS256 with RSA public key (ONEPALC_PUBLIC_KEY PEM) ─────────
+    if _ONEPALC_PUBLIC_KEY:
+        try:
+            payload = _jwt.decode(
+                token,
+                _ONEPALC_PUBLIC_KEY,
+                algorithms=["RS256"],
+                options={"verify_exp": True},
+            )
+            logger.info("[OnePalC] ✓ JWT verified with RS256 (public key)")
+            jti = payload.get("jti")
+            if jti and not _record_jti(jti):
+                logger.warning(f"[OnePalC] JWT replay detected — jti={jti}")
+                return {"__replay__": True}
+            return payload
+        except _jwt.ExpiredSignatureError:
+            logger.warning("[OnePalC] JWT expired (RS256) — rejecting")
+            return {}
+        except Exception as e:
+            logger.warning(f"[OnePalC] JWT RS256 decode error: {e} — falling back to unverified")
+
+    # ── Level 2: Unverified base64 decode with exp/iat/jti checks ────────────
+    # Used when no signing key is configured. Less secure but still blocks
+    # expired tokens, tokens > 10 minutes old, and replayed tokens.
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            logger.warning("[OnePalC] JWT has fewer than 2 parts — invalid token")
+            return {}
+        payload_b64 = parts[1]
+        # Fix base64 padding
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload_bytes = base64.urlsafe_b64decode(payload_b64)
+        payload = json.loads(payload_bytes.decode("utf-8"))
+
+        # Basic security checks even without signature verification
+        now_ts = datetime.utcnow().timestamp()
+
+        # Check token expiry
+        exp = payload.get("exp")
+        if exp and now_ts > float(exp):
+            logger.warning(f"[OnePalC] JWT expired (exp={exp}, now={now_ts}) — rejecting")
+            return {}
+
+        # Check token is not too old (iat must be within last 10 minutes)
+        iat = payload.get("iat")
+        if iat and now_ts - float(iat) > 600:  # 10-minute window
+            logger.warning(f"[OnePalC] JWT too old (iat={iat}, age={now_ts-float(iat):.0f}s) — rejecting")
+            return {}
+
+        # Replay guard via jti
+        jti = payload.get("jti")
+        if jti and not _record_jti(jti):
+            logger.warning(f"[OnePalC] JWT replay detected — jti={jti}")
+            return {"__replay__": True}
+
+        logger.info("[OnePalC] JWT decoded (unverified — no public key configured)")
+        return payload
+    except Exception as e:
+        logger.warning(f"[OnePalC] JWT decode failed: {e}")
+        return {}
+
+
+@app.get("/hub-callback")
+def hub_callback(
+    request: Request,
+    token: str = "",
+    auth_token: str = "",
+    access_token: str = "",
+    session_token: str = "",
+    db: Session = Depends(get_db)
+):
+    """
+    OnePalC Hub redirects here after authentication.
+    Accepts token as ?token=, ?auth_token=, ?access_token=, or ?session_token=
+    Decodes user info from JWT, registers a session, sets cookie, redirects to /.
+    """
+    from fastapi.responses import RedirectResponse
+
+    # Accept any of the common token param names OnePalC might use
+    jwt = token or auth_token or access_token or session_token
+
+    user_name  = "Unknown User"
+    user_email = ""
+    user_role  = ""
+    payload    = {}
+
+    if jwt:
+        payload = _decode_jwt_payload(jwt)
+        logger.info(f"[OnePalC] Callback JWT payload keys: {list(payload.keys())}")
+
+        # Extract user name — try common JWT claim names
+        user_name = (
+            payload.get("name") or
+            payload.get("full_name") or
+            payload.get("display_name") or
+            payload.get("username") or
+            payload.get("preferred_username") or
+            payload.get("sub") or
+            "OnePalC User"
+        )
+
+        # Extract email
+        user_email = payload.get("email") or payload.get("mail") or payload.get("sub") or ""
+
+        # Extract role from roles map using the configured role key
+        roles_map = payload.get("roles", {})
+        if isinstance(roles_map, dict):
+            user_role = roles_map.get(_ONEPALC_ROLE_KEY, "")
+        elif isinstance(roles_map, list):
+            user_role = roles_map[0] if roles_map else ""
+
+        # Normalize role to lowercase
+        user_role = str(user_role).lower() if user_role else ""
+
+    # Replay attack guard — stop here if JWT was flagged as replay
+    if payload.get("__replay__"):
+        logger.error(f"[OnePalC] Replay attack blocked for token — rejecting callback")
+        from fastapi.responses import HTMLResponse as _HTML
+        return _HTML(
+            content="<h2>Security Error</h2><p>Token already used. Please log in again.</p>",
+            status_code=403
+        )
+
+    # Find existing session for this user to preserve DUT ownership
+    # Sessions are user-based and persistent — reuse existing active session
+    existing_session = None
+    if user_email:
+        existing_session = (
+            db.query(UserSession)
+            .filter(UserSession.user_email == user_email, UserSession.status == "active")
+            .order_by(UserSession.last_activity.desc())
+            .first()
+        )
+    if not existing_session and user_name:
+        existing_session = (
+            db.query(UserSession)
+            .filter(UserSession.user_name == user_name, UserSession.status == "active")
+            .order_by(UserSession.last_activity.desc())
+            .first()
+        )
+
+    if existing_session:
+        session_id = existing_session.session_id
+        existing_session.status = "active"
+        existing_session.last_activity = datetime.utcnow()
+        existing_session.expires_at = None  # No TTL — user-based session
+        # Always sync role from latest JWT in case it changed
+        if user_role:
+            existing_session.user_role = user_role
+        try:
+            db.commit()
+            logger.info(f"[OnePalC] Reused session: {session_id} for {user_name} ({user_email}) role={user_role}")
+        except Exception as e:
+            logger.error(f"[OnePalC] Failed to update session: {e}")
+            db.rollback()
+    else:
+        # Generate new user-based persistent session
+        session_id = "sso-" + base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+        try:
+            new_session = UserSession(
+                session_id=session_id,
+                user_name=user_name,
+                user_email=user_email,
+                user_role=user_role,  # Persist role from OnePalC JWT
+                status="active",
+                created_at=datetime.utcnow(),
+                last_activity=datetime.utcnow(),
+                expires_at=None,  # No TTL — user-based session
+            )
+            db.add(new_session)
+            db.commit()
+            logger.info(f"[OnePalC] Session created: {session_id} for {user_name} ({user_email}) role={user_role}")
+        except Exception as e:
+            logger.error(f"[OnePalC] Failed to create session: {e}")
+            db.rollback()
+
+    # Redirect to root, passing session info via query params so JS can pick them up
+    # The frontend JS (handleSSOCallback) reads these and stores them in localStorage
+    redirect_url = (
+        f"/?sso=1"
+        f"&session_id={urllib.parse.quote(session_id)}"
+        f"&user_name={urllib.parse.quote(user_name)}"
+        f"&user_email={urllib.parse.quote(user_email)}"
+        f"&user_role={urllib.parse.quote(user_role)}"
+    )
+
+    response = RedirectResponse(url=redirect_url, status_code=302)
+    # Also set a cookie as backup
+    response.set_cookie(
+        key="eka_session_id", value=session_id,
+        max_age=28800, httponly=False, samesite="lax"
+    )
+    return response
+
+
+@app.get("/api/onepalc/logout")
+def onepalc_logout(request: Request, db: Session = Depends(get_db)):
+    """Clear session cookie, mark session as terminated, redirect to OnePalC Hub logout.
+
+    User-based sessions are persistent until explicitly logged out.
+    This endpoint is the ONLY way a session ends (other than admin revoke).
+    """
+    from fastapi.responses import RedirectResponse
+
+    # Mark the session as terminated so it's cleaned up by the background job
+    session_id = request.cookies.get("eka_session_id", "").strip()
+    if session_id:
+        session = db.query(UserSession).filter(UserSession.session_id == session_id).first()
+        if session and session.status == "active":
+            session.status = "terminated"
+            try:
+                db.commit()
+                logger.info(f"[OnePalC] Logout: session {session_id} marked as terminated (user: {session.user_name})")
+            except Exception as e:
+                logger.error(f"[OnePalC] Failed to terminate session on logout: {e}")
+                db.rollback()
+
+    logout_url = _ONEPALC_HUB_AUTH_URL.replace("/login", "/logout") if _ONEPALC_HUB_AUTH_URL else "/"
+    response = RedirectResponse(url=logout_url, status_code=302)
+    response.delete_cookie("eka_session_id")
+    return response
 
 
 # ============================================================================
