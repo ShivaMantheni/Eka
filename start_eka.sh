@@ -12,15 +12,20 @@ PID_FILE="$APP_DIR/eka.pid"
 LOG_FILE="$APP_DIR/uvicorn.log"
 PORT=8000
 
-# ── Locate uvicorn (venv → local → system) ───────────────────────────────────
+# ── Locate uvicorn (venv → ~/.local → system) ────────────────────────────────
+# Resolve the home dir of the user actually running this script
+_HOME="$(eval echo ~$(whoami))"
 if [ -f ".venv/bin/uvicorn" ]; then
     UVICORN=".venv/bin/uvicorn"
 elif [ -f "venv/bin/uvicorn" ]; then
     UVICORN="venv/bin/uvicorn"
+elif [ -f "$_HOME/.local/bin/uvicorn" ]; then
+    UVICORN="$_HOME/.local/bin/uvicorn"
 elif command -v uvicorn &>/dev/null; then
     UVICORN="$(command -v uvicorn)"
 else
     echo "❌ uvicorn not found. Install it: pip install uvicorn"
+    echo "   Searched: .venv/bin, venv/bin, $_HOME/.local/bin, PATH"
     exit 1
 fi
 
