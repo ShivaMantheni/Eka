@@ -261,11 +261,80 @@
                 <button class="btn outline small" onclick="renameActiveJob()" title="Rename this job" id="btn-rename-job">
                     <span class="material-icons-round" style="font-size:14px">edit</span>
                 </button>
+                <button class="btn outline small" onclick="openScheduleModal()" title="Schedule this job" id="btn-schedule-job">
+                    <span class="material-icons-round" style="font-size:14px">schedule</span> Schedule
+                </button>
+                <span id="job-next-run" style="font-size:11px;color:var(--text-secondary);white-space:nowrap;display:none"></span>
                 <button class="btn outline small" onclick="deleteActiveJob()" title="Delete this job" id="btn-delete-job"
                     style="color:var(--error,#ef4444);border-color:var(--error,#ef4444)">
                     <span class="material-icons-round" style="font-size:14px">delete</span>
                 </button>
                 <div id="conflict-banner" class="conflict-banner"></div>
+            </div>
+
+            <!-- Schedule Modal -->
+            <div id="schedule-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+                <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:12px;padding:24px;width:380px;max-width:95vw">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+                        <h3 style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px">
+                            <span class="material-icons-round" style="color:var(--primary)">schedule</span> Schedule Job
+                        </h3>
+                        <button onclick="closeScheduleModal()" style="background:none;border:none;cursor:pointer;color:var(--text-secondary)">
+                            <span class="material-icons-round">close</span>
+                        </button>
+                    </div>
+
+                    <!-- Type selector -->
+                    <div style="display:flex;gap:8px;margin-bottom:16px">
+                        <label style="flex:1;cursor:pointer">
+                            <input type="radio" name="sched-type" value="none" onchange="onSchedTypeChange()" style="margin-right:4px"> Off
+                        </label>
+                        <label style="flex:1;cursor:pointer">
+                            <input type="radio" name="sched-type" value="once" onchange="onSchedTypeChange()" style="margin-right:4px"> Once
+                        </label>
+                        <label style="flex:1;cursor:pointer">
+                            <input type="radio" name="sched-type" value="cron" onchange="onSchedTypeChange()" style="margin-right:4px"> Recurring
+                        </label>
+                    </div>
+
+                    <!-- Once: datetime picker -->
+                    <div id="sched-once-row" style="display:none;margin-bottom:14px">
+                        <label class="field-label">Run at (your local time)</label>
+                        <input type="datetime-local" id="sched-at-input"
+                            style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-tertiary);color:var(--text);font-size:13px">
+                    </div>
+
+                    <!-- Cron: quick presets + custom -->
+                    <div id="sched-cron-row" style="display:none;margin-bottom:14px">
+                        <label class="field-label">Recurring schedule</label>
+                        <select id="sched-cron-preset" onchange="onCronPresetChange()"
+                            style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-tertiary);color:var(--text);font-size:13px;margin-bottom:8px">
+                            <option value="daily">Daily at a time</option>
+                            <option value="hourly">Every hour</option>
+                            <option value="custom">Custom cron expression</option>
+                        </select>
+                        <div id="sched-daily-row" style="display:flex;gap:8px;align-items:center">
+                            <label style="font-size:12px;color:var(--text-secondary);white-space:nowrap">Every day at</label>
+                            <input type="time" id="sched-daily-time" value="09:00"
+                                style="padding:5px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-tertiary);color:var(--text);font-size:13px">
+                        </div>
+                        <div id="sched-custom-row" style="display:none">
+                            <input type="text" id="sched-cron-expr" placeholder="e.g. 0 9 * * 1-5  (weekdays 09:00)"
+                                style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-tertiary);color:var(--text);font-size:12px;font-family:monospace">
+                            <p style="font-size:11px;color:var(--text-secondary);margin:4px 0 0">Format: minute hour day month weekday</p>
+                        </div>
+                    </div>
+
+                    <!-- Last run / next run info -->
+                    <div id="sched-info" style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;min-height:18px"></div>
+
+                    <div style="display:flex;gap:8px;justify-content:flex-end">
+                        <button class="btn outline" onclick="closeScheduleModal()">Cancel</button>
+                        <button class="btn primary" onclick="saveSchedule()">
+                            <span class="material-icons-round" style="font-size:14px">save</span> Save Schedule
+                        </button>
+                    </div>
+                </div>
             </div>
 
             <!-- Row 1: VM Selection + Git (single row) -->

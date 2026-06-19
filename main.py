@@ -56,6 +56,8 @@ from telnet_pool import telnet_pool
 
 # APScheduler for background tasks (heartbeat checks, cleanup)
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 # Hardware Load imports
 from telnet_manager import TelnetConnectionManager
@@ -355,17 +357,23 @@ class AuditLog(Base):
 class ExecutionJob(Base):
     """Named job container linking DUT selection, topology, scripts, and executions."""
     __tablename__ = "execution_jobs"
-    id         = Column(Integer, primary_key=True, autoincrement=True)
-    name       = Column(String(100), nullable=False, default="Job")
-    status     = Column(String(20), default="idle")   # idle|running|completed|failed
-    session_id = Column(String(255), nullable=True, index=True)
-    dut_ids    = Column(Text, nullable=True)           # JSON array of DUT ids
-    base_path  = Column(Text, nullable=True)
-    host_id    = Column(Integer, nullable=True)
-    topology   = Column(Text, nullable=True)           # JSON canvas snapshot
-    scripts    = Column(Text, nullable=True)           # JSON array of script objects
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    name             = Column(String(100), nullable=False, default="Job")
+    status           = Column(String(20), default="idle")   # idle|running|completed|failed
+    session_id       = Column(String(255), nullable=True, index=True)
+    dut_ids          = Column(Text, nullable=True)           # JSON array of DUT ids
+    base_path        = Column(Text, nullable=True)
+    host_id          = Column(Integer, nullable=True)
+    topology         = Column(Text, nullable=True)           # JSON canvas snapshot
+    scripts          = Column(Text, nullable=True)           # JSON array of script objects
+    # Scheduler fields
+    schedule_type    = Column(String(10), default="none")    # none | once | cron
+    schedule_at      = Column(DateTime, nullable=True)       # UTC datetime for one-time run
+    schedule_cron    = Column(String(100), nullable=True)    # cron expression for recurring
+    schedule_enabled = Column(Boolean, default=False)
+    last_run_at      = Column(DateTime, nullable=True)       # last auto-triggered run
+    created_at       = Column(DateTime, default=datetime.utcnow)
+    updated_at       = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # Create tables (creates new tables; existing tables are not altered here)
 Base.metadata.create_all(bind=engine)
@@ -400,9 +408,212 @@ def _apply_column_migrations():
                 conn.execute(text(
                     "ALTER TABLE dut_locks ADD COLUMN IF NOT EXISTS lock_type VARCHAR(10) DEFAULT 'exec';"
                 ))
+            # Scheduler columns on execution_jobs
+            _sched_cols = [
+                ("schedule_type",    "VARCHAR(10) DEFAULT 'none'"),
+                ("schedule_at",      "TIMESTAMP"),
+                ("schedule_cron",    "VARCHAR(100)"),
+                ("schedule_enabled", "BOOLEAN DEFAULT FALSE"),
+                ("last_run_at",      "TIMESTAMP"),
+            ]
+            for col_name, col_def in _sched_cols:
+                if dialect == "sqlite":
+                    try:
+                        conn.execute(text(
+                            f"ALTER TABLE execution_jobs ADD COLUMN {col_name} {col_def};"
+                        ))
+                    except Exception:
+                        pass
+                else:
+                    conn.execute(text(
+                        f"ALTER TABLE execution_jobs ADD COLUMN IF NOT EXISTS {col_name} {col_def};"
+                    ))
             conn.commit()
         except Exception as _e:
             logger.warning(f"[Startup] Column migration warning (safe to ignore if columns exist): {_e}")
+
+
+# ============================================================================
+# JOB SCHEDULER — auto-trigger execution jobs at a set time / cron schedule
+# ============================================================================
+
+def _trigger_scheduled_job(execution_job_id: int):
+    """Called by APScheduler when a job's scheduled time arrives.
+
+    Reads the job's saved state (host, scripts, testbed path) from the DB,
+    generates a master testbed on the coordinator VM (SSH), and launches
+    _run_spytest_execution in a background thread — exactly like a manual Run.
+    """
+    db = SessionLocal()
+    try:
+        job = db.query(ExecutionJob).filter(ExecutionJob.id == execution_job_id).first()
+        if not job:
+            logger.warning(f"[Scheduler] Job {execution_job_id} not found — skipping")
+            return
+        if job.status == "running":
+            logger.info(f"[Scheduler] Job {execution_job_id} already running — skipping scheduled trigger")
+            return
+        if not job.schedule_enabled:
+            logger.info(f"[Scheduler] Job {execution_job_id} schedule disabled — skipping")
+            return
+
+        scripts  = json.loads(job.scripts)  if job.scripts  else []
+        host_id  = job.host_id
+        base_path = job.base_path or ""
+
+        if not host_id or not scripts:
+            logger.warning(f"[Scheduler] Job {execution_job_id} missing host or scripts — skipping")
+            return
+
+        host_dut = db.query(DUT).filter(DUT.id == host_id).first()
+        if not host_dut:
+            logger.warning(f"[Scheduler] Job {execution_job_id} host DUT {host_id} not found — skipping")
+            return
+
+        # Generate master testbed via SSH (reuse existing helper logic inline)
+        from threading import Thread as _Thread
+        coord = SSHConnectionManager(host_dut.ip_address, host_dut.port,
+                                     host_dut.username, host_dut.password)
+        testbed_file = "master_testbed.yaml"
+        if base_path and coord.connect():
+            try:
+                # Minimal testbed: derive testbeds dir and write a placeholder
+                bp = base_path.rstrip("/")
+                m = re.match(r'(^.*?/spytest)(?:/|$)', bp)
+                spytest_root = m.group(1) if m else os.path.dirname(bp)
+                tb_dir = spytest_root + "/testbeds"
+                coord.execute_command(f"mkdir -p '{tb_dir}'", timeout=10)
+                # Reuse the generate-testbed endpoint logic by calling it as a function
+                topology = json.loads(job.topology) if job.topology else []
+                dut_ids  = json.loads(job.dut_ids)  if job.dut_ids  else []
+                # Build minimal testbed YAML inline
+                devices_section = {}
+                for did in dut_ids:
+                    d = db.query(DUT).filter(DUT.id == int(did)).first()
+                    if d:
+                        devices_section[d.name] = {
+                            "ip": d.ip_address, "username": d.username,
+                            "password": d.password, "port": d.port,
+                        }
+                tb_yaml = yaml.dump({"devices": devices_section, "params": {}, "topology": {}})
+                tb_path = f"{tb_dir}/master_testbed.yaml"
+                coord.execute_command(
+                    f"cat > '{tb_path}' << 'EOFYAML'\n{tb_yaml}\nEOFYAML", timeout=15
+                )
+                testbed_file = tb_path
+            except Exception as _e:
+                logger.warning(f"[Scheduler] Could not generate testbed for job {execution_job_id}: {_e}")
+            finally:
+                coord.disconnect()
+
+        # Create Execution record
+        exec_name = f"scheduled_{execution_job_id}_{int(datetime.utcnow().timestamp())}"
+        execution = Execution(
+            name=exec_name,
+            dut_ids=json.dumps([host_id]),
+            execution_type="spytest",
+            status="pending",
+            job_id=execution_job_id,
+        )
+        db.add(execution)
+
+        # Update job state
+        job.status   = "running"
+        job.last_run_at = datetime.utcnow()
+        # Disable once-type schedules after firing
+        if job.schedule_type == "once":
+            job.schedule_enabled = False
+        db.commit()
+        db.refresh(execution)
+
+        script_names = [os.path.basename(s.get("path", "")) for s in scripts]
+        _q_init(execution.id, script_names, [])
+        _init_pending_scripts(execution.id)
+
+        available_dut_count = len(json.loads(job.dut_ids) if job.dut_ids else [1])
+
+        _Thread(
+            target=_run_spytest_execution,
+            args=(execution.id, host_id, scripts, testbed_file, {}, available_dut_count, base_path, execution_job_id),
+            daemon=True,
+        ).start()
+
+        logger.info(f"[Scheduler] Job {execution_job_id} '{job.name}' triggered — execution {execution.id}")
+
+    except Exception as e:
+        logger.error(f"[Scheduler] Error triggering job {execution_job_id}: {e}")
+    finally:
+        db.close()
+
+
+def _register_job_schedule(job: "ExecutionJob"):
+    """Add or replace an APScheduler entry for this ExecutionJob."""
+    ap_id = f"exec_job_{job.id}"
+    # Always remove old entry first
+    try:
+        scheduler.remove_job(ap_id)
+    except Exception:
+        pass
+
+    if not job.schedule_enabled:
+        return
+
+    try:
+        if job.schedule_type == "once" and job.schedule_at:
+            if job.schedule_at <= datetime.utcnow():
+                logger.warning(f"[Scheduler] Job {job.id} schedule_at is in the past — not scheduling")
+                return
+            scheduler.add_job(
+                _trigger_scheduled_job,
+                trigger=DateTrigger(run_date=job.schedule_at),
+                args=[job.id],
+                id=ap_id,
+                replace_existing=True,
+            )
+            logger.info(f"[Scheduler] Job {job.id} '{job.name}' scheduled once at {job.schedule_at} UTC")
+
+        elif job.schedule_type == "cron" and job.schedule_cron:
+            # Parse simple "HH:MM" or full cron "min hr dom mon dow"
+            cron_str = job.schedule_cron.strip()
+            if re.match(r'^\d{1,2}:\d{2}$', cron_str):
+                # Daily shorthand "HH:MM"
+                hh, mm = cron_str.split(":")
+                trigger = CronTrigger(hour=int(hh), minute=int(mm))
+            else:
+                parts = cron_str.split()
+                if len(parts) == 5:
+                    trigger = CronTrigger(
+                        minute=parts[0], hour=parts[1],
+                        day=parts[2], month=parts[3], day_of_week=parts[4]
+                    )
+                else:
+                    logger.warning(f"[Scheduler] Job {job.id} invalid cron '{cron_str}'")
+                    return
+            scheduler.add_job(
+                _trigger_scheduled_job,
+                trigger=trigger,
+                args=[job.id],
+                id=ap_id,
+                replace_existing=True,
+            )
+            logger.info(f"[Scheduler] Job {job.id} '{job.name}' scheduled cron '{cron_str}'")
+    except Exception as e:
+        logger.error(f"[Scheduler] Failed to register job {job.id}: {e}")
+
+
+def _reload_all_job_schedules():
+    """On startup, re-register APScheduler entries for all enabled jobs."""
+    db = SessionLocal()
+    try:
+        jobs = db.query(ExecutionJob).filter(ExecutionJob.schedule_enabled == True).all()
+        for j in jobs:
+            _register_job_schedule(j)
+        if jobs:
+            logger.info(f"[Scheduler] Reloaded {len(jobs)} job schedule(s) from DB")
+    except Exception as e:
+        logger.error(f"[Scheduler] Failed to reload schedules: {e}")
+    finally:
+        db.close()
 
 
 # ============================================================================
@@ -1218,6 +1429,7 @@ def startup_migrations():
     """Apply safe column migrations (idempotent — runs on every restart)."""
     _apply_column_migrations()
     logger.info("[Startup] Column migrations applied")
+    _reload_all_job_schedules()
 
 
 @app.on_event("startup")
@@ -6282,6 +6494,11 @@ def get_execution_job(job_id: int, request: Request, db: Session = Depends(get_d
         "topology": json.loads(job.topology) if job.topology else [],
         "scripts": json.loads(job.scripts) if job.scripts else [],
         "executions": execs_data,
+        "schedule_type":    job.schedule_type or "none",
+        "schedule_at":      job.schedule_at.isoformat() if job.schedule_at else None,
+        "schedule_cron":    job.schedule_cron,
+        "schedule_enabled": bool(job.schedule_enabled),
+        "last_run_at":      job.last_run_at.isoformat() if job.last_run_at else None,
         "created_at": job.created_at.isoformat() if job.created_at else None,
     }
 
@@ -6403,6 +6620,112 @@ def job_excel_report(job_id: int, request: Request, db: Session = Depends(get_db
     filename = f"{job.name.replace(' ', '_')}_report.xlsx"
     return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                              headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+# ============================================================================
+# API — Execution Job Scheduler
+# ============================================================================
+
+@app.put("/api/execution-jobs/{job_id}/schedule")
+def set_job_schedule(job_id: int, request: Request, body: dict,
+                     db: Session = Depends(get_db)):
+    """Set or update the schedule for an execution job.
+
+    Body:
+        schedule_type: "none" | "once" | "cron"
+        schedule_at:   ISO datetime string (UTC) — required for type "once"
+        schedule_cron: "HH:MM" (daily) or full cron "min hr dom mon dow" — required for type "cron"
+        enabled:       bool — enable/disable without clearing the schedule
+    """
+    session_id = request.headers.get("X-Session-ID", "default")
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    stype   = body.get("schedule_type", job.schedule_type or "none")
+    enabled = body.get("enabled", True)
+
+    if stype == "none":
+        job.schedule_type    = "none"
+        job.schedule_enabled = False
+        job.schedule_at      = None
+        job.schedule_cron    = None
+    elif stype == "once":
+        sat = body.get("schedule_at")
+        if not sat:
+            raise HTTPException(status_code=400, detail="schedule_at required for type 'once'")
+        try:
+            job.schedule_at = datetime.fromisoformat(sat.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid schedule_at: {sat}")
+        job.schedule_type    = "once"
+        job.schedule_cron    = None
+        job.schedule_enabled = bool(enabled)
+    elif stype == "cron":
+        cron_expr = body.get("schedule_cron", "").strip()
+        if not cron_expr:
+            raise HTTPException(status_code=400, detail="schedule_cron required for type 'cron'")
+        job.schedule_type    = "cron"
+        job.schedule_cron    = cron_expr
+        job.schedule_at      = None
+        job.schedule_enabled = bool(enabled)
+    else:
+        raise HTTPException(status_code=400, detail="schedule_type must be none | once | cron")
+
+    job.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(job)
+
+    # Re-register in APScheduler
+    _register_job_schedule(job)
+
+    next_run = None
+    ap_id = f"exec_job_{job.id}"
+    try:
+        ap_job = scheduler.get_job(ap_id)
+        if ap_job and ap_job.next_run_time:
+            next_run = ap_job.next_run_time.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+
+    return {
+        "id": job.id,
+        "schedule_type": job.schedule_type,
+        "schedule_at": job.schedule_at.isoformat() if job.schedule_at else None,
+        "schedule_cron": job.schedule_cron,
+        "schedule_enabled": job.schedule_enabled,
+        "next_run": next_run,
+    }
+
+
+@app.get("/api/execution-jobs/{job_id}/schedule")
+def get_job_schedule(job_id: int, request: Request, db: Session = Depends(get_db)):
+    """Return current schedule settings for a job."""
+    session_id = request.headers.get("X-Session-ID", "default")
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    next_run = None
+    ap_id = f"exec_job_{job.id}"
+    try:
+        ap_job = scheduler.get_job(ap_id)
+        if ap_job and ap_job.next_run_time:
+            next_run = ap_job.next_run_time.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+
+    return {
+        "id": job.id,
+        "schedule_type": job.schedule_type or "none",
+        "schedule_at": job.schedule_at.isoformat() if job.schedule_at else None,
+        "schedule_cron": job.schedule_cron,
+        "schedule_enabled": bool(job.schedule_enabled),
+        "last_run_at": job.last_run_at.isoformat() if job.last_run_at else None,
+        "next_run": next_run,
+    }
 
 
 # ============================================================================

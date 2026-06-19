@@ -1462,6 +1462,7 @@ async function switchJob(newId) {
         updateDUTMultiSelectText();
         updateScriptMultiSelectText();
         renderJobDropdown();
+        _renderNextRunLabel(data);
         toast(`Switched to ${data.name}`, 'info', 2000);
     } catch (e) {
         toast('Failed to switch job: ' + e.message, 'error');
@@ -1574,6 +1575,137 @@ function _updateJobStatusBadge(status) {
     if (job) job.status = status;
     renderJobDropdown();
 }
+
+// ── Job Scheduler UI ─────────────────────────────────────────────────────────
+
+async function openScheduleModal() {
+    if (!activeJobId) return;
+    const modal = document.getElementById('schedule-modal');
+    if (!modal) return;
+    modal.style.display = 'flex';
+
+    // Load current schedule from server
+    try {
+        const res = await fetch(`${API}/api/execution-jobs/${activeJobId}/schedule`,
+            { headers: getSessionHeaders() });
+        const data = res.ok ? await res.json() : {};
+
+        // Set radio
+        const radios = document.querySelectorAll('input[name="sched-type"]');
+        radios.forEach(r => { r.checked = r.value === (data.schedule_type || 'none'); });
+        onSchedTypeChange();
+
+        // Populate once field
+        if (data.schedule_at) {
+            // Convert UTC ISO to local datetime-local string
+            const d = new Date(data.schedule_at + 'Z');
+            const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000)
+                .toISOString().slice(0, 16);
+            document.getElementById('sched-at-input').value = local;
+        }
+
+        // Populate cron fields
+        if (data.schedule_cron) {
+            const expr = data.schedule_cron;
+            if (/^\d{1,2}:\d{2}$/.test(expr)) {
+                document.getElementById('sched-cron-preset').value = 'daily';
+                document.getElementById('sched-daily-time').value = expr;
+            } else if (expr === '0 * * * *' || expr === '*/60') {
+                document.getElementById('sched-cron-preset').value = 'hourly';
+            } else {
+                document.getElementById('sched-cron-preset').value = 'custom';
+                document.getElementById('sched-cron-expr').value = expr;
+            }
+            onCronPresetChange();
+        }
+
+        // Info line
+        const info = document.getElementById('sched-info');
+        const parts = [];
+        if (data.last_run_at) parts.push(`Last run: ${new Date(data.last_run_at+'Z').toLocaleString()}`);
+        if (data.next_run)    parts.push(`Next run: ${data.next_run}`);
+        if (info) info.textContent = parts.join('  ·  ');
+    } catch (_) {}
+}
+
+function closeScheduleModal() {
+    const modal = document.getElementById('schedule-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+function onSchedTypeChange() {
+    const type = document.querySelector('input[name="sched-type"]:checked')?.value || 'none';
+    document.getElementById('sched-once-row').style.display = type === 'once' ? '' : 'none';
+    document.getElementById('sched-cron-row').style.display = type === 'cron' ? '' : 'none';
+}
+
+function onCronPresetChange() {
+    const preset = document.getElementById('sched-cron-preset')?.value;
+    document.getElementById('sched-daily-row').style.display  = preset === 'daily'  ? '' : 'none';
+    document.getElementById('sched-custom-row').style.display = preset === 'custom' ? '' : 'none';
+}
+
+async function saveSchedule() {
+    if (!activeJobId) return;
+    const type = document.querySelector('input[name="sched-type"]:checked')?.value || 'none';
+    const body = { schedule_type: type, enabled: true };
+
+    if (type === 'once') {
+        const val = document.getElementById('sched-at-input').value;
+        if (!val) { toast('Please pick a date and time', 'error'); return; }
+        // Convert local datetime-local to UTC ISO
+        body.schedule_at = new Date(val).toISOString();
+    } else if (type === 'cron') {
+        const preset = document.getElementById('sched-cron-preset').value;
+        if (preset === 'daily') {
+            body.schedule_cron = document.getElementById('sched-daily-time').value; // "HH:MM"
+        } else if (preset === 'hourly') {
+            body.schedule_cron = '0 * * * *';
+        } else {
+            body.schedule_cron = document.getElementById('sched-cron-expr').value.trim();
+            if (!body.schedule_cron) { toast('Please enter a cron expression', 'error'); return; }
+        }
+    } else {
+        body.enabled = false;
+    }
+
+    try {
+        const res = await fetch(`${API}/api/execution-jobs/${activeJobId}/schedule`, {
+            method: 'PUT',
+            headers: getSessionHeaders(),
+            body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            const d = await res.json();
+            toast(d.detail || 'Failed to save schedule', 'error');
+            return;
+        }
+        const data = await res.json();
+        closeScheduleModal();
+        _renderNextRunLabel(data);
+        const typeLabels = { none: 'disabled', once: `once at ${data.schedule_at?.slice(0,16).replace('T',' ')} UTC`, cron: data.schedule_cron };
+        toast(`Schedule saved — ${typeLabels[data.schedule_type] || type}`, 'success');
+    } catch (e) {
+        toast('Save failed: ' + e.message, 'error');
+    }
+}
+
+function _renderNextRunLabel(data) {
+    const el = document.getElementById('job-next-run');
+    if (!el) return;
+    if (data && data.next_run && data.schedule_enabled) {
+        el.textContent = `⏰ ${data.next_run}`;
+        el.style.display = '';
+    } else {
+        el.style.display = 'none';
+    }
+}
+
+// Close modal on backdrop click
+document.addEventListener('click', e => {
+    const modal = document.getElementById('schedule-modal');
+    if (modal && e.target === modal) closeScheduleModal();
+});
 
 function updateDUTMultiSelectText() {
     const textEl = document.querySelector('#dut-multi-select .multi-select-text');
