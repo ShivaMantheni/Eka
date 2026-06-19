@@ -6223,11 +6223,11 @@ def release_dut_lock(dut_id: int, db: Session = Depends(get_db)):
 # ============================================================================
 
 @app.post("/api/execution-jobs")
-def create_execution_job(body: dict, db: Session = Depends(get_db),
-                         current: UserSession = Depends(require_session)):
+def create_execution_job(request: Request, body: dict, db: Session = Depends(get_db)):
     """Create a new named execution job for the current session."""
+    session_id = request.headers.get("X-Session-ID", "default")
     name = body.get("name") or f"Job-{datetime.utcnow().strftime('%H%M')}"
-    job = ExecutionJob(name=name, session_id=current.session_id)
+    job = ExecutionJob(name=name, session_id=session_id)
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -6235,11 +6235,11 @@ def create_execution_job(body: dict, db: Session = Depends(get_db),
 
 
 @app.get("/api/execution-jobs")
-def list_execution_jobs(db: Session = Depends(get_db),
-                        current: UserSession = Depends(require_session)):
+def list_execution_jobs(request: Request, db: Session = Depends(get_db)):
     """List all execution jobs for the current session (most recent first)."""
+    session_id = request.headers.get("X-Session-ID", "default")
     jobs = (db.query(ExecutionJob)
-            .filter(ExecutionJob.session_id == current.session_id)
+            .filter(ExecutionJob.session_id == session_id)
             .order_by(ExecutionJob.created_at.desc())
             .limit(50)
             .all())
@@ -6258,11 +6258,11 @@ def list_execution_jobs(db: Session = Depends(get_db),
 
 
 @app.get("/api/execution-jobs/{job_id}")
-def get_execution_job(job_id: int, db: Session = Depends(get_db),
-                      current: UserSession = Depends(require_session)):
+def get_execution_job(job_id: int, request: Request, db: Session = Depends(get_db)):
     """Get full state of a specific job."""
+    session_id = request.headers.get("X-Session-ID", "default")
     job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
-                                        ExecutionJob.session_id == current.session_id).first()
+                                        ExecutionJob.session_id == session_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     executions = (db.query(Execution).filter(Execution.job_id == job_id)
@@ -6287,11 +6287,11 @@ def get_execution_job(job_id: int, db: Session = Depends(get_db),
 
 
 @app.put("/api/execution-jobs/{job_id}")
-def update_execution_job(job_id: int, body: dict, db: Session = Depends(get_db),
-                         current: UserSession = Depends(require_session)):
+def update_execution_job(job_id: int, request: Request, body: dict, db: Session = Depends(get_db)):
     """Save/update job state (devices, topology, scripts, base_path)."""
+    session_id = request.headers.get("X-Session-ID", "default")
     job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
-                                        ExecutionJob.session_id == current.session_id).first()
+                                        ExecutionJob.session_id == session_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if "name" in body:
@@ -6314,16 +6314,15 @@ def update_execution_job(job_id: int, body: dict, db: Session = Depends(get_db),
 
 
 @app.delete("/api/execution-jobs/{job_id}")
-def delete_execution_job(job_id: int, db: Session = Depends(get_db),
-                         current: UserSession = Depends(require_session)):
+def delete_execution_job(job_id: int, request: Request, db: Session = Depends(get_db)):
     """Delete a job (only if not currently running)."""
+    session_id = request.headers.get("X-Session-ID", "default")
     job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
-                                        ExecutionJob.session_id == current.session_id).first()
+                                        ExecutionJob.session_id == session_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status == "running":
         raise HTTPException(status_code=400, detail="Cannot delete a running job")
-    # Detach executions (set job_id=None) rather than deleting them
     db.query(Execution).filter(Execution.job_id == job_id).update({"job_id": None})
     db.delete(job)
     db.commit()
@@ -6331,9 +6330,8 @@ def delete_execution_job(job_id: int, db: Session = Depends(get_db),
 
 
 @app.get("/api/execution-jobs/{job_id}/conflicts")
-def check_job_conflicts(job_id: int, dut_ids: str = "",
-                        db: Session = Depends(get_db),
-                        current: UserSession = Depends(require_session)):
+def check_job_conflicts(job_id: int, request: Request, dut_ids: str = "",
+                        db: Session = Depends(get_db)):
     """Check if any requested DUT ids are locked by a DIFFERENT active job.
 
     Query param: dut_ids — comma-separated list of DUT ids.
@@ -6364,17 +6362,16 @@ def check_job_conflicts(job_id: int, dut_ids: str = "",
 
 
 @app.get("/api/execution-jobs/{job_id}/report/html")
-def job_html_report(job_id: int, db: Session = Depends(get_db),
-                    current: UserSession = Depends(require_session)):
+def job_html_report(job_id: int, request: Request, db: Session = Depends(get_db)):
     """Generate aggregated HTML report for all executions in this job."""
+    session_id = request.headers.get("X-Session-ID", "default")
     job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
-                                        ExecutionJob.session_id == current.session_id).first()
+                                        ExecutionJob.session_id == session_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     executions = db.query(Execution).filter(Execution.job_id == job_id).all()
     if not executions:
         raise HTTPException(status_code=404, detail="No executions found for this job")
-    # Aggregate all testcase results from all executions in this job
     all_tcrs = []
     for ex in executions:
         tcrs = db.query(TestCaseResult).filter(TestCaseResult.execution_id == ex.id).all()
@@ -6386,13 +6383,13 @@ def job_html_report(job_id: int, db: Session = Depends(get_db),
 
 
 @app.get("/api/execution-jobs/{job_id}/report/excel")
-def job_excel_report(job_id: int, db: Session = Depends(get_db),
-                     current: UserSession = Depends(require_session)):
+def job_excel_report(job_id: int, request: Request, db: Session = Depends(get_db)):
     """Generate aggregated Excel report for all executions in this job."""
     if not _HAS_OPENPYXL:
         raise HTTPException(status_code=503, detail="openpyxl not installed")
+    session_id = request.headers.get("X-Session-ID", "default")
     job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
-                                        ExecutionJob.session_id == current.session_id).first()
+                                        ExecutionJob.session_id == session_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     executions = db.query(Execution).filter(Execution.job_id == job_id).all()
