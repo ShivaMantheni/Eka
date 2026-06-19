@@ -1457,7 +1457,7 @@ async function switchJob(newId) {
             selectedScriptPaths = new Set();
         }
         // Re-render everything
-        renderDUTCheckboxes(dutsData);
+        renderDUTChecklist();
         renderTopologyCanvas();
         updateDUTMultiSelectText();
         updateScriptMultiSelectText();
