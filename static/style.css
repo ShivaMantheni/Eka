@@ -3164,3 +3164,53 @@ input::placeholder {
         min-width: 100%;
     }
 }
+
+/* ── Execution Jobs — Job Header Bar ───────────────────────────────────────── */
+.job-header-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: var(--surface2, var(--bg-secondary));
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+}
+.job-select {
+    flex: 1;
+    max-width: 240px;
+    min-width: 120px;
+    padding: 5px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text);
+    font-size: 13px;
+}
+.job-status-badge {
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+.job-status-badge.idle      { background: rgba(100,116,139,0.15); color: #64748b; }
+.job-status-badge.running   { background: rgba(59,130,246,0.15);  color: #3b82f6; }
+.job-status-badge.completed { background: rgba(34,197,94,0.15);   color: #22c55e; }
+.job-status-badge.failed    { background: rgba(239,68,68,0.15);   color: #ef4444; }
+.conflict-banner {
+    display: none;
+    padding: 5px 10px;
+    background: rgba(245,158,11,0.12);
+    border: 1px solid rgba(245,158,11,0.4);
+    border-radius: 6px;
+    color: #d97706;
+    font-size: 12px;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+}
+.conflict-banner.visible { display: flex; }

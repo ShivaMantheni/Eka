@@ -721,6 +721,14 @@ function switchTab(tab) {
         renderTopologyCanvas();
         loadTopologyConnectionsFromServer();
         loadDUTLockStatus();
+        loadJobs().then(() => {
+            if (activeJobList.length === 0) {
+                // Auto-create Job-1 on first open
+                createJob();
+            } else if (!activeJobId) {
+                switchJob(activeJobList[0].id);
+            }
+        });
     }
     if (tab === 'devices') loadDUTs();
     if (tab === 'logs') loadExecutions();
@@ -1241,9 +1249,12 @@ function toggleDUTCheck(id, cb) {
     const numId = Number(id);
     if (cb.checked) {
         selectedDUTIds.add(numId);
+            checkDUTConflicts([numId]);
+            saveJobState();
     } else {
         selectedDUTIds.delete(numId);
         delete dutPositions[numId];
+            saveJobState();
     }
     const label = cb.closest('.dut-selector-item');
     if (label) label.classList.toggle('selected', cb.checked);
@@ -1322,6 +1333,12 @@ function updateSpyStartBtn() {
 let selectedDUTIds = new Set();
 let scriptsData = [];
 
+// ── Execution Job state ───────────────────────────────────────────────────
+let activeJobId   = null;   // currently-active job id
+let activeJobList = [];     // [{id, name, status, execution_count}]
+let _jobSaveTimer = null;   // debounce handle for auto-save
+
+
 function renderSpyVMs() {
     const sel = document.getElementById('spy-vm-select');
     if (!sel) return;
@@ -1347,6 +1364,216 @@ function renderSpyVMs() {
     updateSpyStartBtn();
 }
 
+
+// ── Execution Job Management ────────────────────────────────────────────────
+
+async function loadJobs() {
+    try {
+        const res = await fetch(`${API}/api/execution-jobs`, { headers: getSessionHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        activeJobList = data.jobs || [];
+        renderJobDropdown();
+    } catch (_) {}
+}
+
+function renderJobDropdown() {
+    const sel = document.getElementById('job-select');
+    const badge = document.getElementById('job-status-badge');
+    if (!sel) return;
+    sel.innerHTML = '';
+    if (activeJobList.length === 0) {
+        sel.innerHTML = '<option value="">-- No Jobs --</option>';
+    } else {
+        activeJobList.forEach(j => {
+            const opt = document.createElement('option');
+            opt.value = j.id;
+            opt.textContent = `${j.name} (${j.status})`;
+            if (j.id === activeJobId) opt.selected = true;
+            sel.appendChild(opt);
+        });
+    }
+    const activeJob = activeJobList.find(j => j.id === activeJobId);
+    if (badge && activeJob) {
+        badge.textContent = activeJob.status;
+        badge.className = `job-status-badge ${activeJob.status}`;
+    }
+    const btnDelete = document.getElementById('btn-delete-job');
+    const btnRename = document.getElementById('btn-rename-job');
+    if (btnDelete) btnDelete.disabled = !activeJobId || (activeJob && activeJob.status === 'running');
+    if (btnRename) btnRename.disabled = !activeJobId;
+}
+
+async function createJob() {
+    const name = `Job-${activeJobList.length + 1}`;
+    try {
+        const res = await fetch(`${API}/api/execution-jobs`, {
+            method: 'POST',
+            headers: getSessionHeaders(),
+            body: JSON.stringify({ name }),
+        });
+        if (!res.ok) { toast('Failed to create job', 'error'); return; }
+        const data = await res.json();
+        activeJobList.unshift({ id: data.id, name: data.name, status: data.status, execution_count: 0 });
+        await switchJob(data.id);
+    } catch (e) {
+        toast('Failed to create job: ' + e.message, 'error');
+    }
+}
+
+async function switchJob(newId) {
+    if (!newId) return;
+    // Save current job state first
+    if (activeJobId && activeJobId !== newId) {
+        await saveJobState(true); // immediate save
+    }
+    // Load new job state from server
+    try {
+        const res = await fetch(`${API}/api/execution-jobs/${newId}`, { headers: getSessionHeaders() });
+        if (!res.ok) { toast('Failed to load job', 'error'); return; }
+        const data = await res.json();
+        activeJobId = newId;
+        // Restore DUT selection
+        selectedDUTIds = new Set((data.dut_ids || []).map(Number));
+        // Restore base path
+        activeBasePath = data.base_path || '';
+        const pathInput = document.getElementById('scripts-base-path');
+        if (pathInput) pathInput.value = activeBasePath;
+        // Restore host VM
+        if (data.host_id) {
+            const vmSel = document.getElementById('spy-vm-select');
+            if (vmSel) vmSel.value = data.host_id;
+        }
+        // Restore topology connections
+        if (data.topology && data.topology.length > 0) {
+            dutConnections = data.topology;
+        } else {
+            dutConnections = [];
+        }
+        // Restore script selection
+        if (data.scripts && data.scripts.length > 0) {
+            selectedScriptPaths = new Set(data.scripts.map(s => s.path || s));
+        } else {
+            selectedScriptPaths = new Set();
+        }
+        // Re-render everything
+        renderDUTCheckboxes(dutsData);
+        renderTopologyCanvas();
+        updateDUTMultiSelectText();
+        updateScriptMultiSelectText();
+        renderJobDropdown();
+        toast(`Switched to ${data.name}`, 'info', 2000);
+    } catch (e) {
+        toast('Failed to switch job: ' + e.message, 'error');
+    }
+}
+
+async function saveJobState(immediate) {
+    if (!activeJobId) return;
+    if (!immediate) {
+        clearTimeout(_jobSaveTimer);
+        _jobSaveTimer = setTimeout(() => saveJobState(true), 500);
+        return;
+    }
+    try {
+        const vmSel = document.getElementById('spy-vm-select');
+        const hostId = vmSel ? parseInt(vmSel.value) || null : null;
+        await fetch(`${API}/api/execution-jobs/${activeJobId}`, {
+            method: 'PUT',
+            headers: getSessionHeaders(),
+            body: JSON.stringify({
+                dut_ids:   Array.from(selectedDUTIds).map(Number),
+                base_path: activeBasePath || '',
+                host_id:   hostId,
+                topology:  dutConnections || [],
+                scripts:   Array.from(selectedScriptPaths).map(p => ({ path: p })),
+            }),
+        });
+    } catch (_) {}
+}
+
+async function renameActiveJob() {
+    if (!activeJobId) return;
+    const job = activeJobList.find(j => j.id === activeJobId);
+    const newName = prompt('Job name:', job ? job.name : '');
+    if (!newName || !newName.trim()) return;
+    try {
+        await fetch(`${API}/api/execution-jobs/${activeJobId}`, {
+            method: 'PUT',
+            headers: getSessionHeaders(),
+            body: JSON.stringify({ name: newName.trim() }),
+        });
+        if (job) job.name = newName.trim();
+        renderJobDropdown();
+    } catch (e) {
+        toast('Rename failed: ' + e.message, 'error');
+    }
+}
+
+async function deleteActiveJob() {
+    if (!activeJobId) return;
+    const job = activeJobList.find(j => j.id === activeJobId);
+    if (!confirm(`Delete "${job ? job.name : 'this job'}"? This cannot be undone.`)) return;
+    try {
+        const res = await fetch(`${API}/api/execution-jobs/${activeJobId}`, {
+            method: 'DELETE',
+            headers: getSessionHeaders(),
+        });
+        if (!res.ok) {
+            const d = await res.json();
+            toast(d.detail || 'Delete failed', 'error');
+            return;
+        }
+        activeJobList = activeJobList.filter(j => j.id !== activeJobId);
+        activeJobId = null;
+        if (activeJobList.length > 0) {
+            await switchJob(activeJobList[0].id);
+        } else {
+            renderJobDropdown();
+        }
+        toast('Job deleted', 'success');
+    } catch (e) {
+        toast('Delete failed: ' + e.message, 'error');
+    }
+}
+
+async function checkDUTConflicts(dutIds) {
+    if (!activeJobId || !dutIds || dutIds.length === 0) return;
+    try {
+        const res = await fetch(
+            `${API}/api/execution-jobs/${activeJobId}/conflicts?dut_ids=${dutIds.join(',')}`,
+            { headers: getSessionHeaders() }
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        const banner = document.getElementById('conflict-banner');
+        if (!banner) return;
+        if (data.conflicts && data.conflicts.length > 0) {
+            const msgs = data.conflicts.map(c =>
+                `<strong>${esc(c.dut_name)}</strong> is used by ${esc(c.conflicting_job_name)}`
+            );
+            banner.innerHTML = `<span class="material-icons-round" style="font-size:14px">warning</span> ${msgs.join(', ')} &nbsp;<span style="cursor:pointer;opacity:0.6" onclick="this.parentElement.classList.remove('visible')">✕</span>`;
+            banner.classList.add('visible');
+        } else {
+            banner.classList.remove('visible');
+        }
+    } catch (_) {}
+}
+
+function downloadJobReport(type) {
+    if (!activeJobId) return;
+    window.open(`${API}/api/execution-jobs/${activeJobId}/report/${type}`);
+}
+
+function _updateJobStatusBadge(status) {
+    const badge = document.getElementById('job-status-badge');
+    if (!badge) return;
+    badge.textContent = status;
+    badge.className = `job-status-badge ${status}`;
+    const job = activeJobList.find(j => j.id === activeJobId);
+    if (job) job.status = status;
+    renderJobDropdown();
+}
 
 function updateDUTMultiSelectText() {
     const textEl = document.querySelector('#dut-multi-select .multi-select-text');
@@ -1442,6 +1669,7 @@ function loadScriptsFromPath() {
     const vmId = document.getElementById('spy-vm-select').value;
     if (!vmId) { toast('Please select a VM first', 'warning'); return; }
     activeBasePath = raw;
+    saveJobState();
     navigateToPath('');
 }
 
@@ -1942,6 +2170,7 @@ async function startExecution() {
             // Enhancement 3: Pass DUT reservation flag
             reserve_duts: reserveDuts,
             base_path: activeBasePath || '',
+            job_id: activeJobId || null,
         };
     }
 
@@ -1954,6 +2183,7 @@ async function startExecution() {
         if (!res.ok) throw new Error((await res.json()).detail);
         const data = await res.json();
         currentExecId = data.execution_id;
+        _updateJobStatusBadge('running');
         allLogs = [];
         logStreams = {};
         renderLogs();
@@ -2030,6 +2260,11 @@ function connectWS(execId) {
             const btnXls = document.getElementById('btn-dl-excel');
             if (btnHtml) btnHtml.disabled = false;
             if (btnXls) btnXls.disabled = false;
+            const jobHtmlBtn = document.getElementById('btn-job-html');
+            const jobExcelBtn = document.getElementById('btn-job-excel');
+            if (activeJobId && jobHtmlBtn) jobHtmlBtn.style.display = '';
+            if (activeJobId && jobExcelBtn) jobExcelBtn.style.display = '';
+            _updateJobStatusBadge('completed');
 
             allLogs = [];
             logStreams = {};

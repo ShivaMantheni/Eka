@@ -247,6 +247,27 @@
         <!-- ============ EXECUTE TAB ============ -->
         <section id="tab-execute" class="tab-content">
 
+            <!-- Job Header Bar -->
+            <div class="job-header-bar" id="job-header-bar">
+                <span class="material-icons-round" style="font-size:18px;color:var(--primary)">work</span>
+                <label style="font-size:13px;font-weight:600;color:var(--text-secondary);white-space:nowrap">Job:</label>
+                <select id="job-select" class="job-select" onchange="switchJob(parseInt(this.value))" title="Switch between jobs">
+                    <option value="">-- No Jobs --</option>
+                </select>
+                <span id="job-status-badge" class="job-status-badge idle">idle</span>
+                <button class="btn primary small" onclick="createJob()" title="Create a new job">
+                    <span class="material-icons-round" style="font-size:14px">add</span> New Job
+                </button>
+                <button class="btn outline small" onclick="renameActiveJob()" title="Rename this job" id="btn-rename-job">
+                    <span class="material-icons-round" style="font-size:14px">edit</span>
+                </button>
+                <button class="btn outline small" onclick="deleteActiveJob()" title="Delete this job" id="btn-delete-job"
+                    style="color:var(--error,#ef4444);border-color:var(--error,#ef4444)">
+                    <span class="material-icons-round" style="font-size:14px">delete</span>
+                </button>
+                <div id="conflict-banner" class="conflict-banner"></div>
+            </div>
+
             <!-- Row 1: VM Selection + Git (single row) -->
             <div class="card glass">
                 <div class="card-header">
@@ -612,6 +633,16 @@
                         <button class="btn outline small" onclick="downloadLogs()" id="btn-download-logs"
                             style="display:none">
                             <span class="material-icons-round">download</span> Download
+                        </button>
+                        <button id="btn-job-html" onclick="downloadJobReport('html')"
+                            style="display:none"
+                            class="btn outline small" title="Download HTML report for this entire job">
+                            <span class="material-icons-round" style="font-size:14px">summarize</span> Job HTML
+                        </button>
+                        <button id="btn-job-excel" onclick="downloadJobReport('excel')"
+                            style="display:none"
+                            class="btn outline small" title="Download Excel report for this entire job">
+                            <span class="material-icons-round" style="font-size:14px">table_chart</span> Job Excel
                         </button>
                     </div>
                 </div>

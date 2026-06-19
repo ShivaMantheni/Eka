@@ -212,6 +212,7 @@ class Execution(Base):
     end_time = Column(DateTime, nullable=True)
     duration_seconds = Column(Integer, nullable=True)
     test_results = Column(Text, nullable=True)   # JSON list of per-script aggregates
+    job_id       = Column(Integer, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -246,7 +247,8 @@ class DUTLock(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     dut_id = Column(Integer, nullable=False, unique=True)
     status = Column(String(20), default="AVAILABLE")   # AVAILABLE | ALLOCATED | IN_USE
-    job_id = Column(Integer, nullable=True)
+    job_id     = Column(Integer, nullable=True)
+    lock_type  = Column(String(10), default="exec")   # 'hw' or 'exec'
     locked_since = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -349,8 +351,59 @@ class AuditLog(Base):
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
 
-# Create tables
+
+class ExecutionJob(Base):
+    """Named job container linking DUT selection, topology, scripts, and executions."""
+    __tablename__ = "execution_jobs"
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    name       = Column(String(100), nullable=False, default="Job")
+    status     = Column(String(20), default="idle")   # idle|running|completed|failed
+    session_id = Column(String(255), nullable=True, index=True)
+    dut_ids    = Column(Text, nullable=True)           # JSON array of DUT ids
+    base_path  = Column(Text, nullable=True)
+    host_id    = Column(Integer, nullable=True)
+    topology   = Column(Text, nullable=True)           # JSON canvas snapshot
+    scripts    = Column(Text, nullable=True)           # JSON array of script objects
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+# Create tables (creates new tables; existing tables are not altered here)
 Base.metadata.create_all(bind=engine)
+
+
+def _apply_column_migrations():
+    """Safely add new columns to existing tables without dropping data.
+
+    This runs on every startup and is idempotent — it uses IF NOT EXISTS /
+    try-except so it is safe to run against a DB that already has the columns.
+    """
+    with engine.connect() as conn:
+        dialect = conn.dialect.name
+        try:
+            if dialect == "sqlite":
+                try:
+                    conn.execute(text("ALTER TABLE executions ADD COLUMN job_id INTEGER;"))
+                except Exception:
+                    pass
+                try:
+                    conn.execute(text("ALTER TABLE dut_locks ADD COLUMN lock_type VARCHAR(10) DEFAULT 'exec';"))
+                except Exception:
+                    pass
+            else:
+                conn.execute(text(
+                    "ALTER TABLE executions ADD COLUMN IF NOT EXISTS job_id INTEGER "
+                    "REFERENCES execution_jobs(id) ON DELETE SET NULL;"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_executions_job_id ON executions (job_id);"
+                ))
+                conn.execute(text(
+                    "ALTER TABLE dut_locks ADD COLUMN IF NOT EXISTS lock_type VARCHAR(10) DEFAULT 'exec';"
+                ))
+            conn.commit()
+        except Exception as _e:
+            logger.warning(f"[Startup] Column migration warning (safe to ignore if columns exist): {_e}")
+
 
 # ============================================================================
 # LOGGING
@@ -1158,6 +1211,13 @@ def _another_server_running(port: int = 8000) -> bool:
     with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         return s.connect_ex(('127.0.0.1', port)) == 0
+
+
+@app.on_event("startup")
+def startup_migrations():
+    """Apply safe column migrations (idempotent — runs on every restart)."""
+    _apply_column_migrations()
+    logger.info("[Startup] Column migrations applied")
 
 
 @app.on_event("startup")
@@ -4813,12 +4873,14 @@ def start_spytest_execution(body: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Host device not found")
 
     # Create master execution record
+    job_id = body.get("job_id")
     exec_name = f"spytest_{int(datetime.utcnow().timestamp())}"
     execution = Execution(
         name=exec_name,
         dut_ids=json.dumps([host_id]),
         execution_type="spytest",
         status="pending",
+        job_id=int(job_id) if job_id else None,
     )
     db.add(execution)
     db.commit()
@@ -4835,9 +4897,16 @@ def start_spytest_execution(body: dict, db: Session = Depends(get_db)):
     user_base_path = (body.get("base_path") or "").strip().rstrip("/")
 
     # Start background execution thread
+    # Mark job as running when execution starts
+    if job_id:
+        _job = db.query(ExecutionJob).filter(ExecutionJob.id == int(job_id)).first()
+        if _job:
+            _job.status = "running"
+            db.commit()
+
     thread = Thread(
         target=_run_spytest_execution,
-        args=(execution.id, host_id, scripts, testbed_file, options, available_dut_count, user_base_path),
+        args=(execution.id, host_id, scripts, testbed_file, options, available_dut_count, user_base_path, int(job_id) if job_id else None),
         daemon=True,
     )
     thread.start()
@@ -5577,6 +5646,7 @@ def _run_spytest_execution(
     options: dict,
     available_dut_count: int = 1,
     base_path: str = "",
+    job_id: int = None,
 ):
     """Background thread: Smart SPyTest execution with true parallel DUT allocation.
 
@@ -5993,6 +6063,12 @@ def _run_spytest_execution(
             db.commit()
             log_execution(db, execution_id, "SYSTEM", "INFO",
                           f"✓ All scripts finished ({execution.duration_seconds}s)")
+            # Update parent job status
+            if job_id:
+                _job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id).first()
+                if _job and _job.status == "running":
+                    _job.status = "completed"
+                    db.commit()
             _q_cleanup(execution_id)
             # Enhancement 2: Clean up pending scripts structure
             _cleanup_pending_scripts(execution_id)
@@ -6140,6 +6216,196 @@ def release_dut_lock(dut_id: int, db: Session = Depends(get_db)):
     lock.locked_since = None
     db.commit()
     return {"status": "released", "dut_id": dut_id}
+
+
+# ============================================================================
+# API — Execution Jobs (named job containers for the Execute tab)
+# ============================================================================
+
+@app.post("/api/execution-jobs")
+def create_execution_job(body: dict, db: Session = Depends(get_db),
+                         current: UserSession = Depends(require_session)):
+    """Create a new named execution job for the current session."""
+    name = body.get("name") or f"Job-{datetime.utcnow().strftime('%H%M')}"
+    job = ExecutionJob(name=name, session_id=current.session_id)
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return {"id": job.id, "name": job.name, "status": job.status, "created_at": job.created_at.isoformat() if job.created_at else None}
+
+
+@app.get("/api/execution-jobs")
+def list_execution_jobs(db: Session = Depends(get_db),
+                        current: UserSession = Depends(require_session)):
+    """List all execution jobs for the current session (most recent first)."""
+    jobs = (db.query(ExecutionJob)
+            .filter(ExecutionJob.session_id == current.session_id)
+            .order_by(ExecutionJob.created_at.desc())
+            .limit(50)
+            .all())
+    result = []
+    for j in jobs:
+        exec_count = db.query(Execution).filter(Execution.job_id == j.id).count()
+        result.append({
+            "id": j.id,
+            "name": j.name,
+            "status": j.status,
+            "execution_count": exec_count,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "updated_at": j.updated_at.isoformat() if j.updated_at else None,
+        })
+    return {"jobs": result}
+
+
+@app.get("/api/execution-jobs/{job_id}")
+def get_execution_job(job_id: int, db: Session = Depends(get_db),
+                      current: UserSession = Depends(require_session)):
+    """Get full state of a specific job."""
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == current.session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    executions = (db.query(Execution).filter(Execution.job_id == job_id)
+                  .order_by(Execution.created_at.desc()).all())
+    execs_data = [{
+        "id": e.id, "name": e.name, "status": e.status,
+        "start_time": e.start_time.isoformat() if e.start_time else None,
+        "end_time": e.end_time.isoformat() if e.end_time else None,
+    } for e in executions]
+    return {
+        "id": job.id,
+        "name": job.name,
+        "status": job.status,
+        "dut_ids": json.loads(job.dut_ids) if job.dut_ids else [],
+        "base_path": job.base_path or "",
+        "host_id": job.host_id,
+        "topology": json.loads(job.topology) if job.topology else [],
+        "scripts": json.loads(job.scripts) if job.scripts else [],
+        "executions": execs_data,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+    }
+
+
+@app.put("/api/execution-jobs/{job_id}")
+def update_execution_job(job_id: int, body: dict, db: Session = Depends(get_db),
+                         current: UserSession = Depends(require_session)):
+    """Save/update job state (devices, topology, scripts, base_path)."""
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == current.session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if "name" in body:
+        job.name = body["name"]
+    if "dut_ids" in body:
+        job.dut_ids = json.dumps(body["dut_ids"])
+    if "base_path" in body:
+        job.base_path = body["base_path"]
+    if "host_id" in body:
+        job.host_id = body["host_id"]
+    if "topology" in body:
+        job.topology = json.dumps(body["topology"])
+    if "scripts" in body:
+        job.scripts = json.dumps(body["scripts"])
+    if "status" in body and body["status"] in ("idle", "running", "completed", "failed"):
+        job.status = body["status"]
+    job.updated_at = datetime.utcnow()
+    db.commit()
+    return {"id": job.id, "status": job.status}
+
+
+@app.delete("/api/execution-jobs/{job_id}")
+def delete_execution_job(job_id: int, db: Session = Depends(get_db),
+                         current: UserSession = Depends(require_session)):
+    """Delete a job (only if not currently running)."""
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == current.session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status == "running":
+        raise HTTPException(status_code=400, detail="Cannot delete a running job")
+    # Detach executions (set job_id=None) rather than deleting them
+    db.query(Execution).filter(Execution.job_id == job_id).update({"job_id": None})
+    db.delete(job)
+    db.commit()
+    return {"deleted": job_id}
+
+
+@app.get("/api/execution-jobs/{job_id}/conflicts")
+def check_job_conflicts(job_id: int, dut_ids: str = "",
+                        db: Session = Depends(get_db),
+                        current: UserSession = Depends(require_session)):
+    """Check if any requested DUT ids are locked by a DIFFERENT active job.
+
+    Query param: dut_ids — comma-separated list of DUT ids.
+    Returns: [{dut_id, dut_name, conflicting_job_id, conflicting_job_name}]
+    """
+    if not dut_ids.strip():
+        return {"conflicts": []}
+    requested = [int(x) for x in dut_ids.split(",") if x.strip().isdigit()]
+    conflicts = []
+    for did in requested:
+        lock = db.query(DUTLock).filter(
+            DUTLock.dut_id == did,
+            DUTLock.status != "AVAILABLE",
+            DUTLock.lock_type == "exec",
+            DUTLock.job_id != job_id,
+            DUTLock.job_id != None,
+        ).first()
+        if lock:
+            owner_job = db.query(ExecutionJob).filter(ExecutionJob.id == lock.job_id).first()
+            dut = db.query(DUT).filter(DUT.id == did).first()
+            conflicts.append({
+                "dut_id":               did,
+                "dut_name":             dut.name if dut else str(did),
+                "conflicting_job_id":   lock.job_id,
+                "conflicting_job_name": owner_job.name if owner_job else f"Job {lock.job_id}",
+            })
+    return {"conflicts": conflicts}
+
+
+@app.get("/api/execution-jobs/{job_id}/report/html")
+def job_html_report(job_id: int, db: Session = Depends(get_db),
+                    current: UserSession = Depends(require_session)):
+    """Generate aggregated HTML report for all executions in this job."""
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == current.session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    executions = db.query(Execution).filter(Execution.job_id == job_id).all()
+    if not executions:
+        raise HTTPException(status_code=404, detail="No executions found for this job")
+    # Aggregate all testcase results from all executions in this job
+    all_tcrs = []
+    for ex in executions:
+        tcrs = db.query(TestCaseResult).filter(TestCaseResult.execution_id == ex.id).all()
+        all_tcrs.extend(tcrs)
+    buf = _build_html_dashboard(executions[0], all_tcrs)
+    filename = f"{job.name.replace(' ', '_')}_report.html"
+    return StreamingResponse(iter([buf]), media_type="text/html",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.get("/api/execution-jobs/{job_id}/report/excel")
+def job_excel_report(job_id: int, db: Session = Depends(get_db),
+                     current: UserSession = Depends(require_session)):
+    """Generate aggregated Excel report for all executions in this job."""
+    if not _HAS_OPENPYXL:
+        raise HTTPException(status_code=503, detail="openpyxl not installed")
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == current.session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    executions = db.query(Execution).filter(Execution.job_id == job_id).all()
+    if not executions:
+        raise HTTPException(status_code=404, detail="No executions found for this job")
+    all_tcrs = []
+    for ex in executions:
+        tcrs = db.query(TestCaseResult).filter(TestCaseResult.execution_id == ex.id).all()
+        all_tcrs.extend(tcrs)
+    buf = _build_excel(executions[0], all_tcrs)
+    filename = f"{job.name.replace(' ', '_')}_report.xlsx"
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 # ============================================================================
