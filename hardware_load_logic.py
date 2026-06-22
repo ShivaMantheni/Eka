@@ -831,3 +831,11 @@ async def execute_hardware_load(
         if telnet_mgr:
             telnet_pool.close_connection(dut.id)
             append_job_log(db, job, "Telnet connection closed and removed from pool", passwords_to_redact)
+
+        # Release the DB session that was created by the caller (main.py:2520).
+        # Without this the SQLAlchemy connection pool leaks one slot per hardware
+        # load job, eventually exhausting the pool and slowing all DB operations.
+        try:
+            db.close()
+        except Exception:
+            pass

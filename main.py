@@ -1527,6 +1527,18 @@ def startup_cleanup():
             db.commit()
             logger.info(f"Cleaned up {len(stuck_executions)} stuck executions")
 
+        # ── Clear orphaned in-memory state from previous run ──────────────────
+        # On restart these dicts are always empty (fresh process), but clearing
+        # them explicitly guards any edge case where startup_cleanup() is called
+        # while threads are still winding down, and ensures PTY sessions that
+        # weren't cleaned up on abnormal WebSocket disconnect are removed.
+        _exec_queue_state.clear()
+        with _pending_scripts_lock:
+            _pending_scripts.clear()
+        with _pty_sessions_lock:
+            _pty_sessions.clear()
+        logger.info("[Startup] Cleared orphaned in-memory execution queue / PTY state")
+
         # ── Clean up stuck execution jobs ─────────────────────────────────────
         stuck_exec_jobs = db.query(ExecutionJob).filter(ExecutionJob.status == "running").all()
         if stuck_exec_jobs:
@@ -1955,6 +1967,11 @@ def delete_dut(dut_id: int, request: Request, db: Session = Depends(get_db)):
         except Exception as conn_err:
             logger.warning(f"Failed to close connection for DUT {dut_id}: {conn_err}")
             # Continue with deletion even if connection close fails
+
+        # Prune in-memory session state so stale entries don't accumulate
+        # (_dut_session_state grows forever if never cleaned — memory leak on
+        # long-running servers where DUTs are frequently added/deleted).
+        _dut_session_state.pop(dut_id, None)
 
         # Delete related configuration
         db.query(DUTConfiguration).filter(DUTConfiguration.dut_id == dut_id).delete()
