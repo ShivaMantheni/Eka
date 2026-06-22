@@ -366,6 +366,7 @@ class ExecutionJob(Base):
     host_id          = Column(Integer, nullable=True)
     topology         = Column(Text, nullable=True)           # JSON canvas snapshot
     scripts          = Column(Text, nullable=True)           # JSON array of script objects
+    testbed_path     = Column(Text, nullable=True)           # full path on VM of last-generated testbed
     # Scheduler fields
     schedule_type    = Column(String(10), default="none")    # none | once | cron
     schedule_at      = Column(DateTime, nullable=True)       # UTC datetime for one-time run
@@ -415,6 +416,7 @@ def _apply_column_migrations():
                 ("schedule_cron",    "VARCHAR(100)"),
                 ("schedule_enabled", "BOOLEAN DEFAULT FALSE"),
                 ("last_run_at",      "TIMESTAMP"),
+                ("testbed_path",     "TEXT"),
             ]
             for col_name, col_def in _sched_cols:
                 if dialect == "sqlite":
@@ -457,8 +459,8 @@ def _trigger_scheduled_job(execution_job_id: int):
             logger.info(f"[Scheduler] Job {execution_job_id} schedule disabled — skipping")
             return
 
-        scripts  = json.loads(job.scripts)  if job.scripts  else []
-        host_id  = job.host_id
+        scripts   = json.loads(job.scripts)   if job.scripts   else []
+        host_id   = job.host_id
         base_path = job.base_path or ""
 
         if not host_id or not scripts:
@@ -470,41 +472,76 @@ def _trigger_scheduled_job(execution_job_id: int):
             logger.warning(f"[Scheduler] Job {execution_job_id} host DUT {host_id} not found — skipping")
             return
 
-        # Generate master testbed via SSH (reuse existing helper logic inline)
         from threading import Thread as _Thread
-        coord = SSHConnectionManager(host_dut.ip_address, host_dut.port,
-                                     host_dut.username, host_dut.password)
-        testbed_file = "master_testbed.yaml"
-        if base_path and coord.connect():
-            try:
-                # Minimal testbed: derive testbeds dir and write a placeholder
-                bp = base_path.rstrip("/")
-                m = re.match(r'(^.*?/spytest)(?:/|$)', bp)
-                spytest_root = m.group(1) if m else os.path.dirname(bp)
-                tb_dir = spytest_root + "/testbeds"
-                coord.execute_command(f"mkdir -p '{tb_dir}'", timeout=10)
-                # Reuse the generate-testbed endpoint logic by calling it as a function
-                topology = json.loads(job.topology) if job.topology else []
-                dut_ids  = json.loads(job.dut_ids)  if job.dut_ids  else []
-                # Build minimal testbed YAML inline
-                devices_section = {}
-                for did in dut_ids:
-                    d = db.query(DUT).filter(DUT.id == int(did)).first()
-                    if d:
-                        devices_section[d.name] = {
-                            "ip": d.ip_address, "username": d.username,
-                            "password": d.password, "port": d.port,
-                        }
-                tb_yaml = yaml.dump({"devices": devices_section, "params": {}, "topology": {}})
-                tb_path = f"{tb_dir}/master_testbed.yaml"
-                coord.execute_command(
-                    f"cat > '{tb_path}' << 'EOFYAML'\n{tb_yaml}\nEOFYAML", timeout=15
-                )
-                testbed_file = tb_path
-            except Exception as _e:
-                logger.warning(f"[Scheduler] Could not generate testbed for job {execution_job_id}: {_e}")
-            finally:
-                coord.disconnect()
+
+        # Use the testbed path saved from the last manual run if available.
+        # If not, generate one now using the same base64-pipe technique as the
+        # /api/spytest/generate-testbed endpoint so the YAML is valid SPyTest format.
+        testbed_file = job.testbed_path or ""
+        if not testbed_file and base_path:
+            coord = SSHConnectionManager(host_dut.ip_address, host_dut.port,
+                                         host_dut.username, host_dut.password)
+            if coord.connect():
+                try:
+                    bp = base_path.rstrip("/")
+                    _m = re.match(r'(^.*?/spytest)(?:/|$)', bp)
+                    spytest_root = _m.group(1) if _m else os.path.dirname(bp)
+                    tb_dir = spytest_root + "/testbeds"
+                    coord.execute_command(f'mkdir -p "{tb_dir}"', timeout=10)
+
+                    dut_ids = json.loads(job.dut_ids) if job.dut_ids else []
+                    devices_section = {}
+                    for did in dut_ids:
+                        d = db.query(DUT).filter(DUT.id == int(did)).first()
+                        if d and d.device_type != "VM":
+                            devices_section[d.name] = {
+                                "ip": d.ip_address,
+                                "username": d.username,
+                                "password": d.password,
+                                "port": d.port or 22,
+                            }
+
+                    tb_path = f"{tb_dir}/master_testbed.yaml"
+                    tb_config = {
+                        "version": "2.0",
+                        "devices": devices_section,
+                        "topology": {},
+                        "services": {"default": {}},
+                        "builds": {"default": {}},
+                        "configs": {"default": {}},
+                        "errors": {"default": {}},
+                        "params": {},
+                    }
+                    tb_yaml = (
+                        "# MASTER TESTBED - AUTO-GENERATED BY SCHEDULER\n"
+                        + yaml.dump(tb_config, default_flow_style=None, sort_keys=False)
+                    )
+                    # Write via base64 pipe to avoid heredoc/ARG_MAX issues
+                    yaml_b64 = base64.b64encode(tb_yaml.encode()).decode()
+                    stdin_ch, stdout_ch, stderr_ch = coord.client.exec_command(
+                        f'base64 -d > "{tb_path}"', timeout=15
+                    )
+                    stdin_ch.write(yaml_b64.encode())
+                    stdin_ch.channel.shutdown_write()
+                    write_code = stdout_ch.channel.recv_exit_status()
+                    if write_code == 0:
+                        testbed_file = tb_path
+                        # Persist so future scheduled runs reuse it
+                        job.testbed_path = tb_path
+                        db.commit()
+                        logger.info(f"[Scheduler] Generated testbed {tb_path} for job {execution_job_id}")
+                    else:
+                        err = stderr_ch.read().decode("utf-8", errors="ignore").strip()
+                        logger.warning(f"[Scheduler] Failed to write testbed for job {execution_job_id}: {err}")
+                except Exception as _e:
+                    logger.warning(f"[Scheduler] Could not generate testbed for job {execution_job_id}: {_e}")
+                finally:
+                    coord.disconnect()
+
+        if not testbed_file:
+            logger.warning(f"[Scheduler] Job {execution_job_id} has no testbed — skipping. "
+                           "Run the job manually once to save the testbed path.")
+            return
 
         # Create Execution record
         exec_name = f"scheduled_{execution_job_id}_{int(datetime.utcnow().timestamp())}"
@@ -563,12 +600,18 @@ def _register_job_schedule(job: "ExecutionJob"):
             if job.schedule_at <= datetime.utcnow():
                 logger.warning(f"[Scheduler] Job {job.id} schedule_at is in the past — not scheduling")
                 return
+            # schedule_at is stored as naive UTC; make it timezone-aware so
+            # APScheduler (which defaults to the server's local timezone) fires
+            # it at the correct wall-clock moment instead of 5.5h early (IST offset).
+            from datetime import timezone as _utc_tz
+            aware_dt = job.schedule_at.replace(tzinfo=_utc_tz.utc)
             scheduler.add_job(
                 _trigger_scheduled_job,
-                trigger=DateTrigger(run_date=job.schedule_at),
+                trigger=DateTrigger(run_date=aware_dt),
                 args=[job.id],
                 id=ap_id,
                 replace_existing=True,
+                misfire_grace_time=300,  # fire up to 5 min late if server was busy
             )
             logger.info(f"[Scheduler] Job {job.id} '{job.name}' scheduled once at {job.schedule_at} UTC")
 
@@ -1483,6 +1526,15 @@ def startup_cleanup():
                     exec.duration_seconds = int((exec.end_time - exec.start_time).total_seconds())
             db.commit()
             logger.info(f"Cleaned up {len(stuck_executions)} stuck executions")
+
+        # ── Clean up stuck execution jobs ─────────────────────────────────────
+        stuck_exec_jobs = db.query(ExecutionJob).filter(ExecutionJob.status == "running").all()
+        if stuck_exec_jobs:
+            logger.warning(f"Found {len(stuck_exec_jobs)} stuck execution jobs from previous run, marking as failed")
+            for ej in stuck_exec_jobs:
+                ej.status = "failed"
+            db.commit()
+            logger.info(f"Cleaned up {len(stuck_exec_jobs)} stuck execution jobs")
 
         # ── Clean up stuck hardware load jobs ─────────────────────────────────
         # Any job not in a terminal state means the server died mid-operation.
@@ -6296,6 +6348,14 @@ def _run_spytest_execution(
             execution.status = "failed"
             execution.end_time = datetime.utcnow()
             db.commit()
+        if job_id:
+            try:
+                _job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id).first()
+                if _job and _job.status == "running":
+                    _job.status = "failed"
+                    db.commit()
+            except Exception:
+                pass
         log_execution(db, execution_id, "SYSTEM", "ERROR", f"Execution failed: {e}")
         _q_cleanup(execution_id)
         # Enhancement 2: Clean up pending scripts structure on failure
@@ -6484,6 +6544,16 @@ def get_execution_job(job_id: int, request: Request, db: Session = Depends(get_d
         "start_time": e.start_time.isoformat() if e.start_time else None,
         "end_time": e.end_time.isoformat() if e.end_time else None,
     } for e in executions]
+    next_run = None
+    ap_id = f"exec_job_{job.id}"
+    try:
+        ap_job = scheduler.get_job(ap_id)
+        if ap_job and ap_job.next_run_time:
+            from datetime import timezone as _utc_tz
+            next_run = ap_job.next_run_time.astimezone(_utc_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+
     return {
         "id": job.id,
         "name": job.name,
@@ -6493,12 +6563,14 @@ def get_execution_job(job_id: int, request: Request, db: Session = Depends(get_d
         "host_id": job.host_id,
         "topology": json.loads(job.topology) if job.topology else [],
         "scripts": json.loads(job.scripts) if job.scripts else [],
+        "testbed_path": job.testbed_path or "",
         "executions": execs_data,
         "schedule_type":    job.schedule_type or "none",
         "schedule_at":      job.schedule_at.isoformat() if job.schedule_at else None,
         "schedule_cron":    job.schedule_cron,
         "schedule_enabled": bool(job.schedule_enabled),
         "last_run_at":      job.last_run_at.isoformat() if job.last_run_at else None,
+        "next_run":         next_run,
         "created_at": job.created_at.isoformat() if job.created_at else None,
     }
 
@@ -6523,6 +6595,8 @@ def update_execution_job(job_id: int, request: Request, body: dict, db: Session 
         job.topology = json.dumps(body["topology"])
     if "scripts" in body:
         job.scripts = json.dumps(body["scripts"])
+    if "testbed_path" in body:
+        job.testbed_path = body["testbed_path"] or None
     if "status" in body and body["status"] in ("idle", "running", "completed", "failed"):
         job.status = body["status"]
     job.updated_at = datetime.utcnow()
@@ -6685,7 +6759,8 @@ def set_job_schedule(job_id: int, request: Request, body: dict,
     try:
         ap_job = scheduler.get_job(ap_id)
         if ap_job and ap_job.next_run_time:
-            next_run = ap_job.next_run_time.strftime("%Y-%m-%d %H:%M UTC")
+            from datetime import timezone as _utc_tz
+            next_run = ap_job.next_run_time.astimezone(_utc_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         pass
 
@@ -6713,7 +6788,8 @@ def get_job_schedule(job_id: int, request: Request, db: Session = Depends(get_db
     try:
         ap_job = scheduler.get_job(ap_id)
         if ap_job and ap_job.next_run_time:
-            next_run = ap_job.next_run_time.strftime("%Y-%m-%d %H:%M UTC")
+            from datetime import timezone as _utc_tz
+            next_run = ap_job.next_run_time.astimezone(_utc_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         pass
 
