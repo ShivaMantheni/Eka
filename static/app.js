@@ -729,6 +729,9 @@ function switchTab(tab) {
                 switchJob(activeJobList[0].id);
             }
         });
+        _startJobPoller();
+    } else {
+        _stopJobPoller();
     }
     if (tab === 'devices') loadDUTs();
     if (tab === 'logs') loadExecutions();
@@ -1619,11 +1622,20 @@ async function openScheduleModal() {
             onCronPresetChange();
         }
 
-        // Info line
+        // Info line — show times in local timezone
         const info = document.getElementById('sched-info');
         const parts = [];
-        if (data.last_run_at) parts.push(`Last run: ${new Date(data.last_run_at+'Z').toLocaleString()}`);
-        if (data.next_run)    parts.push(`Next run: ${data.next_run}`);
+        if (data.last_run_at) {
+            parts.push(`Last run: ${new Date(data.last_run_at + 'Z').toLocaleString()}`);
+        }
+        if (data.next_run) {
+            try {
+                const utcStr = data.next_run.replace(' UTC', 'Z').replace(' ', 'T');
+                parts.push(`Next run: ${new Date(utcStr).toLocaleString()}`);
+            } catch (_) {
+                parts.push(`Next run: ${data.next_run}`);
+            }
+        }
         if (info) info.textContent = parts.join('  ·  ');
     } catch (_) {}
 }
@@ -1694,11 +1706,70 @@ function _renderNextRunLabel(data) {
     const el = document.getElementById('job-next-run');
     if (!el) return;
     if (data && data.next_run && data.schedule_enabled) {
-        el.textContent = `⏰ ${data.next_run}`;
+        // next_run is "YYYY-MM-DD HH:MM UTC" — convert to local time for display
+        try {
+            const utcStr = data.next_run.replace(' UTC', 'Z').replace(' ', 'T');
+            const local  = new Date(utcStr).toLocaleString([], {
+                month: 'short', day: 'numeric',
+                hour: '2-digit', minute: '2-digit',
+            });
+            el.textContent = `⏰ Next: ${local}`;
+        } catch (_) {
+            el.textContent = `⏰ ${data.next_run}`;
+        }
         el.style.display = '';
     } else {
         el.style.display = 'none';
     }
+}
+
+// ── Scheduled-run live log watcher ───────────────────────────────────────────
+// Polls the active job every 5 s. When a scheduled run starts (execution_id
+// we didn't launch manually), it connects the WebSocket so logs stream live
+// and the Stop button appears — identical to a manual run.
+
+let _jobPollTimer = null;
+let _jobPollLastExecId = null;
+
+function _startJobPoller() {
+    _stopJobPoller();
+    _jobPollTimer = setInterval(_pollActiveJob, 5000);
+}
+
+function _stopJobPoller() {
+    if (_jobPollTimer) { clearInterval(_jobPollTimer); _jobPollTimer = null; }
+}
+
+async function _pollActiveJob() {
+    if (!activeJobId) return;
+    try {
+        const res = await fetch(`${API}/api/execution-jobs/${activeJobId}`, { headers: getSessionHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // Update status badge
+        _updateJobStatusBadge(data.status);
+        _renderNextRunLabel(data);
+
+        if (data.status === 'running' && data.executions && data.executions.length > 0) {
+            const latestExec = data.executions[0]; // most recent first
+            // Only connect if this is a new execution we didn't start manually
+            if (latestExec.id !== currentExecId && latestExec.id !== _jobPollLastExecId
+                    && latestExec.status === 'running') {
+                _jobPollLastExecId = latestExec.id;
+                currentExecId = latestExec.id;
+                allLogs = [];
+                logStreams = {};
+                renderLogs();
+                // Show stop / hide start
+                document.getElementById('btn-start-exec').style.display = 'none';
+                document.getElementById('btn-stop-exec').style.display = '';
+                startQueuePolling(currentExecId);
+                connectWS(currentExecId);
+                toast(`Scheduled run started — Execution #${currentExecId}`, 'info');
+            }
+        }
+    } catch (_) {}
 }
 
 // Close modal on backdrop click
