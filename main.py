@@ -3941,7 +3941,7 @@ async def websocket_logs(websocket: WebSocket, execution_id: int):
 
             # Check if execution has finished
             execution = db.query(Execution).filter(Execution.id == execution_id).first()
-            if execution and execution.status in ["completed", "failed"]:
+            if execution and execution.status in ["completed", "failed", "cancelled"]:
                 # Send any remaining logs and TCR results
                 db.expire_all()
                 remaining = (
@@ -5314,6 +5314,32 @@ _execution_threads_lock = Lock()
 _execution_threads: dict = {}  # execution_id -> list of thread objects
 _test_results_lock = Lock()  # guards concurrent test_results JSON updates from parallel script threads
 
+# ── Execution-level STOP support ────────────────────────────────────────────
+# Set of execution_ids the user asked to stop. The per-script worker threads poll
+# this and, when their id appears, kill the remote SPyTest process, mark the script
+# "cancelled", and exit. The finalizer then records the execution/job as "cancelled".
+_exec_cancel_lock = Lock()
+_exec_cancel: set = set()
+
+
+class ExecutionCancelled(Exception):
+    """Raised inside a worker when the user stops the execution while it waits for DUTs."""
+
+
+def _request_exec_cancel(execution_id: int):
+    with _exec_cancel_lock:
+        _exec_cancel.add(execution_id)
+
+
+def _is_exec_cancelled(execution_id: int) -> bool:
+    with _exec_cancel_lock:
+        return execution_id in _exec_cancel
+
+
+def _clear_exec_cancel(execution_id: int):
+    with _exec_cancel_lock:
+        _exec_cancel.discard(execution_id)
+
 
 def _init_pending_scripts(execution_id: int):
     """Initialize pending scripts structure for new execution."""
@@ -5430,6 +5456,57 @@ def cancel_script_from_execution(execution_id: int, body: dict, db: Session = De
         "script": script_name,
         "execution_id": execution_id
     }
+
+
+@app.post("/api/executions/{execution_id}/stop")
+def stop_execution_endpoint(execution_id: int, db: Session = Depends(get_db)):
+    """Stop a running execution: terminate all running scripts and mark it cancelled.
+
+    Sets the execution-level cancel flag. Each worker thread polls it (≤10 s), kills its
+    remote SPyTest process, marks the script "cancelled", and exits; the finalizer then
+    records the execution and parent job as "cancelled" and releases the DUT locks. For
+    immediacy, this endpoint also best-effort kills any already-known running PIDs now,
+    so the remote scripts don't keep running until the next poll tick.
+    """
+    execution = db.query(Execution).filter(Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    if execution.status not in ("running", "pending"):
+        # Already finished — nothing to stop; report the real status back.
+        return {"status": execution.status, "execution_id": execution_id,
+                "message": "Execution is not running"}
+
+    _request_exec_cancel(execution_id)
+    log_execution(db, execution_id, "SYSTEM", "WARN",
+                  "■ Stop requested by user — terminating running scripts…")
+
+    # Best-effort immediate kill of any running PIDs we already track (don't wait for poll)
+    killed = 0
+    try:
+        with _exec_queue_lock:
+            state = _exec_queue_state.get(execution_id)
+            running = ([(s.get("name"), s.get("pid")) for s in state["scripts"]
+                        if s.get("status") == "running" and s.get("pid")]
+                       if state else [])
+        host = None
+        if running and execution.job_id:
+            _job = db.query(ExecutionJob).filter(ExecutionJob.id == execution.job_id).first()
+            if _job and _job.host_id:
+                host = db.query(DUT).filter(DUT.id == _job.host_id).first()
+        if running and host:
+            kssh = SSHConnectionManager(host.ip_address, host.port, host.username, host.password)
+            if kssh.connect():
+                for _name, _pid in running:
+                    kssh.execute_command(
+                        f"kill -TERM {_pid} 2>/dev/null; sleep 1; kill -KILL {_pid} 2>/dev/null",
+                        timeout=10)
+                    killed += 1
+                kssh.disconnect()
+    except Exception as _e:
+        logger.warning(f"[STOP] Immediate kill best-effort failed for exec {execution_id}: {_e}")
+
+    return {"status": "stopping", "execution_id": execution_id, "killed_now": killed}
 
 
 # ============================================================================
@@ -6186,6 +6263,9 @@ def _run_spytest_execution(
                 When the canvas has no connections, simple FIFO is always used.
                 """
                 while True:
+                    # Abort a queued script immediately if the user stopped the execution
+                    if _is_exec_cancelled(execution_id):
+                        raise ExecutionCancelled()
                     with pool_lock:
                         if len(available_pool) >= needed:
                             # Topology-aware path: canvas has connections AND
@@ -6329,8 +6409,20 @@ def _run_spytest_execution(
 
                     # --- Poll until the process exits -----------------------
                     last_lines_seen = 0
+                    cancelled = False
                     while True:
                         _time.sleep(10)
+                        # User pressed Stop — kill the remote SPyTest process and bail out
+                        if _is_exec_cancelled(execution_id):
+                            s_ssh.execute_command(
+                                f"kill -TERM {pid} 2>/dev/null; sleep 1; kill -KILL {pid} 2>/dev/null",
+                                timeout=10,
+                            )
+                            log_execution(sdb, execution_id, sname, "WARN",
+                                          f"■ Stopped by user — killed PID {pid}")
+                            _q_update_script(execution_id, sname, "cancelled")
+                            cancelled = True
+                            break
                         chk_out, _, _ = s_ssh.execute_command(
                             f"kill -0 {pid} 2>/dev/null && echo RUNNING || echo DONE",
                             timeout=5,
@@ -6354,6 +6446,11 @@ def _run_spytest_execution(
                         if "DONE" in chk_out:
                             break
 
+                    if cancelled:
+                        # Stopped by user — don't mark done or collect results
+                        s_ssh.execute_command(f"rm -f {temp_tb_path}", timeout=5)
+                        return
+
                     log_execution(sdb, execution_id, sname, "INFO", "✓ Script completed")
                     _q_update_script(execution_id, sname, "done")
                     # Collect CSV results and persist TestCaseResult rows
@@ -6361,6 +6458,10 @@ def _run_spytest_execution(
                                               script_path, log_dir, sdb)
                     s_ssh.execute_command(f"rm -f {temp_tb_path}", timeout=5)
 
+                except ExecutionCancelled:
+                    log_execution(sdb, execution_id, sname, "WARN",
+                                  "■ Stopped by user before DUTs were allocated")
+                    _q_update_script(execution_id, sname, "cancelled")
                 except Exception as ex:
                     log_execution(sdb, execution_id, sname, "ERROR",
                                   f"Script error: {ex}")
@@ -6387,22 +6488,28 @@ def _run_spytest_execution(
             for t in threads:
                 t.join()
 
-            # ── Mark master execution done ────────────────────────────────────
-            execution.status = "completed"
+            # ── Mark master execution done (or cancelled if the user stopped it) ──
+            _was_cancelled = _is_exec_cancelled(execution_id)
+            final_status = "cancelled" if _was_cancelled else "completed"
+            execution.status = final_status
             execution.end_time = datetime.utcnow()
             if execution.start_time:
                 execution.duration_seconds = int(
                     (execution.end_time - execution.start_time).total_seconds()
                 )
             db.commit()
-            log_execution(db, execution_id, "SYSTEM", "INFO",
-                          f"✓ All scripts finished ({execution.duration_seconds}s)")
+            log_execution(db, execution_id, "SYSTEM",
+                          "WARN" if _was_cancelled else "INFO",
+                          (f"■ Execution stopped by user ({execution.duration_seconds}s)"
+                           if _was_cancelled else
+                           f"✓ All scripts finished ({execution.duration_seconds}s)"))
             # Update parent job status
             if job_id:
                 _job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id).first()
                 if _job and _job.status == "running":
-                    _job.status = "completed"
+                    _job.status = final_status
                     db.commit()
+            _clear_exec_cancel(execution_id)
             _q_cleanup(execution_id)
             # Enhancement 2: Clean up pending scripts structure
             _cleanup_pending_scripts(execution_id)
@@ -6427,6 +6534,7 @@ def _run_spytest_execution(
             except Exception:
                 pass
         log_execution(db, execution_id, "SYSTEM", "ERROR", f"Execution failed: {e}")
+        _clear_exec_cancel(execution_id)
         _q_cleanup(execution_id)
         # Enhancement 2: Clean up pending scripts structure on failure
         _cleanup_pending_scripts(execution_id)

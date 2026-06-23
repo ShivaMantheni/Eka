@@ -643,7 +643,7 @@
                             <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-secondary);margin-bottom:8px;font-weight:600">
                                 <span class="material-icons-round" style="font-size:13px;vertical-align:middle;color:var(--accent)">list</span> Scripts
                             </div>
-                            <div id="queue-scripts-list" style="display:flex;flex-direction:column;gap:6px">
+                            <div id="queue-scripts-list" style="display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto;padding-right:4px">
                                 <span class="muted" style="font-size:12px">–</span>
                             </div>
                         </div>
@@ -678,19 +678,21 @@
                             0 of 0 scripts done
                         </div>
                     </div>
-                    <table class="data-table" style="font-size:12px">
-                        <thead>
-                            <tr>
-                                <th>Script</th>
-                                <th>Status</th>
-                                <th style="text-align:center">Pass</th>
-                                <th style="text-align:center">Fail</th>
-                                <th style="text-align:center">Skip</th>
-                                <th>Duration</th>
-                            </tr>
-                        </thead>
-                        <tbody id="live-results-tbody"></tbody>
-                    </table>
+                    <div class="live-results-scroll">
+                        <table class="data-table" style="font-size:12px">
+                            <thead>
+                                <tr>
+                                    <th>Script</th>
+                                    <th>Status</th>
+                                    <th style="text-align:center">Pass</th>
+                                    <th style="text-align:center">Fail</th>
+                                    <th style="text-align:center">Skip</th>
+                                    <th>Duration</th>
+                                </tr>
+                            </thead>
+                            <tbody id="live-results-tbody"></tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
 
@@ -700,8 +702,8 @@
                     <h3><span class="material-icons-round">article</span> Live Execution Logs</h3>
                     <div style="display:flex; gap:8px">
                         <button class="btn outline small" onclick="toggleShowOnlyRunning()" id="btn-show-only-running"
-                            style="display:none" title="Hide completed scripts' logs">
-                            <span class="material-icons-round">visibility_off</span> Show Only Running
+                            style="display:none" title="Show all scripts (including completed)">
+                            <span class="material-icons-round">visibility</span> <span id="show-only-running-label">Show All</span>
                         </button>
                         <button class="btn outline small" onclick="downloadLogs()" id="btn-download-logs"
                             style="display:none">

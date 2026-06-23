@@ -4,6 +4,10 @@
 
 const API = window.location.origin;
 let currentExecId = null;
+let currentExecActive = false;  // true only while currentExecId is running/pending — gates the
+                                // cancel-script flow so unchecking a script after a run finished
+                                // (or after the execution was deleted) is a plain deselect, not a
+                                // cancel against a stale/dead execution id (Session 14 fix)
 let ws = null;
 let allLogs = [];           // [{dut_name, script_name, level, message, timestamp}]
 let _queuePollTimer = null; // setInterval handle for queue status polling
@@ -1468,6 +1472,7 @@ function _syncExecutionView(latestExec, jobScripts) {
 
     currentExecId      = latestExec ? latestExec.id : null;
     _jobPollLastExecId = currentExecId;
+    currentExecActive  = !!(latestExec && (latestExec.status === 'running' || latestExec.status === 'pending'));
 
     if (latestExec && (latestExec.status === 'running' || latestExec.status === 'pending')) {
         // Active execution — stream live (logs via WS, queue panel, live results)
@@ -1506,14 +1511,29 @@ function _syncExecutionView(latestExec, jobScripts) {
 }
 
 async function switchJob(newId) {
-    if (!newId) return;
-    // Save current job state first
-    if (activeJobId && activeJobId !== newId) {
-        await saveJobState(true); // immediate save
-    }
-    // Load new job state from server
+    if (!newId || newId === activeJobId) return;
+    // Flush the OUTGOING job's state without blocking the switch.
+    // This used to `await saveJobState(true)` here — but this call sits OUTSIDE the try
+    // below, so if the PUT stalled while the server was busy during a running execution,
+    // switchJob() hung forever with no error toast and none of the panels (device hub,
+    // topology, scripts, queue, live results, logs) ever updated until a page reload.
+    // State is already debounce-saved on every change, and the running execution does not
+    // mutate the selection, so a fire-and-forget flush loses nothing. (saveJobState reads
+    // the current globals synchronously to build the request body before it awaits, so the
+    // outgoing values are captured correctly even though we overwrite the globals below.)
+    if (activeJobId) saveJobState(true);  // fire-and-forget — do NOT await
+    // Load new job state from server — guarded with a timeout so a wedged request can never
+    // leave the viewer stuck on the previous job.
     try {
-        const res = await fetch(`${API}/api/execution-jobs/${newId}`, { headers: getSessionHeaders() });
+        const _ctrl = new AbortController();
+        const _to = setTimeout(() => _ctrl.abort(), 15000);
+        let res;
+        try {
+            res = await fetch(`${API}/api/execution-jobs/${newId}`, {
+                headers: getSessionHeaders(), signal: _ctrl.signal });
+        } finally {
+            clearTimeout(_to);
+        }
         if (!res.ok) { toast('Failed to load job', 'error'); return; }
         const data = await res.json();
         activeJobId = newId;
@@ -2243,8 +2263,11 @@ function renderScriptsDropdown() {
 }
 
 function onScriptCheckboxChange(scriptPath, cb) {
-    // Enhancement 2: If deselecting during execution, show confirmation
-    if (!cb.checked && currentExecId) {
+    // Enhancement 2: If deselecting during a LIVE execution, show cancel confirmation.
+    // Gate on currentExecActive (not just currentExecId): currentExecId lingers after a run
+    // completes or after the execution is deleted from the Logs tab, so unchecking a script
+    // then would fire cancel-script against a dead id → "Execution not found" (Session 14).
+    if (!cb.checked && currentExecId && currentExecActive) {
         // User is trying to deselect a script during execution
         // Show confirmation dialog
         cb.checked = true;  // Re-check for now
@@ -2441,13 +2464,17 @@ function resetExecutionState() {
     completedScripts.clear();
     Object.keys(scriptHideTimers).forEach(key => clearTimeout(scriptHideTimers[key]));
     scriptHideTimers = {};
-    showOnlyRunning = false;
+    // Default to "only running" — a completed script's log pane is hidden the moment it
+    // finishes, so the Live Execution Logs section only shows scripts that are still running.
+    showOnlyRunning = true;
     const btn = document.getElementById('btn-show-only-running');
     if (btn) {
-        btn.classList.remove('active');
-        btn.title = 'Hide completed scripts';
+        btn.classList.add('active');
+        btn.title = 'Show all scripts (including completed)';
         const icon = btn.querySelector('.material-icons-round');
-        if (icon) icon.textContent = 'visibility_off';
+        if (icon) icon.textContent = 'visibility';
+        const lbl = document.getElementById('show-only-running-label');
+        if (lbl) lbl.textContent = 'Show All';
     }
 
     // Enhancement 2: Hide add scripts button
@@ -2566,6 +2593,7 @@ async function startExecution() {
         if (!res.ok) throw new Error((await res.json()).detail);
         const data = await res.json();
         currentExecId = data.execution_id;
+        currentExecActive = true;
         _updateJobStatusBadge('running');
         // Persist the testbed path so the scheduler can reuse it next time
         if (activeJobId && generatedTestbedPath) {
@@ -2605,15 +2633,36 @@ async function startExecution() {
     }
 }
 
-function stopExecution() {
-    if (ws) { ws.close(); ws = null; }
-    stopQueuePolling();
-    document.getElementById('btn-start-exec').style.display = '';
-    document.getElementById('btn-stop-exec').style.display = 'none';
-    const qPanel = document.getElementById('queue-status-panel');
-    if (qPanel) qPanel.style.display = 'none';
-    toast('Execution monitoring stopped', 'info');
-    hideLiveResultsPanel();
+async function stopExecution() {
+    // Actually terminate the running execution on the server — not just stop watching.
+    if (!currentExecId) { toast('No execution to stop', 'info'); return; }
+    if (!confirm('Stop this execution? All running scripts will be terminated on the VM.')) return;
+
+    const stopBtn = document.getElementById('btn-stop-exec');
+    if (stopBtn) stopBtn.disabled = true;
+    try {
+        const res = await fetch(`${API}/api/executions/${currentExecId}/stop`, {
+            method: 'POST',
+            headers: getSessionHeaders(),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            toast(`Failed to stop: ${err.detail || res.status}`, 'error');
+            return;
+        }
+        // The server is now killing the remote scripts. Keep the WebSocket open so the
+        // logs/queue update and the final `execution_complete` (status: cancelled) event
+        // resets the UI cleanly. Reflect the stopping state immediately.
+        currentExecActive = false;
+        const badge = document.getElementById('queue-exec-badge');
+        if (badge) { badge.className = 'badge failed'; badge.textContent = 'stopping'; }
+        _updateJobStatusBadge('cancelled');
+        toast('Stopping execution — terminating scripts on the VM…', 'info');
+    } catch (e) {
+        toast(`Failed to stop: ${e.message}`, 'error');
+    } finally {
+        if (stopBtn) stopBtn.disabled = false;
+    }
 }
 
 function connectWS(execId) {
@@ -2629,6 +2678,7 @@ function connectWS(execId) {
         }
 
         if (data.type === 'execution_complete') {
+            currentExecActive = false;  // run finished — unchecking scripts is now a plain deselect
             toast(`Execution ${data.status} (${data.duration || 0}s)`,
                   data.status === 'completed' ? 'success' : 'error');
             document.getElementById('btn-start-exec').style.display = '';
@@ -2655,7 +2705,7 @@ function connectWS(execId) {
             const jobExcelBtn = document.getElementById('btn-job-excel');
             if (activeJobId && jobHtmlBtn) jobHtmlBtn.style.display = '';
             if (activeJobId && jobExcelBtn) jobExcelBtn.style.display = '';
-            _updateJobStatusBadge('completed');
+            _updateJobStatusBadge(data.status || 'completed');
 
             allLogs = [];
             logStreams = {};
@@ -2831,7 +2881,8 @@ async function downloadReport(execId, format) {
 // ============================================================
 
 let logStreams = {};  // {scriptName: DOM element}
-let showOnlyRunning = false;  // Toggle for "Show Only Running" button
+let showOnlyRunning = true;   // Default: Live Execution Logs shows only running scripts;
+                              // a script's pane is hidden as soon as it completes
 let completedScripts = new Set();  // Track completed script names
 let scriptHideTimers = {};  // Auto-hide timers per script
 
@@ -2848,6 +2899,13 @@ function renderLogs() {
     wrapper.className = 'log-panes-wrapper';
     container.appendChild(wrapper);
     allLogs.forEach(appendLogEntry);
+    // Re-apply "only running" filter after a full rebuild — appendLogEntry only hides a pane
+    // on the tick it first completes, so already-completed scripts must be re-hidden here.
+    if (showOnlyRunning) {
+        wrapper.querySelectorAll('.script-log-pane').forEach(pane => {
+            if (completedScripts.has(pane.dataset.scriptName)) pane.classList.add('log-pane-hidden');
+        });
+    }
 }
 
 function _ensurePaneWrapper() {
@@ -2868,12 +2926,12 @@ function appendLogEntry(log) {
 
     // Detect script completion messages and mark as completed
     const msg = (log.message || '').toLowerCase();
+    let justCompleted = false;
     if ((msg.includes('passed') || msg.includes('failed') || msg.includes('completed')) &&
         !msg.includes('waiting')) {
         if (!completedScripts.has(source)) {
             completedScripts.add(source);
-            // Set auto-hide timer for 5 minutes (300000 ms)
-            setAutoHideScriptLog(source, 300000);
+            justCompleted = true;
         }
     }
 
@@ -2901,6 +2959,13 @@ function appendLogEntry(log) {
         // Auto-scroll only the individual pane (not the main container)
         // This allows each script section to scroll independently
         target.scrollTop = target.scrollHeight;
+    }
+
+    // In "only running" mode, hide this script's pane as soon as it completes so the
+    // Live Execution Logs section shows only scripts that are still running.
+    if (justCompleted && showOnlyRunning && target) {
+        const pane = target.closest('.script-log-pane');
+        if (pane) pane.classList.add('log-pane-hidden');
     }
 }
 
@@ -2934,10 +2999,12 @@ function toggleShowOnlyRunning() {
     showOnlyRunning = !showOnlyRunning;
     const btn = document.getElementById('btn-show-only-running');
     if (btn) {
-        btn.classList.toggle('active');
-        btn.title = showOnlyRunning ? 'Show all scripts' : 'Hide completed scripts';
+        btn.classList.toggle('active', showOnlyRunning);
+        btn.title = showOnlyRunning ? 'Show all scripts (including completed)' : 'Show only running scripts';
         const icon = btn.querySelector('.material-icons-round');
         if (icon) icon.textContent = showOnlyRunning ? 'visibility' : 'visibility_off';
+        const lbl = document.getElementById('show-only-running-label');
+        if (lbl) lbl.textContent = showOnlyRunning ? 'Show All' : 'Show Only Running';
     }
 
     // Update all log panes visibility
@@ -3674,6 +3741,13 @@ async function deleteLogs() {
 
         if (res.ok) {
             toast(`✓ Logs deleted (scope: ${choice})`, 'success');
+            // If the Execute tab is still tracking the execution we just deleted, drop the
+            // stale pointer so a later script uncheck won't fire cancel against a dead id
+            // (Session 14 — "Failed to cancel: Execution not found").
+            if (currentExecId && Number(currentExecId) === Number(currentViewingExecId)) {
+                currentExecId = null;
+                currentExecActive = false;
+            }
             closeLogViewer();
             // Refresh execution history
             loadExecutions();
