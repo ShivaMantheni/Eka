@@ -7185,7 +7185,16 @@ async function loadUsers() {
             countBadge.style.display = 'inline-flex';
         }
 
+        // Sort alphabetically by display name then group by first letter
+        ekaUsers.sort((a, b) => {
+            const na = (a.display_name || a.name || a.email || '').toLowerCase();
+            const nb = (b.display_name || b.name || b.email || '').toLowerCase();
+            return na.localeCompare(nb);
+        });
+
         container.innerHTML = '';
+        let currentLetter = null;
+
         ekaUsers.forEach(u => {
             // Extract application roles
             let rolesArr = [];
@@ -7197,21 +7206,36 @@ async function loadUsers() {
                 else rolesArr = Object.values(u.roles);
             }
 
+            const isAdmin = rolesArr.some(r => r.toLowerCase() === 'admin');
             const rolesHtml = rolesArr.length > 0
-                ? rolesArr.map(r => `<span class="user-role-badge">${r}</span>`).join('')
-                : '<span class="user-role-badge" style="opacity:0.45">No Role</span>';
+                ? rolesArr.map(r => {
+                    const cls = r.toLowerCase() === 'admin' ? 'is-admin' : '';
+                    return `<span class="user-role-badge ${cls}">${esc(r)}</span>`;
+                  }).join('')
+                : '<span class="user-role-badge" style="opacity:0.4">—</span>';
 
             const displayName = u.display_name || u.name || '—';
-            const email      = u.email || 'No email';
-            const initial    = (displayName !== '—' ? displayName : email).charAt(0).toUpperCase();
+            const email       = u.email || 'No email';
+            const sortKey     = (displayName !== '—' ? displayName : email);
+            const initial     = sortKey.charAt(0).toUpperCase();
+            const letter      = /[A-Z]/.test(initial) ? initial : '#';
+
+            // Insert alphabetical divider when the first letter changes
+            if (letter !== currentLetter) {
+                currentLetter = letter;
+                const div = document.createElement('div');
+                div.className = 'um-alpha-divider';
+                div.innerHTML = `<span>${letter}</span>`;
+                container.appendChild(div);
+            }
 
             const row = document.createElement('div');
             row.className = 'user-row';
             row.innerHTML = `
-                <div class="user-row-avatar">${initial}</div>
+                <div class="user-row-avatar${isAdmin ? ' is-admin' : ''}">${initial}</div>
                 <div class="user-row-info">
-                    <div class="user-row-name">${displayName}</div>
-                    <div class="user-row-email">${email}</div>
+                    <div class="user-row-name">${esc(displayName)}</div>
+                    <div class="user-row-email">${esc(email)}</div>
                 </div>
                 <div class="user-row-roles">${rolesHtml}</div>
             `;
@@ -7307,12 +7331,12 @@ async function loadActiveSessions() {
                     Since ${s.created_at ? new Date(s.created_at).toLocaleDateString() : '—'}
                 </div>`;
 
-            const footer = (isAdmin && !isSelf)
-                ? `<div class="session-card-footer">
-                       <button class="btn outline small" style="color:var(--red);"
+            const revokeBtn = (isAdmin && !isSelf)
+                ? `<div class="session-card-actions">
+                       <button class="btn outline small" style="color:var(--red);border-color:var(--red);opacity:0.85;"
                            onclick="revokeSession('${esc(s.session_id)}','${esc(displayName)}')"
                            title="Revoke this session">
-                           <span class="material-icons-round" style="font-size:14px">block</span> Revoke
+                           <span class="material-icons-round" style="font-size:13px">block</span> Revoke
                        </button>
                    </div>`
                 : '';
@@ -7323,15 +7347,15 @@ async function loadActiveSessions() {
                 <div class="session-card-top">
                     <div class="session-avatar ${isAdmin_row ? 'session-avatar-admin' : ''}">${initial}</div>
                     <div class="session-info">
-                        <div class="session-name">
-                            ${esc(displayName)}${selfTag}
-                            <span style="margin-left:auto">${roleBadge}</span>
-                        </div>
+                        <div class="session-name">${esc(displayName)}${selfTag}</div>
                         <div class="session-email">${esc(s.user_email || '—')}</div>
                     </div>
+                    ${roleBadge}
                 </div>
-                <div class="session-card-meta">${metaChips}</div>
-                ${footer}`;
+                <div class="session-card-bottom">
+                    <div class="session-card-meta">${metaChips}</div>
+                    ${revokeBtn}
+                </div>`;
             container.appendChild(card);
         });
 

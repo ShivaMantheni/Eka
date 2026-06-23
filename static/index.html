@@ -1074,16 +1074,14 @@
         <!-- USERS VIEW -->
         <!-- ========================================== -->
         <section id="tab-users" class="tab-content">
-            <div class="view-header">
-                <h2>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+                <h2 style="display:flex;align-items:center;gap:8px;margin:0">
                     <span class="material-icons-round">manage_accounts</span>
                     User Management
                 </h2>
-                <div class="header-actions">
-                    <button class="btn btn-outline" onclick="loadUsers(); loadActiveSessions();">
-                        <span class="material-icons-round">refresh</span> Refresh
-                    </button>
-                </div>
+                <button class="btn outline small" onclick="loadUsers(); loadActiveSessions();">
+                    <span class="material-icons-round">refresh</span> Refresh
+                </button>
             </div>
 
             <div class="um-grid">
