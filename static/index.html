@@ -265,6 +265,10 @@
                     <span class="material-icons-round" style="font-size:14px">schedule</span> Schedule
                 </button>
                 <span id="job-next-run" style="font-size:11px;color:var(--text-secondary);white-space:nowrap;display:none"></span>
+                <button class="btn outline small" onclick="resetJobToIdle()" title="Reset stuck job back to idle" id="btn-reset-job"
+                    style="display:none;color:#d97706;border-color:#d97706">
+                    <span class="material-icons-round" style="font-size:14px">restart_alt</span> Reset
+                </button>
                 <button class="btn outline small" onclick="deleteActiveJob()" title="Delete this job" id="btn-delete-job"
                     style="color:var(--error,#ef4444);border-color:var(--error,#ef4444)">
                     <span class="material-icons-round" style="font-size:14px">delete</span>

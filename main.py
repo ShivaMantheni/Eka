@@ -1847,6 +1847,19 @@ def create_dut(request: Request, dut_data: dict, db: Session = Depends(get_db)):
         if not re.match(ip_pattern, ip_address):
             raise HTTPException(status_code=400, detail="Invalid IP address. Must be valid IPv4 format (e.g., 192.168.1.100). No subnet mask allowed.")
 
+        # DUPLICATE CHECK: device name must be unique within the session.
+        # The Postgres `duts` table was created without the model's
+        # UniqueConstraint('session_id','name'), so enforce it explicitly here.
+        existing = db.query(DUT).filter(
+            DUT.session_id == session_id,
+            DUT.name == name,
+        ).first()
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A device named '{name}' already exists. Device names must be unique.",
+            )
+
         connection_type = dut_data.get("connection_type", "ssh")
 
         dut = DUT(
@@ -1874,6 +1887,10 @@ def create_dut(request: Request, dut_data: dict, db: Session = Depends(get_db)):
         db.commit()
 
         return {"id": dut.id, "name": dut.name, "status": "created"}
+    except HTTPException:
+        # Validation / duplicate errors carry their own status + message — don't re-wrap
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
@@ -1902,6 +1919,19 @@ def update_dut(dut_id: int, request: Request, dut_data: dict, db: Session = Depe
             if not re.match(r'^[A-Za-z0-9]+$', name):
                 raise HTTPException(status_code=400, detail="Device name must contain only letters (A-Z, a-z) and numbers (0-9). No special characters or spaces allowed.")
             dut_data['name'] = name  # Update with trimmed value
+
+            # DUPLICATE CHECK: renaming must not collide with another device in this session
+            if name != dut.name:
+                clash = db.query(DUT).filter(
+                    DUT.session_id == dut.session_id,
+                    DUT.name == name,
+                    DUT.id != dut_id,
+                ).first()
+                if clash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"A device named '{name}' already exists. Device names must be unique.",
+                    )
 
         # VALIDATION: IP address must be valid IPv4 format
         if 'ip_address' in dut_data:
@@ -1936,6 +1966,10 @@ def update_dut(dut_id: int, request: Request, dut_data: dict, db: Session = Depe
             "credentials_changed": creds_changed and dut.device_type in ['DUT', 'Switch', 'Router']
         }
         return result
+    except HTTPException:
+        # Validation / duplicate errors carry their own status + message — don't re-wrap
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
@@ -6556,11 +6590,36 @@ def get_execution_job(job_id: int, request: Request, db: Session = Depends(get_d
         raise HTTPException(status_code=404, detail="Job not found")
     executions = (db.query(Execution).filter(Execution.job_id == job_id)
                   .order_by(Execution.created_at.desc()).all())
-    execs_data = [{
-        "id": e.id, "name": e.name, "status": e.status,
-        "start_time": e.start_time.isoformat() if e.start_time else None,
-        "end_time": e.end_time.isoformat() if e.end_time else None,
-    } for e in executions]
+    execs_data = []
+    for e in executions:
+        # BF-11: Aggregate per-script results so the UI can restore the live
+        # results panel when switching back to a completed/failed job.
+        tcrs = (db.query(TestCaseResult)
+                .filter(TestCaseResult.execution_id == e.id).all())
+        script_map = {}
+        for t in tcrs:
+            stem = os.path.basename(t.script_path or "").replace(".py", "") or "unknown"
+            if stem not in script_map:
+                script_map[stem] = {"passed": 0, "failed": 0, "skipped": 0,
+                                    "duration_s": 0, "status": "running",
+                                    "script_stem": stem}
+            r = (t.result or "").upper()
+            if r in ("PASS", "PASSED"):
+                script_map[stem]["passed"] += 1
+            elif r in ("FAIL", "FAILED", "ERROR"):
+                script_map[stem]["failed"] += 1
+            else:
+                script_map[stem]["skipped"] += 1
+            script_map[stem]["duration_s"] += t.time_seconds or 0
+        # Mark each script's final status
+        for s in script_map.values():
+            s["status"] = "failed" if s["failed"] > 0 else "passed"
+        execs_data.append({
+            "id": e.id, "name": e.name, "status": e.status,
+            "start_time": e.start_time.isoformat() if e.start_time else None,
+            "end_time": e.end_time.isoformat() if e.end_time else None,
+            "script_results": list(script_map.values()),
+        })
     next_run = None
     ap_id = f"exec_job_{job.id}"
     try:
@@ -6640,15 +6699,23 @@ def delete_execution_job(job_id: int, request: Request, db: Session = Depends(ge
 @app.get("/api/execution-jobs/{job_id}/conflicts")
 def check_job_conflicts(job_id: int, request: Request, dut_ids: str = "",
                         db: Session = Depends(get_db)):
-    """Check if any requested DUT ids are locked by a DIFFERENT active job.
+    """Check if any requested DUT ids conflict with another job.
+
+    Two conflict types are detected:
+    - runtime:  DUTLock is non-AVAILABLE (device physically locked by an active execution)
+    - planning: DUT appears in another active/idle/running job's dut_ids selection
 
     Query param: dut_ids — comma-separated list of DUT ids.
-    Returns: [{dut_id, dut_name, conflicting_job_id, conflicting_job_name}]
+    Returns: [{dut_id, dut_name, conflicting_job_id, conflicting_job_name, conflict_type}]
     """
+    session_id = request.headers.get("X-Session-ID", "default")
     if not dut_ids.strip():
         return {"conflicts": []}
     requested = [int(x) for x in dut_ids.split(",") if x.strip().isdigit()]
     conflicts = []
+    seen_duts = set()  # avoid duplicate entries per DUT
+
+    # ── Pass 1: runtime locks (execution actively running) ──────────────────
     for did in requested:
         lock = db.query(DUTLock).filter(
             DUTLock.dut_id == did,
@@ -6665,7 +6732,39 @@ def check_job_conflicts(job_id: int, request: Request, dut_ids: str = "",
                 "dut_name":             dut.name if dut else str(did),
                 "conflicting_job_id":   lock.job_id,
                 "conflicting_job_name": owner_job.name if owner_job else f"Job {lock.job_id}",
+                "conflict_type":        "runtime",
             })
+            seen_duts.add(did)
+
+    # ── Pass 2: planning-level overlap (DUT selected in another job's dut_ids) ─
+    other_jobs = (db.query(ExecutionJob)
+                  .filter(
+                      ExecutionJob.session_id == session_id,
+                      ExecutionJob.id != job_id,
+                      ExecutionJob.status.notin_(["completed", "failed"]),
+                      ExecutionJob.dut_ids != None,
+                      ExecutionJob.dut_ids != "[]",
+                  ).all())
+    for did in requested:
+        if did in seen_duts:
+            continue  # already reported as runtime conflict
+        for other in other_jobs:
+            try:
+                other_duts = json.loads(other.dut_ids or "[]")
+            except Exception:
+                continue
+            if did in [int(x) for x in other_duts]:
+                dut = db.query(DUT).filter(DUT.id == did).first()
+                conflicts.append({
+                    "dut_id":               did,
+                    "dut_name":             dut.name if dut else str(did),
+                    "conflicting_job_id":   other.id,
+                    "conflicting_job_name": other.name,
+                    "conflict_type":        "planning",
+                })
+                seen_duts.add(did)
+                break  # report the first conflicting job only
+
     return {"conflicts": conflicts}
 
 

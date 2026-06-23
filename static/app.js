@@ -1340,6 +1340,7 @@ let scriptsData = [];
 let activeJobId   = null;   // currently-active job id
 let activeJobList = [];     // [{id, name, status, execution_count}]
 let _jobSaveTimer = null;   // debounce handle for auto-save
+let _jobStatusSnapshot = {}; // BF-10: {jobId: status} — detects background job state changes
 
 
 function renderSpyVMs() {
@@ -1376,6 +1377,8 @@ async function loadJobs() {
         if (!res.ok) return;
         const data = await res.json();
         activeJobList = data.jobs || [];
+        // BF-10: Seed snapshot so first sweep doesn't toast stale status changes
+        activeJobList.forEach(j => { _jobStatusSnapshot[j.id] = j.status; });
         renderJobDropdown();
     } catch (_) {}
 }
@@ -1424,6 +1427,79 @@ async function createJob() {
     }
 }
 
+// BF-13: Derive live-results row stems from an execution's script_results
+// (preferred — reflects actual run) or the job's saved scripts (fallback).
+function _jobScriptStems(latestExec, jobScripts) {
+    const sr = (latestExec && latestExec.script_results) || [];
+    if (sr.length > 0) return sr.map(r => r.script_stem);
+    return (jobScripts || []).map(s => (s.path || s).split('/').pop().replace(/\.py$/, ''));
+}
+
+// BF-13: Single source of truth for the execution viewer. Fully resets the
+// global execution display (logs, queue panel, live results, run buttons) and
+// restores it from the given job's latest execution. Called by both switchJob()
+// and _pollActiveJob() so the viewer is always a clean function of the selected
+// job — no stale logs or half-restored state leaking across jobs.
+function _syncExecutionView(latestExec, jobScripts) {
+    // 1. Tear down any connection/polling from the previously-viewed execution
+    if (ws) { ws.close(); ws = null; }
+    stopQueuePolling();
+
+    // 2. Always clear the logs panel — stale lines from another job must not linger
+    allLogs = [];
+    logStreams = {};
+    renderLogs();
+
+    // 3. Reset run-specific ancillary controls
+    ['btn-add-scripts-exec', 'btn-show-only-running', 'btn-download-logs'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    });
+    const qPanel      = document.getElementById('queue-status-panel');
+    const jobHtmlBtn  = document.getElementById('btn-job-html');
+    const jobExcelBtn = document.getElementById('btn-job-excel');
+    const startBtn    = document.getElementById('btn-start-exec');
+    const stopBtn     = document.getElementById('btn-stop-exec');
+
+    currentExecId      = latestExec ? latestExec.id : null;
+    _jobPollLastExecId = currentExecId;
+
+    if (latestExec && (latestExec.status === 'running' || latestExec.status === 'pending')) {
+        // Active execution — stream live (logs via WS, queue panel, live results)
+        if (startBtn)    startBtn.style.display    = 'none';
+        if (stopBtn)     stopBtn.style.display     = '';
+        if (jobHtmlBtn)  jobHtmlBtn.style.display  = 'none';
+        if (jobExcelBtn) jobExcelBtn.style.display = 'none';
+        const stems = _jobScriptStems(latestExec, jobScripts);
+        if (stems.length) {
+            showLiveResultsPanel(stems.map(s => `${s}.py`));
+            // Replay any scripts that already finished before we connected
+            (latestExec.script_results || []).forEach(r => updateLiveResults(r));
+        } else {
+            hideLiveResultsPanel();
+        }
+        if (qPanel) qPanel.style.display = '';
+        startQueuePolling(currentExecId);
+        connectWS(currentExecId);
+    } else if (latestExec) {
+        // Completed/failed — restore per-script rows + job report buttons
+        if (startBtn)    startBtn.style.display    = '';
+        if (stopBtn)     stopBtn.style.display     = 'none';
+        if (jobHtmlBtn)  jobHtmlBtn.style.display  = '';
+        if (jobExcelBtn) jobExcelBtn.style.display = '';
+        if (qPanel) qPanel.style.display = 'none';
+        _restoreLiveResultsPanel(latestExec, jobScripts);
+    } else {
+        // No executions yet — fresh idle state
+        if (startBtn)    startBtn.style.display    = '';
+        if (stopBtn)     stopBtn.style.display     = 'none';
+        if (jobHtmlBtn)  jobHtmlBtn.style.display  = 'none';
+        if (jobExcelBtn) jobExcelBtn.style.display = 'none';
+        if (qPanel) qPanel.style.display = 'none';
+        hideLiveResultsPanel();
+    }
+}
+
 async function switchJob(newId) {
     if (!newId) return;
     // Save current job state first
@@ -1463,9 +1539,27 @@ async function switchJob(newId) {
         renderDUTChecklist();
         renderTopologyCanvas();
         updateDUTMultiSelectText();
-        updateScriptMultiSelectText();
         renderJobDropdown();
         _renderNextRunLabel(data);
+
+        // BF-14: Rebuild the Categories & Scripts panel for this job.
+        // Always reset first so the previous job's folders/scripts never linger.
+        _resetScriptPanel();
+        const vmSel = document.getElementById('spy-vm-select');
+        const hostId = vmSel ? parseInt(vmSel.value) || null : null;
+        if (activeBasePath && hostId) {
+            // Job has a saved path + VM — reload its folders/scripts silently.
+            // Restored selectedScriptPaths get re-checked where visible.
+            navigateToPath('', true);
+        } else {
+            // Fresh job — leave the panel empty
+            updateScriptMultiSelectText();
+        }
+
+        // BF-13: Restore the entire execution viewer from this job's latest run
+        const latestExec = data.executions && data.executions.length > 0 ? data.executions[0] : null;
+        _syncExecutionView(latestExec, data.scripts);
+
         toast(`Switched to ${data.name}`, 'info', 2000);
     } catch (e) {
         toast('Failed to switch job: ' + e.message, 'error');
@@ -1553,10 +1647,13 @@ async function checkDUTConflicts(dutIds) {
         const banner = document.getElementById('conflict-banner');
         if (!banner) return;
         if (data.conflicts && data.conflicts.length > 0) {
-            const msgs = data.conflicts.map(c =>
-                `<strong>${esc(c.dut_name)}</strong> is used by ${esc(c.conflicting_job_name)}`
-            );
-            banner.innerHTML = `<span class="material-icons-round" style="font-size:14px">warning</span> ${msgs.join(', ')} &nbsp;<span style="cursor:pointer;opacity:0.6" onclick="this.parentElement.classList.remove('visible')">✕</span>`;
+            const msgs = data.conflicts.map(c => {
+                const label = c.conflict_type === 'runtime'
+                    ? `<strong>${esc(c.dut_name)}</strong> is currently locked by <strong>${esc(c.conflicting_job_name)}</strong> (execution running)`
+                    : `<strong>${esc(c.dut_name)}</strong> is already selected in <strong>${esc(c.conflicting_job_name)}</strong>`;
+                return label;
+            });
+            banner.innerHTML = `<span class="material-icons-round" style="font-size:14px">warning</span> ${msgs.join(' &bull; ')} &nbsp;<span style="cursor:pointer;opacity:0.6" onclick="this.parentElement.classList.remove('visible')">✕</span>`;
             banner.classList.add('visible');
         } else {
             banner.classList.remove('visible');
@@ -1576,7 +1673,26 @@ function _updateJobStatusBadge(status) {
     badge.className = `job-status-badge ${status}`;
     const job = activeJobList.find(j => j.id === activeJobId);
     if (job) job.status = status;
+    const resetBtn = document.getElementById('btn-reset-job');
+    if (resetBtn) resetBtn.style.display = status === 'running' ? '' : 'none';
     renderJobDropdown();
+}
+
+async function resetJobToIdle() {
+    if (!activeJobId) return;
+    if (!confirm('Reset this job back to idle? Use this only if the job is stuck.')) return;
+    try {
+        const res = await fetch(`${API}/api/execution-jobs/${activeJobId}`, {
+            method: 'PUT',
+            headers: { ...getSessionHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'idle' }),
+        });
+        if (!res.ok) throw new Error((await res.json()).detail || 'Reset failed');
+        _updateJobStatusBadge('idle');
+        toast('Job reset to idle', 'success');
+    } catch (e) {
+        toast(`Reset failed: ${e.message}`, 'error');
+    }
 }
 
 // ── Job Scheduler UI ─────────────────────────────────────────────────────────
@@ -1659,6 +1775,9 @@ function onCronPresetChange() {
 
 async function saveSchedule() {
     if (!activeJobId) return;
+    // Flush current state immediately before registering the schedule so the
+    // scheduler always reads up-to-date scripts, host_id, and base_path from DB.
+    await saveJobState(true);
     const type = document.querySelector('input[name="sched-type"]:checked')?.value || 'none';
     const body = { schedule_type: type, enabled: true };
 
@@ -1751,24 +1870,53 @@ async function _pollActiveJob() {
         _updateJobStatusBadge(data.status);
         _renderNextRunLabel(data);
 
-        if (data.status === 'running' && data.executions && data.executions.length > 0) {
+        if (data.executions && data.executions.length > 0) {
             const latestExec = data.executions[0]; // most recent first
-            // Only connect if this is a new execution we didn't start manually
-            if (latestExec.id !== currentExecId && latestExec.id !== _jobPollLastExecId
-                    && latestExec.status === 'running') {
-                _jobPollLastExecId = latestExec.id;
-                currentExecId = latestExec.id;
-                allLogs = [];
-                logStreams = {};
-                renderLogs();
-                // Show stop / hide start
-                document.getElementById('btn-start-exec').style.display = 'none';
-                document.getElementById('btn-stop-exec').style.display = '';
-                startQueuePolling(currentExecId);
-                connectWS(currentExecId);
-                toast(`Scheduled run started — Execution #${currentExecId}`, 'info');
+            // A new execution we haven't wired up yet (e.g. a scheduled run that
+            // started on the job currently being viewed).
+            if (latestExec.id !== currentExecId && latestExec.id !== _jobPollLastExecId) {
+                if (latestExec.status === 'running' || latestExec.status === 'pending') {
+                    // BF-13: restore the full viewer (logs + queue + live results)
+                    _syncExecutionView(latestExec, data.scripts);
+                    toast(`Scheduled run started — Execution #${latestExec.id}`, 'info');
+                } else if (latestExec.status === 'failed') {
+                    // Execution failed before we could connect (e.g., SSH error)
+                    _jobPollLastExecId = latestExec.id;
+                    toast(`Scheduled run #${latestExec.id} failed — check Logs tab for details`, 'error');
+                }
             }
         }
+    } catch (_) {}
+
+    // BF-10: Sweep all background jobs for status changes
+    _sweepBackgroundJobs();
+}
+
+async function _sweepBackgroundJobs() {
+    if (activeJobList.length <= 1) return;
+    try {
+        const res = await fetch(`${API}/api/execution-jobs`, { headers: getSessionHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        const jobs = data.jobs || [];
+        jobs.forEach(j => {
+            if (j.id === activeJobId) return; // active job handled by main poller
+            const prev = _jobStatusSnapshot[j.id];
+            if (prev !== undefined && prev !== j.status) {
+                // Status changed on a background job — notify the user
+                if (j.status === 'running') {
+                    toast(`Job "${j.name}" started (scheduled run)`, 'info');
+                } else if (j.status === 'completed') {
+                    toast(`Job "${j.name}" completed`, 'success');
+                } else if (j.status === 'failed') {
+                    toast(`Job "${j.name}" failed — switch to it for details`, 'error');
+                }
+            }
+            _jobStatusSnapshot[j.id] = j.status;
+        });
+        // Update the dropdown badges for all jobs so status colours stay current
+        activeJobList = jobs;
+        renderJobDropdown();
     } catch (_) {}
 }
 
@@ -1855,6 +2003,8 @@ async function onSpyVMChange() {
     if (scriptsEl2)    scriptsEl2.innerHTML    = '<p class="muted" style="padding:8px;font-size:12px;margin:0">Enter a path above and click Load.</p>';
 
     updateSpyStartBtn();
+    // Persist the new VM selection (and the cleared script/path state) to the job record
+    saveJobState();
 }
 
 // ============================================================
@@ -1876,11 +2026,32 @@ function loadScriptsFromPath() {
     navigateToPath('');
 }
 
+// BF-14: Reset the "Categories & Scripts" panel to its fresh, empty state.
+// Clears the global script data plus the subfolders list, script dropdown,
+// breadcrumb and counts so no stale content leaks across a job switch.
+function _resetScriptPanel() {
+    scriptsData = [];
+    currentFolderPath = '';
+    const subfoldersEl = document.getElementById('subfolders-list');
+    if (subfoldersEl) subfoldersEl.innerHTML = '<p class="muted" style="padding:8px;font-size:12px;margin:0">Enter a path above and click Load.</p>';
+    const scriptsEl = document.getElementById('script-dropdown-list');
+    if (scriptsEl) scriptsEl.innerHTML = '<p class="muted" style="padding:8px;font-size:12px;margin:0">Enter a path above and click Load.</p>';
+    updateBreadcrumb('');
+    const subfolderCountEl = document.getElementById('subfolder-count');
+    if (subfolderCountEl) subfolderCountEl.textContent = '0';
+    const scriptsCountEl = document.getElementById('scripts-count');
+    if (scriptsCountEl) scriptsCountEl.textContent = '0';
+    const inspector = document.getElementById('script-inspector');
+    if (inspector) inspector.style.display = 'none';
+    updateScriptMultiSelectText();
+}
+
 /**
  * Navigate to a specific folder path and load its contents
  * @param {string} path - Relative path from tests directory (empty string for root)
+ * @param {boolean} silent - Suppress the success toast (used when restoring a job)
  */
-async function navigateToPath(path) {
+async function navigateToPath(path, silent) {
     console.log(`Navigating to path: "${path}"`);
     const vmId = document.getElementById('spy-vm-select').value;
 
@@ -1950,8 +2121,10 @@ async function navigateToPath(path) {
         document.getElementById('scripts-count').textContent = data.script_count || 0;
 
         // Show toast
-        const pathDisplay = path || 'root';
-        toast(`Loaded ${data.subfolder_count} folders, ${data.script_count} scripts from ${pathDisplay}`, 'success');
+        if (!silent) {
+            const pathDisplay = path || 'root';
+            toast(`Loaded ${data.subfolder_count} folders, ${data.script_count} scripts from ${pathDisplay}`, 'success');
+        }
 
     } catch (e) {
         console.error('Error in navigateToPath:', e);
@@ -2092,6 +2265,7 @@ function onScriptCheckboxChange(scriptPath, cb) {
             inspector.style.display = 'none';
         }
     }
+    saveJobState();
 }
 
 function toggleAllScripts(cb) {
@@ -2103,6 +2277,7 @@ function toggleAllScripts(cb) {
     });
     updateScriptMultiSelectText();
     updateSpyStartBtn();
+    saveJobState();
 }
 
 function updateScriptMultiSelectText() {
@@ -2387,6 +2562,14 @@ async function startExecution() {
         const data = await res.json();
         currentExecId = data.execution_id;
         _updateJobStatusBadge('running');
+        // Persist the testbed path so the scheduler can reuse it next time
+        if (activeJobId && generatedTestbedPath) {
+            fetch(`${API}/api/execution-jobs/${activeJobId}`, {
+                method: 'PUT',
+                headers: getSessionHeaders(),
+                body: JSON.stringify({ testbed_path: generatedTestbedPath }),
+            }).catch(() => {});
+        }
         allLogs = [];
         logStreams = {};
         renderLogs();
@@ -2534,6 +2717,31 @@ function showLiveResultsPanel(scriptPaths) {
 function hideLiveResultsPanel() {
     const panel = document.getElementById('live-results-panel');
     if (panel) panel.style.display = 'none';
+}
+
+// BF-11: Restore live results panel from a completed/failed execution's script_results.
+// scriptResults — array of {script_stem, passed, failed, skipped, duration_s, status}
+// from get_execution_job's execs_data[].script_results
+function _restoreLiveResultsPanel(latestExec, jobScripts) {
+    const scriptResults = latestExec.script_results || [];
+    // Build path list: prefer script_results order; fall back to job's saved scripts
+    const stems = scriptResults.length > 0
+        ? scriptResults.map(r => r.script_stem)
+        : (jobScripts || []).map(s => (s.path || s).split('/').pop().replace(/\.py$/, ''));
+
+    if (stems.length === 0) { hideLiveResultsPanel(); return; }
+
+    // Use showLiveResultsPanel to initialise the table rows
+    showLiveResultsPanel(stems.map(stem => `${stem}.py`));
+
+    // Replay each result row
+    scriptResults.forEach(r => updateLiveResults(r));
+
+    // Enable download buttons (execution already completed)
+    const btnHtml = document.getElementById('btn-dl-html');
+    const btnXls  = document.getElementById('btn-dl-excel');
+    if (btnHtml) btnHtml.disabled = false;
+    if (btnXls)  btnXls.disabled  = false;
 }
 
 function updateLiveResults(data) {
