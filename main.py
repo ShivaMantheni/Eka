@@ -151,6 +151,7 @@ class DUT(Base):
     connection_type = Column(String(10), default="ssh")  # 'ssh' or 'telnet'
     status = Column(String(20), default="offline")
     xml_path = Column(String(500), default="/home/hp/prajwal/VMs")  # Per-device XML path for VS definitions
+    interfaces = Column(Text, nullable=True)  # JSON list of last-fetched interfaces (per-device, survives reload)
     session_id = Column(String(255), nullable=True, index=True)  # Session-based isolation
     last_heartbeat = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -430,6 +431,16 @@ def _apply_column_migrations():
                     conn.execute(text(
                         f"ALTER TABLE execution_jobs ADD COLUMN IF NOT EXISTS {col_name} {col_def};"
                     ))
+            # Per-device interface cache on duts
+            if dialect == "sqlite":
+                try:
+                    conn.execute(text("ALTER TABLE duts ADD COLUMN interfaces TEXT;"))
+                except Exception:
+                    pass
+            else:
+                conn.execute(text(
+                    "ALTER TABLE duts ADD COLUMN IF NOT EXISTS interfaces TEXT;"
+                ))
             conn.commit()
         except Exception as _e:
             logger.warning(f"[Startup] Column migration warning (safe to ignore if columns exist): {_e}")
@@ -1785,6 +1796,8 @@ def get_duts(request: Request, db: Session = Depends(get_db)):
             "device_type": d.device_type,
             "username": d.username,
             "connection_type": getattr(d, 'connection_type', 'ssh'),  # Default to ssh if not set
+            "xml_path": d.xml_path,  # Needed so the edit modal shows the saved path, not the default
+            "interfaces": json.loads(d.interfaces) if getattr(d, 'interfaces', None) else [],  # Per-device cache
             "status": d.status,
             "last_heartbeat": d.last_heartbeat.isoformat() if d.last_heartbeat else None,
             "created_at": d.created_at.isoformat() if d.created_at else None,
@@ -1814,6 +1827,8 @@ def get_dut(dut_id: int, request: Request, db: Session = Depends(get_db)):
         "port": dut.port,
         "device_type": dut.device_type,
         "username": dut.username,
+        "connection_type": getattr(dut, 'connection_type', 'ssh'),
+        "xml_path": dut.xml_path,
         "status": dut.status,
         "static_ip": config.static_ip if config else None,
         "image_path": config.image_path if config else None,
@@ -2198,6 +2213,10 @@ def get_dut_interfaces(dut_id: int, db: Session = Depends(get_db)):
         # Update device status to online since SSH connection succeeded
         dut.status = "online"
         dut.last_heartbeat = datetime.utcnow()
+        # Persist the fetched interfaces so they survive page reloads and are
+        # shown per-device (instead of every device falling back to defaults)
+        if interfaces:
+            dut.interfaces = json.dumps(interfaces)
         db.commit()
 
         logger.info(f"Fetched {len(interfaces)} interfaces from {dut.name} (type: {dut.device_type})")

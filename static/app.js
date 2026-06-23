@@ -757,6 +757,11 @@ async function loadDUTs() {
         });
         if (!res.ok) throw new Error(`Server returned ${res.status}: ${res.statusText}`);
         dutsData = await res.json();
+        // Seed the per-device interface cache from persisted data so each device
+        // shows its own real interfaces after reload (not the shared defaults)
+        dutsData.forEach(d => {
+            if (d.interfaces && d.interfaces.length > 0) dutInterfaces[d.id] = d.interfaces;
+        });
         renderDUTsTable();
         renderDUTChecklist();   // was renderExecDUTList (undefined)
         renderTermDUTList();
