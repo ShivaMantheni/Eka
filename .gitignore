@@ -32,3 +32,12 @@ spotlight_*.png
 
 # Docker volumes (local dev)
 postgres_data/
+
+# Runtime / process files
+eka.pid
+
+# Claude Code local session files
+.claude/
+
+# Filesystem temp files
+.fuse_hidden*
