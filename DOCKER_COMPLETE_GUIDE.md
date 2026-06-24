@@ -3620,3 +3620,262 @@ docker run mysql
 3. Learn about Docker Swarm or Kubernetes for production
 
 Happy Dockerizing! 🐳
+
+---
+
+---
+
+# 🚀 Eka Automation — Docker Operations Guide
+
+> Everything specific to running, managing, and debugging the Eka app in Docker.
+
+---
+
+## 1. How Many Containers Does Eka Use?
+
+Currently **one container**:
+
+| Name | Image | Port | Purpose |
+|------|-------|------|---------|
+| `eka` | `eka-automation:latest` | `0.0.0.0:8000 → 8000` | Full Eka app (FastAPI + uvicorn) |
+
+Check running containers at any time:
+```bash
+docker ps
+```
+
+Check all containers (including stopped):
+```bash
+docker ps -a
+```
+
+---
+
+## 2. How It Works — Architecture
+
+```
+Browser  →  http://172.26.1.126:8000
+                     │
+              Docker host (ekaapp)
+                     │
+         ┌───────────▼────────────┐
+         │  Container: eka        │
+         │  port 8000 (inside)    │
+         │                        │
+         │  run_migrations.py     │  ← runs on every start
+         │       │                │
+         │  uvicorn main:app      │  ← FastAPI app
+         │  --workers 2           │
+         └───────────┬────────────┘
+                     │  host.docker.internal
+                     ▼
+          PostgreSQL on host :5432
+          DB: eka_automation
+          User: eka_user
+```
+
+**What happens when the container starts:**
+1. `run_migrations.py` runs — creates/updates DB tables
+2. `uvicorn main:app` starts with 2 workers on port 8000
+3. Health check hits `/health` every 30s — container marked `(healthy)` when it passes
+4. App is accessible at `http://172.26.1.126:8000`
+
+**Why `host.docker.internal`?**
+PostgreSQL runs on the host machine (not inside Docker). The container uses `--add-host=host.docker.internal:host-gateway` to reach it via `172.17.0.1` (Docker bridge gateway).
+
+---
+
+## 3. Run & Stop
+
+### Start the container
+```bash
+docker start eka
+```
+
+### Stop the container
+```bash
+docker stop eka
+```
+
+### Restart the container
+```bash
+docker restart eka
+```
+
+### Check if it's running
+```bash
+docker ps
+```
+
+### Check health status
+```bash
+docker inspect --format='{{.State.Health.Status}}' eka
+```
+
+### Run from scratch (first time or after rm)
+```bash
+docker run -d -p 8000:8000 --name eka \
+  --restart=unless-stopped \
+  --add-host=host.docker.internal:host-gateway \
+  -e DATABASE_URL="postgresql://eka_user:eka_secret_change_me@host.docker.internal:5432/eka_automation" \
+  eka-automation:latest
+```
+
+### Auto-restart on server reboot
+The `--restart=unless-stopped` flag is set — Docker will automatically restart the container after a reboot unless you explicitly stopped it.
+
+---
+
+## 4. Build a New Docker Image
+
+Run this from the `~/Eka` directory:
+
+```bash
+docker build -t eka-automation:latest .
+```
+
+**After building, recreate the container to use the new image:**
+```bash
+docker rm -f eka && docker run -d -p 8000:8000 --name eka \
+  --restart=unless-stopped \
+  --add-host=host.docker.internal:host-gateway \
+  -e DATABASE_URL="postgresql://eka_user:eka_secret_change_me@host.docker.internal:5432/eka_automation" \
+  eka-automation:latest
+```
+
+**Tag a specific version (recommended before deploying):**
+```bash
+docker build -t eka-automation:v3.2 -t eka-automation:latest .
+```
+
+**List all built images:**
+```bash
+docker images | grep eka
+```
+
+**Remove old/unused images:**
+```bash
+docker image prune -f
+```
+
+---
+
+## 5. Debug Issues
+
+### View live logs
+```bash
+docker logs eka
+```
+
+### Follow logs in real time (like tail -f)
+```bash
+docker logs -f eka
+```
+
+### View last 50 lines only
+```bash
+docker logs --tail 50 eka
+```
+
+### Get a shell inside the running container
+```bash
+docker exec -it eka bash
+```
+
+### Check container resource usage (CPU / memory)
+```bash
+docker stats eka
+```
+
+### Inspect full container config
+```bash
+docker inspect eka
+```
+
+### Check why a container exited
+```bash
+docker logs eka 2>&1 | tail -30
+docker inspect --format='{{.State.ExitCode}} {{.State.Error}}' eka
+```
+
+### Test DB connection from inside container
+```bash
+docker exec -it eka python3 -c "
+import psycopg2, os
+conn = psycopg2.connect(os.environ['DATABASE_URL'])
+print('DB connection OK:', conn.get_dsn_parameters())
+conn.close()
+"
+```
+
+### Test if app is responding
+```bash
+curl http://172.26.1.126:8000/health
+```
+
+---
+
+## 6. Common Problems & Fixes
+
+| Problem | Symptom | Fix |
+|---------|---------|-----|
+| Container exits immediately | `docker ps` shows nothing | `docker logs eka` to see the error |
+| Port already in use | `bind: address already in use` | `pkill -f "uvicorn main:app"` then restart |
+| DB connection refused | `psycopg2.OperationalError` in logs | Check PostgreSQL is running: `pg_isready -h localhost` |
+| DB rejects Docker connection | `Connection refused` from `172.17.0.1` | Ensure `listen_addresses = '*'` in `postgresql.conf` and `172.17.0.0/16 md5` in `pg_hba.conf` |
+| App works but shows old code | Built image not updated | `docker build` then `docker rm -f eka` and `docker run` again |
+| Container keeps restarting | `Restarting` in `docker ps` | `docker logs eka` — usually a startup crash |
+| `AUTOINCREMENT` migration error | Migration 002/003 fails | Non-fatal if tables already exist; fixed in code (uses `SERIAL` for PostgreSQL) |
+
+---
+
+## 7. Full Deployment Checklist
+
+Use this when deploying a new version:
+
+```bash
+# 1. Pull latest code
+cd ~/Eka && git pull origin master
+
+# 2. Build new image
+docker build -t eka-automation:latest .
+
+# 3. Stop and remove old container
+docker rm -f eka
+
+# 4. Start new container
+docker run -d -p 8000:8000 --name eka \
+  --restart=unless-stopped \
+  --add-host=host.docker.internal:host-gateway \
+  -e DATABASE_URL="postgresql://eka_user:eka_secret_change_me@host.docker.internal:5432/eka_automation" \
+  eka-automation:latest
+
+# 5. Verify it started
+sleep 5 && docker ps && curl http://172.26.1.126:8000/health
+
+# 6. Watch logs for errors
+docker logs -f eka
+```
+
+---
+
+## 8. PostgreSQL Access for Docker (One-Time Setup)
+
+If moving to a new server, PostgreSQL must allow Docker connections:
+
+```bash
+# 1. Allow PostgreSQL to listen on all interfaces
+sudo sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" \
+  /etc/postgresql/*/main/postgresql.conf
+
+# 2. Allow Docker subnet
+echo "host  eka_automation  eka_user  172.17.0.0/16  md5" | \
+  sudo tee -a /etc/postgresql/*/main/pg_hba.conf
+
+# 3. Restart PostgreSQL
+sudo systemctl restart postgresql
+
+# 4. Verify
+sudo ss -tlnp | grep 5432
+# Should show 0.0.0.0:5432
+```
