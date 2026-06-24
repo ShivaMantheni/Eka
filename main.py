@@ -4139,11 +4139,10 @@ def update_vs_image(body: dict, db: Session = Depends(get_db)):
     dut_id = body.get("dut_id")
     vs_name = body.get("vs_name", "").strip()
     source_image = body.get("source_image_path", VS_SOURCE_IMAGE).strip()
-    target_image_name = body.get("target_image_name", "").strip()
     source_server_id = body.get("source_server_id")  # Optional: for remote SFTP copy
 
     # DEBUG: Log what we received
-    logger.info(f"[VS UPDATE API] Received request: vs_name='{vs_name}', target_image_name='{target_image_name}'")
+    logger.info(f"[VS UPDATE API] Received request: vs_name='{vs_name}'")
 
     if not dut_id or not vs_name:
         raise HTTPException(status_code=400, detail="dut_id and vs_name are required")
@@ -4159,14 +4158,10 @@ def update_vs_image(body: dict, db: Session = Depends(get_db)):
         if not source_server:
             raise HTTPException(status_code=404, detail="Source server not found")
 
-    # If no target image name given, use the VS name as the image file name
-    if not target_image_name:
-        target_image_name = f"{vs_name}.img"
-
     # Use device-specific XML path (default: /home/hp/prajwal/VMs)
     xml_path = dut.xml_path or "/home/hp/prajwal/VMs"
     xml_full_path = f"{xml_path}/{vs_name}.xml"
-    target_image_path = f"{VS_IMAGES_PATH}{target_image_name}"
+    # target_image_path resolved dynamically from the XML on the remote host
 
     # Create an execution record for logging
     execution = Execution(
@@ -4182,7 +4177,7 @@ def update_vs_image(body: dict, db: Session = Depends(get_db)):
     # Run in background thread - pass IDs instead of ORM objects to avoid session issues
     thread = Thread(
         target=_run_vs_update,
-        args=(execution.id, dut_id, vs_name, xml_full_path, source_image, target_image_path, source_server_id),
+        args=(execution.id, dut_id, vs_name, xml_full_path, source_image, None, source_server_id),
         daemon=True,
     )
     thread.start()
@@ -4309,38 +4304,53 @@ def _run_vs_batch_update(
             all_success = True
             for idx, entry in enumerate(vs_entries, 1):
                 vs_name = entry.get("vs_name", "").strip()
-                per_vm_target = entry.get("target_image_name", "").strip()
                 if not vs_name:
                     continue
-
-                # Determine target image name for this VM
-                this_target_name = per_vm_target if per_vm_target else f"{vs_name}.img"
-
-                # Images directory on the remote host
-                IMAGES_DIR = "/var/lib/libvirt/images"
 
                 log_execution(db, execution_id, dut.name, "INFO", "")
                 log_execution(db, execution_id, dut.name, "INFO",
                               f"══ VM {idx}/{total}: {vs_name} ══")
                 log_execution(db, execution_id, dut.name, "INFO",
-                              f"  Target image: {this_target_name}")
-                log_execution(db, execution_id, dut.name, "INFO",
                               f"  Source image: {source_image}")
+
+                # Resolve destination image path from the VS XML on the remote host
+                xml_path = dut.xml_path or "/home/hp/prajwal/VMs"
+                xml_full_path = f"{xml_path}/{vs_name}.xml"
+                log_execution(db, execution_id, dut.name, "INFO",
+                              f"  Resolving image path from XML: {xml_full_path}")
+                extract_cmd = sudocmd(
+                    f"python3 -c \""
+                    f"import xml.etree.ElementTree as ET; "
+                    f"root = ET.parse('{xml_full_path}').getroot(); "
+                    f"matches = [d.find('source').get('file') for d in root.iter('disk') "
+                    f"if d.get('device')=='disk' and d.find('source') is not None]; "
+                    f"print(matches[0] if matches else '')\""
+                )
+                xml_out, xml_err, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+                dest_image_path = xml_out.strip()
+                if xml_rc != 0 or not dest_image_path:
+                    log_execution(db, execution_id, dut.name, "ERROR",
+                                  f"  ✗ Could not resolve image path from XML: "
+                                  f"{xml_err.strip() or 'No <disk device=disk> source found'}")
+                    all_success = False
+                    continue
+                log_execution(db, execution_id, dut.name, "INFO",
+                              f"  Resolved image path: {dest_image_path}")
 
                 # Exact 4-step sequence using correct commands:
                 # 1. virsh destroy <vs_name>           (user has libvirt group — no sudo needed)
-                # 2. sudo rm -f <IMAGES_DIR>/<image>
-                # 3. sudo cp <source> <IMAGES_DIR>/<target>
+                # 2. sudo rm -f <dest_image_path>
+                # 3. sudo cp <source> <dest_image_path>
                 # 4. virsh start <vs_name>
                 steps = [
                     ("Step 1/4: Destroying VM",
                      f"virsh destroy {vs_name}",
                      True),   # allow_fail: VM may already be stopped
                     ("Step 2/4: Removing old image",
-                     sudocmd(f"rm -f {IMAGES_DIR}/{this_target_name}"),
+                     sudocmd(f"rm -f {dest_image_path}"),
                      False),
                     ("Step 3/4: Copying new image",
-                     sudocmd(f"cp {source_image} {IMAGES_DIR}/{this_target_name}"),
+                     sudocmd(f"cp {source_image} {dest_image_path}"),
                      False),
                     ("Step 4/4: Starting VM",
                      f"virsh start {vs_name}",
@@ -4438,10 +4448,11 @@ def _run_vs_update(
     vs_name: str,
     xml_full_path: str,
     source_image: str,
-    target_image_path: str,
+    target_image_path=None,
     source_server_id=None,
 ):
     """Background thread: Full VS image update lifecycle.
+    target_image_path is resolved dynamically from the XML on the remote host.
     Supports remote image copy via SFTP when source_server_id is provided."""
     db = SessionLocal()
     execution = None
@@ -4484,7 +4495,7 @@ def _run_vs_update(
         log_execution(db, execution_id, dut.name, "INFO",
                       f"  Source image: {source_image}")
         log_execution(db, execution_id, dut.name, "INFO",
-                      f"  Target image: {target_image_path}")
+                      f"  Target image: (resolving from XML)")
         log_execution(db, execution_id, dut.name, "INFO",
                       f"  XML file: {xml_full_path}")
 
@@ -4506,6 +4517,30 @@ def _run_vs_update(
             return f"echo '{safe_pass}' | sudo -S {cmd}"
 
         try:
+            # Resolve target image path from the XML on the remote host
+            log_execution(db, execution_id, dut.name, "INFO",
+                          f"▶ Resolving image path from XML: {xml_full_path}")
+            extract_cmd = sudocmd(
+                f"python3 -c \""
+                f"import xml.etree.ElementTree as ET; "
+                f"root = ET.parse('{xml_full_path}').getroot(); "
+                f"matches = [d.find('source').get('file') for d in root.iter('disk') "
+                f"if d.get('device')=='disk' and d.find('source') is not None]; "
+                f"print(matches[0] if matches else '')\""
+            )
+            xml_out, xml_err, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+            target_image_path = xml_out.strip()
+            if xml_rc != 0 or not target_image_path:
+                log_execution(db, execution_id, dut.name, "ERROR",
+                              f"  ✗ Could not resolve image path from XML: "
+                              f"{xml_err.strip() or 'No <disk device=disk> source found'}")
+                execution.status = "failed"
+                execution.end_time = datetime.utcnow()
+                db.commit()
+                return
+            log_execution(db, execution_id, dut.name, "INFO",
+                          f"  ✓ Resolved image path: {target_image_path}")
+
             # Steps 1-2: Destroy VM and remove old image
             steps_pre_copy = [
                 ("Step 1/6: Destroying VM",
@@ -4659,66 +4694,15 @@ def _run_vs_update(
                 db.commit()
                 return
 
-            # Step 4: Update XML file to point to new image location
-            log_execution(db, execution_id, dut.name, "INFO",
-                          f"▶ Step 4/7: Updating XML to reference new image")
-            log_execution(db, execution_id, dut.name, "INFO",
-                          f"  XML file: {xml_full_path}")
-            log_execution(db, execution_id, dut.name, "INFO",
-                          f"  New image: {target_image_path}")
-
-            # First, show current XML content for debugging
-            cat_cmd = sudocmd(f"grep '<source file=' {xml_full_path}")
-            log_execution(db, execution_id, dut.name, "INFO", f"  Checking current XML content...")
-            try:
-                output, error, exit_code = ssh.execute_command(cat_cmd, timeout=10)
-                if output.strip():
-                    log_execution(db, execution_id, dut.name, "INFO", f"  Current: {output.strip()}")
-            except:
-                pass
-
-            # Use sed to replace the image path in XML file
-            # Match both single and double quotes, and both self-closing and regular tags
-            # Patterns: <source file='...' /> or <source file="..."/> or <source file='...'></source>
-            sed_cmd = sudocmd(f"sed -i 's|<source file=[\"'\"'][^\"'\"']*[\"'\"']|<source file=\"{target_image_path}\"|g' {xml_full_path}")
-            log_execution(db, execution_id, dut.name, "INFO", f"  $ {sed_cmd}")
-
-            try:
-                output, error, exit_code = ssh.execute_command(sed_cmd, timeout=30)
-                if exit_code != 0:
-                    msg = error.strip() if error.strip() else f"Exit code {exit_code}"
-                    log_execution(db, execution_id, dut.name, "ERROR",
-                                  f"  ✗ Step 4/7 FAILED: {msg}")
-                    execution.status = "failed"
-                    execution.end_time = datetime.utcnow()
-                    db.commit()
-                    return
-                else:
-                    log_execution(db, execution_id, dut.name, "INFO",
-                                  f"  ✓ Step 4/7 completed - XML updated")
-
-                    # Verify the change
-                    verify_cmd = sudocmd(f"grep '<source file=' {xml_full_path}")
-                    output, error, exit_code = ssh.execute_command(verify_cmd, timeout=10)
-                    if output.strip():
-                        log_execution(db, execution_id, dut.name, "INFO", f"  Verified: {output.strip()}")
-            except Exception as cmd_err:
-                log_execution(db, execution_id, dut.name, "ERROR",
-                              f"  ✗ Step 4/7 error: {str(cmd_err)}")
-                execution.status = "failed"
-                execution.end_time = datetime.utcnow()
-                db.commit()
-                return
-
-            # Steps 5-7: Undefine, Define, Start VM
+            # Steps 4-6: Undefine, Define, Start VM
             steps_post_copy = [
-                ("Step 5/7: Undefining VM",
+                ("Step 4/6: Undefining VM",
                  sudocmd(f"virsh undefine {vs_name}"),
                  True),   # allow_fail=True (might already be undefined)
-                ("Step 6/7: Defining VM from XML",
+                ("Step 5/6: Defining VM from XML",
                  sudocmd(f"virsh define {xml_full_path}"),
                  False),
-                ("Step 7/7: Starting VM",
+                ("Step 6/6: Starting VM",
                  sudocmd(f"virsh start {vs_name}"),
                  False),
             ]
