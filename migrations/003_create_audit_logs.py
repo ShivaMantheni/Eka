@@ -22,19 +22,27 @@ def upgrade():
     print("MIGRATION 003: Create audit_logs table")
     print("=" * 60)
 
+    dialect = engine.dialect.name  # 'sqlite' or 'postgresql'
+    if dialect == 'postgresql':
+        id_col = "id SERIAL PRIMARY KEY"
+        dt_type = "TIMESTAMP"
+    else:
+        id_col = "id INTEGER PRIMARY KEY AUTOINCREMENT"
+        dt_type = "DATETIME"
+
     with engine.connect() as conn:
         try:
             # Create audit_logs table
-            conn.execute(text("""
+            conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS audit_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    {id_col},
                     session_id VARCHAR(255),
                     user_ip VARCHAR(50),
                     action VARCHAR(100),
                     resource_type VARCHAR(50),
                     resource_id INTEGER,
                     details TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    timestamp {dt_type} DEFAULT CURRENT_TIMESTAMP
                 )
             """))
 

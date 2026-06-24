@@ -22,12 +22,20 @@ def upgrade():
     print("MIGRATION 002: Create hardware_load_jobs table")
     print("=" * 60)
 
+    dialect = engine.dialect.name  # 'sqlite' or 'postgresql'
+    if dialect == 'postgresql':
+        id_col = "id SERIAL PRIMARY KEY"
+        dt_type = "TIMESTAMP"
+    else:
+        id_col = "id INTEGER PRIMARY KEY AUTOINCREMENT"
+        dt_type = "DATETIME"
+
     with engine.connect() as conn:
         try:
             # Create hardware_load_jobs table
-            conn.execute(text("""
+            conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS hardware_load_jobs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    {id_col},
                     dut_id INTEGER NOT NULL,
                     source_server_id INTEGER,
                     image_path VARCHAR(500) NOT NULL,
@@ -40,8 +48,8 @@ def upgrade():
                     progress_percentage INTEGER DEFAULT 0,
                     execution_log TEXT DEFAULT '',
                     error_message TEXT,
-                    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    completed_at DATETIME,
+                    started_at {dt_type} DEFAULT CURRENT_TIMESTAMP,
+                    completed_at {dt_type},
                     session_id VARCHAR(255) NOT NULL,
                     FOREIGN KEY (dut_id) REFERENCES duts(id) ON DELETE CASCADE,
                     FOREIGN KEY (source_server_id) REFERENCES duts(id) ON DELETE SET NULL
