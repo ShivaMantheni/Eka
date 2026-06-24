@@ -41,8 +41,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
-    ports:
-      - "5432:5432"   # Expose for debugging (remove in production)
+    # ports:
+    #   - "5432:5432"   # Uncomment only if you need external DB access (conflicts with host PostgreSQL)
 
   # ── Core Monolith (Devices + Dashboard + Logs + Terminal) ─────────────────
   eka-core:
