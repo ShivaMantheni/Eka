@@ -414,6 +414,10 @@ class SSHConnectionPool:
                 "timestamp": time.time(),
                 "reason": reason
             })
+            # Keep only the last 50 transitions — prevents unbounded memory growth
+            # on devices that flap state frequently (network issues, reconnects).
+            if len(conn_data["state_history"]) > 50:
+                conn_data["state_history"] = conn_data["state_history"][-50:]
 
             # Phase 4: Update metrics on state transitions
             metrics = conn_data.get("metrics")

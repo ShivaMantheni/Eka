@@ -56,6 +56,8 @@ from telnet_pool import telnet_pool
 
 # APScheduler for background tasks (heartbeat checks, cleanup)
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 # Hardware Load imports
 from telnet_manager import TelnetConnectionManager
@@ -149,6 +151,7 @@ class DUT(Base):
     connection_type = Column(String(10), default="ssh")  # 'ssh' or 'telnet'
     status = Column(String(20), default="offline")
     xml_path = Column(String(500), default="/home/hp/prajwal/VMs")  # Per-device XML path for VS definitions
+    interfaces = Column(Text, nullable=True)  # JSON list of last-fetched interfaces (per-device, survives reload)
     session_id = Column(String(255), nullable=True, index=True)  # Session-based isolation
     last_heartbeat = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -212,6 +215,7 @@ class Execution(Base):
     end_time = Column(DateTime, nullable=True)
     duration_seconds = Column(Integer, nullable=True)
     test_results = Column(Text, nullable=True)   # JSON list of per-script aggregates
+    job_id       = Column(Integer, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -246,7 +250,8 @@ class DUTLock(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     dut_id = Column(Integer, nullable=False, unique=True)
     status = Column(String(20), default="AVAILABLE")   # AVAILABLE | ALLOCATED | IN_USE
-    job_id = Column(Integer, nullable=True)
+    job_id     = Column(Integer, nullable=True)
+    lock_type  = Column(String(10), default="exec")   # 'hw' or 'exec'
     locked_since = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -349,8 +354,321 @@ class AuditLog(Base):
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
 
-# Create tables
+
+class ExecutionJob(Base):
+    """Named job container linking DUT selection, topology, scripts, and executions."""
+    __tablename__ = "execution_jobs"
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    name             = Column(String(100), nullable=False, default="Job")
+    status           = Column(String(20), default="idle")   # idle|running|completed|failed
+    session_id       = Column(String(255), nullable=True, index=True)
+    dut_ids          = Column(Text, nullable=True)           # JSON array of DUT ids
+    base_path        = Column(Text, nullable=True)
+    host_id          = Column(Integer, nullable=True)
+    topology         = Column(Text, nullable=True)           # JSON canvas snapshot
+    scripts          = Column(Text, nullable=True)           # JSON array of script objects
+    testbed_path     = Column(Text, nullable=True)           # full path on VM of last-generated testbed
+    # Scheduler fields
+    schedule_type    = Column(String(10), default="none")    # none | once | cron
+    schedule_at      = Column(DateTime, nullable=True)       # UTC datetime for one-time run
+    schedule_cron    = Column(String(100), nullable=True)    # cron expression for recurring
+    schedule_enabled = Column(Boolean, default=False)
+    last_run_at      = Column(DateTime, nullable=True)       # last auto-triggered run
+    created_at       = Column(DateTime, default=datetime.utcnow)
+    updated_at       = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+# Create tables (creates new tables; existing tables are not altered here)
 Base.metadata.create_all(bind=engine)
+
+
+def _apply_column_migrations():
+    """Safely add new columns to existing tables without dropping data.
+
+    This runs on every startup and is idempotent — it uses IF NOT EXISTS /
+    try-except so it is safe to run against a DB that already has the columns.
+    """
+    with engine.connect() as conn:
+        dialect = conn.dialect.name
+        try:
+            if dialect == "sqlite":
+                try:
+                    conn.execute(text("ALTER TABLE executions ADD COLUMN job_id INTEGER;"))
+                except Exception:
+                    pass
+                try:
+                    conn.execute(text("ALTER TABLE dut_locks ADD COLUMN lock_type VARCHAR(10) DEFAULT 'exec';"))
+                except Exception:
+                    pass
+            else:
+                conn.execute(text(
+                    "ALTER TABLE executions ADD COLUMN IF NOT EXISTS job_id INTEGER "
+                    "REFERENCES execution_jobs(id) ON DELETE SET NULL;"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_executions_job_id ON executions (job_id);"
+                ))
+                conn.execute(text(
+                    "ALTER TABLE dut_locks ADD COLUMN IF NOT EXISTS lock_type VARCHAR(10) DEFAULT 'exec';"
+                ))
+            # Scheduler columns on execution_jobs
+            _sched_cols = [
+                ("schedule_type",    "VARCHAR(10) DEFAULT 'none'"),
+                ("schedule_at",      "TIMESTAMP"),
+                ("schedule_cron",    "VARCHAR(100)"),
+                ("schedule_enabled", "BOOLEAN DEFAULT FALSE"),
+                ("last_run_at",      "TIMESTAMP"),
+                ("testbed_path",     "TEXT"),
+            ]
+            for col_name, col_def in _sched_cols:
+                if dialect == "sqlite":
+                    try:
+                        conn.execute(text(
+                            f"ALTER TABLE execution_jobs ADD COLUMN {col_name} {col_def};"
+                        ))
+                    except Exception:
+                        pass
+                else:
+                    conn.execute(text(
+                        f"ALTER TABLE execution_jobs ADD COLUMN IF NOT EXISTS {col_name} {col_def};"
+                    ))
+            # Per-device interface cache on duts
+            if dialect == "sqlite":
+                try:
+                    conn.execute(text("ALTER TABLE duts ADD COLUMN interfaces TEXT;"))
+                except Exception:
+                    pass
+            else:
+                conn.execute(text(
+                    "ALTER TABLE duts ADD COLUMN IF NOT EXISTS interfaces TEXT;"
+                ))
+            conn.commit()
+        except Exception as _e:
+            logger.warning(f"[Startup] Column migration warning (safe to ignore if columns exist): {_e}")
+
+
+# ============================================================================
+# JOB SCHEDULER — auto-trigger execution jobs at a set time / cron schedule
+# ============================================================================
+
+def _trigger_scheduled_job(execution_job_id: int):
+    """Called by APScheduler when a job's scheduled time arrives.
+
+    Reads the job's saved state (host, scripts, testbed path) from the DB,
+    generates a master testbed on the coordinator VM (SSH), and launches
+    _run_spytest_execution in a background thread — exactly like a manual Run.
+    """
+    db = SessionLocal()
+    try:
+        job = db.query(ExecutionJob).filter(ExecutionJob.id == execution_job_id).first()
+        if not job:
+            logger.warning(f"[Scheduler] Job {execution_job_id} not found — skipping")
+            return
+        if job.status == "running":
+            logger.info(f"[Scheduler] Job {execution_job_id} already running — skipping scheduled trigger")
+            return
+        if not job.schedule_enabled:
+            logger.info(f"[Scheduler] Job {execution_job_id} schedule disabled — skipping")
+            return
+
+        scripts   = json.loads(job.scripts)   if job.scripts   else []
+        host_id   = job.host_id
+        base_path = job.base_path or ""
+
+        if not host_id or not scripts:
+            logger.warning(f"[Scheduler] Job {execution_job_id} missing host or scripts — skipping")
+            return
+
+        host_dut = db.query(DUT).filter(DUT.id == host_id).first()
+        if not host_dut:
+            logger.warning(f"[Scheduler] Job {execution_job_id} host DUT {host_id} not found — skipping")
+            return
+
+        from threading import Thread as _Thread
+
+        # Use the testbed path saved from the last manual run if available.
+        # If not, generate one now using the same base64-pipe technique as the
+        # /api/spytest/generate-testbed endpoint so the YAML is valid SPyTest format.
+        testbed_file = job.testbed_path or ""
+        if not testbed_file and base_path:
+            coord = SSHConnectionManager(host_dut.ip_address, host_dut.port,
+                                         host_dut.username, host_dut.password)
+            if coord.connect():
+                try:
+                    bp = base_path.rstrip("/")
+                    _m = re.match(r'(^.*?/spytest)(?:/|$)', bp)
+                    spytest_root = _m.group(1) if _m else os.path.dirname(bp)
+                    tb_dir = spytest_root + "/testbeds"
+                    coord.execute_command(f'mkdir -p "{tb_dir}"', timeout=10)
+
+                    dut_ids = json.loads(job.dut_ids) if job.dut_ids else []
+                    devices_section = {}
+                    for did in dut_ids:
+                        d = db.query(DUT).filter(DUT.id == int(did)).first()
+                        if d and d.device_type != "VM":
+                            devices_section[d.name] = {
+                                "ip": d.ip_address,
+                                "username": d.username,
+                                "password": d.password,
+                                "port": d.port or 22,
+                            }
+
+                    tb_path = f"{tb_dir}/master_testbed.yaml"
+                    tb_config = {
+                        "version": "2.0",
+                        "devices": devices_section,
+                        "topology": {},
+                        "services": {"default": {}},
+                        "builds": {"default": {}},
+                        "configs": {"default": {}},
+                        "errors": {"default": {}},
+                        "params": {},
+                    }
+                    tb_yaml = (
+                        "# MASTER TESTBED - AUTO-GENERATED BY SCHEDULER\n"
+                        + yaml.dump(tb_config, default_flow_style=None, sort_keys=False)
+                    )
+                    # Write via base64 pipe to avoid heredoc/ARG_MAX issues
+                    yaml_b64 = base64.b64encode(tb_yaml.encode()).decode()
+                    stdin_ch, stdout_ch, stderr_ch = coord.client.exec_command(
+                        f'base64 -d > "{tb_path}"', timeout=15
+                    )
+                    stdin_ch.write(yaml_b64.encode())
+                    stdin_ch.channel.shutdown_write()
+                    write_code = stdout_ch.channel.recv_exit_status()
+                    if write_code == 0:
+                        testbed_file = tb_path
+                        # Persist so future scheduled runs reuse it
+                        job.testbed_path = tb_path
+                        db.commit()
+                        logger.info(f"[Scheduler] Generated testbed {tb_path} for job {execution_job_id}")
+                    else:
+                        err = stderr_ch.read().decode("utf-8", errors="ignore").strip()
+                        logger.warning(f"[Scheduler] Failed to write testbed for job {execution_job_id}: {err}")
+                except Exception as _e:
+                    logger.warning(f"[Scheduler] Could not generate testbed for job {execution_job_id}: {_e}")
+                finally:
+                    coord.disconnect()
+
+        if not testbed_file:
+            logger.warning(f"[Scheduler] Job {execution_job_id} has no testbed — skipping. "
+                           "Run the job manually once to save the testbed path.")
+            return
+
+        # Create Execution record
+        exec_name = f"scheduled_{execution_job_id}_{int(datetime.utcnow().timestamp())}"
+        execution = Execution(
+            name=exec_name,
+            dut_ids=json.dumps([host_id]),
+            execution_type="spytest",
+            status="pending",
+            job_id=execution_job_id,
+        )
+        db.add(execution)
+
+        # Update job state
+        job.status   = "running"
+        job.last_run_at = datetime.utcnow()
+        # Disable once-type schedules after firing
+        if job.schedule_type == "once":
+            job.schedule_enabled = False
+        db.commit()
+        db.refresh(execution)
+
+        script_names = [os.path.basename(s.get("path", "")) for s in scripts]
+        _q_init(execution.id, script_names, [])
+        _init_pending_scripts(execution.id)
+
+        available_dut_count = len(json.loads(job.dut_ids) if job.dut_ids else [1])
+
+        _Thread(
+            target=_run_spytest_execution,
+            args=(execution.id, host_id, scripts, testbed_file, {}, available_dut_count, base_path, execution_job_id),
+            daemon=True,
+        ).start()
+
+        logger.info(f"[Scheduler] Job {execution_job_id} '{job.name}' triggered — execution {execution.id}")
+
+    except Exception as e:
+        logger.error(f"[Scheduler] Error triggering job {execution_job_id}: {e}")
+    finally:
+        db.close()
+
+
+def _register_job_schedule(job: "ExecutionJob"):
+    """Add or replace an APScheduler entry for this ExecutionJob."""
+    ap_id = f"exec_job_{job.id}"
+    # Always remove old entry first
+    try:
+        scheduler.remove_job(ap_id)
+    except Exception:
+        pass
+
+    if not job.schedule_enabled:
+        return
+
+    try:
+        if job.schedule_type == "once" and job.schedule_at:
+            if job.schedule_at <= datetime.utcnow():
+                logger.warning(f"[Scheduler] Job {job.id} schedule_at is in the past — not scheduling")
+                return
+            # schedule_at is stored as naive UTC; make it timezone-aware so
+            # APScheduler (which defaults to the server's local timezone) fires
+            # it at the correct wall-clock moment instead of 5.5h early (IST offset).
+            from datetime import timezone as _utc_tz
+            aware_dt = job.schedule_at.replace(tzinfo=_utc_tz.utc)
+            scheduler.add_job(
+                _trigger_scheduled_job,
+                trigger=DateTrigger(run_date=aware_dt),
+                args=[job.id],
+                id=ap_id,
+                replace_existing=True,
+                misfire_grace_time=300,  # fire up to 5 min late if server was busy
+            )
+            logger.info(f"[Scheduler] Job {job.id} '{job.name}' scheduled once at {job.schedule_at} UTC")
+
+        elif job.schedule_type == "cron" and job.schedule_cron:
+            # Parse simple "HH:MM" or full cron "min hr dom mon dow"
+            cron_str = job.schedule_cron.strip()
+            if re.match(r'^\d{1,2}:\d{2}$', cron_str):
+                # Daily shorthand "HH:MM"
+                hh, mm = cron_str.split(":")
+                trigger = CronTrigger(hour=int(hh), minute=int(mm))
+            else:
+                parts = cron_str.split()
+                if len(parts) == 5:
+                    trigger = CronTrigger(
+                        minute=parts[0], hour=parts[1],
+                        day=parts[2], month=parts[3], day_of_week=parts[4]
+                    )
+                else:
+                    logger.warning(f"[Scheduler] Job {job.id} invalid cron '{cron_str}'")
+                    return
+            scheduler.add_job(
+                _trigger_scheduled_job,
+                trigger=trigger,
+                args=[job.id],
+                id=ap_id,
+                replace_existing=True,
+            )
+            logger.info(f"[Scheduler] Job {job.id} '{job.name}' scheduled cron '{cron_str}'")
+    except Exception as e:
+        logger.error(f"[Scheduler] Failed to register job {job.id}: {e}")
+
+
+def _reload_all_job_schedules():
+    """On startup, re-register APScheduler entries for all enabled jobs."""
+    db = SessionLocal()
+    try:
+        jobs = db.query(ExecutionJob).filter(ExecutionJob.schedule_enabled == True).all()
+        for j in jobs:
+            _register_job_schedule(j)
+        if jobs:
+            logger.info(f"[Scheduler] Reloaded {len(jobs)} job schedule(s) from DB")
+    except Exception as e:
+        logger.error(f"[Scheduler] Failed to reload schedules: {e}")
+    finally:
+        db.close()
+
 
 # ============================================================================
 # LOGGING
@@ -1161,6 +1479,14 @@ def _another_server_running(port: int = 8000) -> bool:
 
 
 @app.on_event("startup")
+def startup_migrations():
+    """Apply safe column migrations (idempotent — runs on every restart)."""
+    _apply_column_migrations()
+    logger.info("[Startup] Column migrations applied")
+    _reload_all_job_schedules()
+
+
+@app.on_event("startup")
 def startup_cleanup():
     """Clean up any executions or hardware load jobs stuck from previous server runs."""
     # Guard: if another server instance already owns port 8000, we are a
@@ -1211,6 +1537,27 @@ def startup_cleanup():
                     exec.duration_seconds = int((exec.end_time - exec.start_time).total_seconds())
             db.commit()
             logger.info(f"Cleaned up {len(stuck_executions)} stuck executions")
+
+        # ── Clear orphaned in-memory state from previous run ──────────────────
+        # On restart these dicts are always empty (fresh process), but clearing
+        # them explicitly guards any edge case where startup_cleanup() is called
+        # while threads are still winding down, and ensures PTY sessions that
+        # weren't cleaned up on abnormal WebSocket disconnect are removed.
+        _exec_queue_state.clear()
+        with _pending_scripts_lock:
+            _pending_scripts.clear()
+        with _pty_sessions_lock:
+            _pty_sessions.clear()
+        logger.info("[Startup] Cleared orphaned in-memory execution queue / PTY state")
+
+        # ── Clean up stuck execution jobs ─────────────────────────────────────
+        stuck_exec_jobs = db.query(ExecutionJob).filter(ExecutionJob.status == "running").all()
+        if stuck_exec_jobs:
+            logger.warning(f"Found {len(stuck_exec_jobs)} stuck execution jobs from previous run, marking as failed")
+            for ej in stuck_exec_jobs:
+                ej.status = "failed"
+            db.commit()
+            logger.info(f"Cleaned up {len(stuck_exec_jobs)} stuck execution jobs")
 
         # ── Clean up stuck hardware load jobs ─────────────────────────────────
         # Any job not in a terminal state means the server died mid-operation.
@@ -1449,6 +1796,8 @@ def get_duts(request: Request, db: Session = Depends(get_db)):
             "device_type": d.device_type,
             "username": d.username,
             "connection_type": getattr(d, 'connection_type', 'ssh'),  # Default to ssh if not set
+            "xml_path": d.xml_path,  # Needed so the edit modal shows the saved path, not the default
+            "interfaces": json.loads(d.interfaces) if getattr(d, 'interfaces', None) else [],  # Per-device cache
             "status": d.status,
             "last_heartbeat": d.last_heartbeat.isoformat() if d.last_heartbeat else None,
             "created_at": d.created_at.isoformat() if d.created_at else None,
@@ -1478,6 +1827,8 @@ def get_dut(dut_id: int, request: Request, db: Session = Depends(get_db)):
         "port": dut.port,
         "device_type": dut.device_type,
         "username": dut.username,
+        "connection_type": getattr(dut, 'connection_type', 'ssh'),
+        "xml_path": dut.xml_path,
         "status": dut.status,
         "static_ip": config.static_ip if config else None,
         "image_path": config.image_path if config else None,
@@ -1511,6 +1862,19 @@ def create_dut(request: Request, dut_data: dict, db: Session = Depends(get_db)):
         if not re.match(ip_pattern, ip_address):
             raise HTTPException(status_code=400, detail="Invalid IP address. Must be valid IPv4 format (e.g., 192.168.1.100). No subnet mask allowed.")
 
+        # DUPLICATE CHECK: device name must be unique within the session.
+        # The Postgres `duts` table was created without the model's
+        # UniqueConstraint('session_id','name'), so enforce it explicitly here.
+        existing = db.query(DUT).filter(
+            DUT.session_id == session_id,
+            DUT.name == name,
+        ).first()
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A device named '{name}' already exists. Device names must be unique.",
+            )
+
         connection_type = dut_data.get("connection_type", "ssh")
 
         dut = DUT(
@@ -1538,6 +1902,10 @@ def create_dut(request: Request, dut_data: dict, db: Session = Depends(get_db)):
         db.commit()
 
         return {"id": dut.id, "name": dut.name, "status": "created"}
+    except HTTPException:
+        # Validation / duplicate errors carry their own status + message — don't re-wrap
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
@@ -1566,6 +1934,19 @@ def update_dut(dut_id: int, request: Request, dut_data: dict, db: Session = Depe
             if not re.match(r'^[A-Za-z0-9]+$', name):
                 raise HTTPException(status_code=400, detail="Device name must contain only letters (A-Z, a-z) and numbers (0-9). No special characters or spaces allowed.")
             dut_data['name'] = name  # Update with trimmed value
+
+            # DUPLICATE CHECK: renaming must not collide with another device in this session
+            if name != dut.name:
+                clash = db.query(DUT).filter(
+                    DUT.session_id == dut.session_id,
+                    DUT.name == name,
+                    DUT.id != dut_id,
+                ).first()
+                if clash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"A device named '{name}' already exists. Device names must be unique.",
+                    )
 
         # VALIDATION: IP address must be valid IPv4 format
         if 'ip_address' in dut_data:
@@ -1600,6 +1981,10 @@ def update_dut(dut_id: int, request: Request, dut_data: dict, db: Session = Depe
             "credentials_changed": creds_changed and dut.device_type in ['DUT', 'Switch', 'Router']
         }
         return result
+    except HTTPException:
+        # Validation / duplicate errors carry their own status + message — don't re-wrap
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
@@ -1631,6 +2016,11 @@ def delete_dut(dut_id: int, request: Request, db: Session = Depends(get_db)):
         except Exception as conn_err:
             logger.warning(f"Failed to close connection for DUT {dut_id}: {conn_err}")
             # Continue with deletion even if connection close fails
+
+        # Prune in-memory session state so stale entries don't accumulate
+        # (_dut_session_state grows forever if never cleaned — memory leak on
+        # long-running servers where DUTs are frequently added/deleted).
+        _dut_session_state.pop(dut_id, None)
 
         # Delete related configuration
         db.query(DUTConfiguration).filter(DUTConfiguration.dut_id == dut_id).delete()
@@ -1823,6 +2213,10 @@ def get_dut_interfaces(dut_id: int, db: Session = Depends(get_db)):
         # Update device status to online since SSH connection succeeded
         dut.status = "online"
         dut.last_heartbeat = datetime.utcnow()
+        # Persist the fetched interfaces so they survive page reloads and are
+        # shown per-device (instead of every device falling back to defaults)
+        if interfaces:
+            dut.interfaces = json.dumps(interfaces)
         db.commit()
 
         logger.info(f"Fetched {len(interfaces)} interfaces from {dut.name} (type: {dut.device_type})")
@@ -3547,7 +3941,7 @@ async def websocket_logs(websocket: WebSocket, execution_id: int):
 
             # Check if execution has finished
             execution = db.query(Execution).filter(Execution.id == execution_id).first()
-            if execution and execution.status in ["completed", "failed"]:
+            if execution and execution.status in ["completed", "failed", "cancelled"]:
                 # Send any remaining logs and TCR results
                 db.expire_all()
                 remaining = (
@@ -3745,11 +4139,10 @@ def update_vs_image(body: dict, db: Session = Depends(get_db)):
     dut_id = body.get("dut_id")
     vs_name = body.get("vs_name", "").strip()
     source_image = body.get("source_image_path", VS_SOURCE_IMAGE).strip()
-    target_image_name = body.get("target_image_name", "").strip()
     source_server_id = body.get("source_server_id")  # Optional: for remote SFTP copy
 
     # DEBUG: Log what we received
-    logger.info(f"[VS UPDATE API] Received request: vs_name='{vs_name}', target_image_name='{target_image_name}'")
+    logger.info(f"[VS UPDATE API] Received request: vs_name='{vs_name}'")
 
     if not dut_id or not vs_name:
         raise HTTPException(status_code=400, detail="dut_id and vs_name are required")
@@ -3765,14 +4158,10 @@ def update_vs_image(body: dict, db: Session = Depends(get_db)):
         if not source_server:
             raise HTTPException(status_code=404, detail="Source server not found")
 
-    # If no target image name given, use the VS name as the image file name
-    if not target_image_name:
-        target_image_name = f"{vs_name}.img"
-
     # Use device-specific XML path (default: /home/hp/prajwal/VMs)
     xml_path = dut.xml_path or "/home/hp/prajwal/VMs"
     xml_full_path = f"{xml_path}/{vs_name}.xml"
-    target_image_path = f"{VS_IMAGES_PATH}{target_image_name}"
+    # target_image_path resolved dynamically from the XML on the remote host
 
     # Create an execution record for logging
     execution = Execution(
@@ -3788,7 +4177,7 @@ def update_vs_image(body: dict, db: Session = Depends(get_db)):
     # Run in background thread - pass IDs instead of ORM objects to avoid session issues
     thread = Thread(
         target=_run_vs_update,
-        args=(execution.id, dut_id, vs_name, xml_full_path, source_image, target_image_path, source_server_id),
+        args=(execution.id, dut_id, vs_name, xml_full_path, source_image, None, source_server_id),
         daemon=True,
     )
     thread.start()
@@ -3915,38 +4304,53 @@ def _run_vs_batch_update(
             all_success = True
             for idx, entry in enumerate(vs_entries, 1):
                 vs_name = entry.get("vs_name", "").strip()
-                per_vm_target = entry.get("target_image_name", "").strip()
                 if not vs_name:
                     continue
-
-                # Determine target image name for this VM
-                this_target_name = per_vm_target if per_vm_target else f"{vs_name}.img"
-
-                # Images directory on the remote host
-                IMAGES_DIR = "/var/lib/libvirt/images"
 
                 log_execution(db, execution_id, dut.name, "INFO", "")
                 log_execution(db, execution_id, dut.name, "INFO",
                               f"══ VM {idx}/{total}: {vs_name} ══")
                 log_execution(db, execution_id, dut.name, "INFO",
-                              f"  Target image: {this_target_name}")
-                log_execution(db, execution_id, dut.name, "INFO",
                               f"  Source image: {source_image}")
+
+                # Resolve destination image path from the VS XML on the remote host
+                xml_path = dut.xml_path or "/home/hp/prajwal/VMs"
+                xml_full_path = f"{xml_path}/{vs_name}.xml"
+                log_execution(db, execution_id, dut.name, "INFO",
+                              f"  Resolving image path from XML: {xml_full_path}")
+                extract_cmd = sudocmd(
+                    f"python3 -c \""
+                    f"import xml.etree.ElementTree as ET; "
+                    f"root = ET.parse('{xml_full_path}').getroot(); "
+                    f"matches = [d.find('source').get('file') for d in root.iter('disk') "
+                    f"if d.get('device')=='disk' and d.find('source') is not None]; "
+                    f"print(matches[0] if matches else '')\""
+                )
+                xml_out, xml_err, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+                dest_image_path = xml_out.strip()
+                if xml_rc != 0 or not dest_image_path:
+                    log_execution(db, execution_id, dut.name, "ERROR",
+                                  f"  ✗ Could not resolve image path from XML: "
+                                  f"{xml_err.strip() or 'No <disk device=disk> source found'}")
+                    all_success = False
+                    continue
+                log_execution(db, execution_id, dut.name, "INFO",
+                              f"  Resolved image path: {dest_image_path}")
 
                 # Exact 4-step sequence using correct commands:
                 # 1. virsh destroy <vs_name>           (user has libvirt group — no sudo needed)
-                # 2. sudo rm -f <IMAGES_DIR>/<image>
-                # 3. sudo cp <source> <IMAGES_DIR>/<target>
+                # 2. sudo rm -f <dest_image_path>
+                # 3. sudo cp <source> <dest_image_path>
                 # 4. virsh start <vs_name>
                 steps = [
                     ("Step 1/4: Destroying VM",
                      f"virsh destroy {vs_name}",
                      True),   # allow_fail: VM may already be stopped
                     ("Step 2/4: Removing old image",
-                     sudocmd(f"rm -f {IMAGES_DIR}/{this_target_name}"),
+                     sudocmd(f"rm -f {dest_image_path}"),
                      False),
                     ("Step 3/4: Copying new image",
-                     sudocmd(f"cp {source_image} {IMAGES_DIR}/{this_target_name}"),
+                     sudocmd(f"cp {source_image} {dest_image_path}"),
                      False),
                     ("Step 4/4: Starting VM",
                      f"virsh start {vs_name}",
@@ -4044,10 +4448,11 @@ def _run_vs_update(
     vs_name: str,
     xml_full_path: str,
     source_image: str,
-    target_image_path: str,
+    target_image_path=None,
     source_server_id=None,
 ):
     """Background thread: Full VS image update lifecycle.
+    target_image_path is resolved dynamically from the XML on the remote host.
     Supports remote image copy via SFTP when source_server_id is provided."""
     db = SessionLocal()
     execution = None
@@ -4090,7 +4495,7 @@ def _run_vs_update(
         log_execution(db, execution_id, dut.name, "INFO",
                       f"  Source image: {source_image}")
         log_execution(db, execution_id, dut.name, "INFO",
-                      f"  Target image: {target_image_path}")
+                      f"  Target image: (resolving from XML)")
         log_execution(db, execution_id, dut.name, "INFO",
                       f"  XML file: {xml_full_path}")
 
@@ -4112,6 +4517,30 @@ def _run_vs_update(
             return f"echo '{safe_pass}' | sudo -S {cmd}"
 
         try:
+            # Resolve target image path from the XML on the remote host
+            log_execution(db, execution_id, dut.name, "INFO",
+                          f"▶ Resolving image path from XML: {xml_full_path}")
+            extract_cmd = sudocmd(
+                f"python3 -c \""
+                f"import xml.etree.ElementTree as ET; "
+                f"root = ET.parse('{xml_full_path}').getroot(); "
+                f"matches = [d.find('source').get('file') for d in root.iter('disk') "
+                f"if d.get('device')=='disk' and d.find('source') is not None]; "
+                f"print(matches[0] if matches else '')\""
+            )
+            xml_out, xml_err, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+            target_image_path = xml_out.strip()
+            if xml_rc != 0 or not target_image_path:
+                log_execution(db, execution_id, dut.name, "ERROR",
+                              f"  ✗ Could not resolve image path from XML: "
+                              f"{xml_err.strip() or 'No <disk device=disk> source found'}")
+                execution.status = "failed"
+                execution.end_time = datetime.utcnow()
+                db.commit()
+                return
+            log_execution(db, execution_id, dut.name, "INFO",
+                          f"  ✓ Resolved image path: {target_image_path}")
+
             # Steps 1-2: Destroy VM and remove old image
             steps_pre_copy = [
                 ("Step 1/6: Destroying VM",
@@ -4265,66 +4694,15 @@ def _run_vs_update(
                 db.commit()
                 return
 
-            # Step 4: Update XML file to point to new image location
-            log_execution(db, execution_id, dut.name, "INFO",
-                          f"▶ Step 4/7: Updating XML to reference new image")
-            log_execution(db, execution_id, dut.name, "INFO",
-                          f"  XML file: {xml_full_path}")
-            log_execution(db, execution_id, dut.name, "INFO",
-                          f"  New image: {target_image_path}")
-
-            # First, show current XML content for debugging
-            cat_cmd = sudocmd(f"grep '<source file=' {xml_full_path}")
-            log_execution(db, execution_id, dut.name, "INFO", f"  Checking current XML content...")
-            try:
-                output, error, exit_code = ssh.execute_command(cat_cmd, timeout=10)
-                if output.strip():
-                    log_execution(db, execution_id, dut.name, "INFO", f"  Current: {output.strip()}")
-            except:
-                pass
-
-            # Use sed to replace the image path in XML file
-            # Match both single and double quotes, and both self-closing and regular tags
-            # Patterns: <source file='...' /> or <source file="..."/> or <source file='...'></source>
-            sed_cmd = sudocmd(f"sed -i 's|<source file=[\"'\"'][^\"'\"']*[\"'\"']|<source file=\"{target_image_path}\"|g' {xml_full_path}")
-            log_execution(db, execution_id, dut.name, "INFO", f"  $ {sed_cmd}")
-
-            try:
-                output, error, exit_code = ssh.execute_command(sed_cmd, timeout=30)
-                if exit_code != 0:
-                    msg = error.strip() if error.strip() else f"Exit code {exit_code}"
-                    log_execution(db, execution_id, dut.name, "ERROR",
-                                  f"  ✗ Step 4/7 FAILED: {msg}")
-                    execution.status = "failed"
-                    execution.end_time = datetime.utcnow()
-                    db.commit()
-                    return
-                else:
-                    log_execution(db, execution_id, dut.name, "INFO",
-                                  f"  ✓ Step 4/7 completed - XML updated")
-
-                    # Verify the change
-                    verify_cmd = sudocmd(f"grep '<source file=' {xml_full_path}")
-                    output, error, exit_code = ssh.execute_command(verify_cmd, timeout=10)
-                    if output.strip():
-                        log_execution(db, execution_id, dut.name, "INFO", f"  Verified: {output.strip()}")
-            except Exception as cmd_err:
-                log_execution(db, execution_id, dut.name, "ERROR",
-                              f"  ✗ Step 4/7 error: {str(cmd_err)}")
-                execution.status = "failed"
-                execution.end_time = datetime.utcnow()
-                db.commit()
-                return
-
-            # Steps 5-7: Undefine, Define, Start VM
+            # Steps 4-6: Undefine, Define, Start VM
             steps_post_copy = [
-                ("Step 5/7: Undefining VM",
+                ("Step 4/6: Undefining VM",
                  sudocmd(f"virsh undefine {vs_name}"),
                  True),   # allow_fail=True (might already be undefined)
-                ("Step 6/7: Defining VM from XML",
+                ("Step 5/6: Defining VM from XML",
                  sudocmd(f"virsh define {xml_full_path}"),
                  False),
-                ("Step 7/7: Starting VM",
+                ("Step 6/6: Starting VM",
                  sudocmd(f"virsh start {vs_name}"),
                  False),
             ]
@@ -4813,12 +5191,14 @@ def start_spytest_execution(body: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Host device not found")
 
     # Create master execution record
+    job_id = body.get("job_id")
     exec_name = f"spytest_{int(datetime.utcnow().timestamp())}"
     execution = Execution(
         name=exec_name,
         dut_ids=json.dumps([host_id]),
         execution_type="spytest",
         status="pending",
+        job_id=int(job_id) if job_id else None,
     )
     db.add(execution)
     db.commit()
@@ -4835,9 +5215,16 @@ def start_spytest_execution(body: dict, db: Session = Depends(get_db)):
     user_base_path = (body.get("base_path") or "").strip().rstrip("/")
 
     # Start background execution thread
+    # Mark job as running when execution starts
+    if job_id:
+        _job = db.query(ExecutionJob).filter(ExecutionJob.id == int(job_id)).first()
+        if _job:
+            _job.status = "running"
+            db.commit()
+
     thread = Thread(
         target=_run_spytest_execution,
-        args=(execution.id, host_id, scripts, testbed_file, options, available_dut_count, user_base_path),
+        args=(execution.id, host_id, scripts, testbed_file, options, available_dut_count, user_base_path, int(job_id) if job_id else None),
         daemon=True,
     )
     thread.start()
@@ -4910,6 +5297,32 @@ _pending_scripts: dict = {}  # execution_id -> {scripts:[...], to_cancel: set(..
 _execution_threads_lock = Lock()
 _execution_threads: dict = {}  # execution_id -> list of thread objects
 _test_results_lock = Lock()  # guards concurrent test_results JSON updates from parallel script threads
+
+# ── Execution-level STOP support ────────────────────────────────────────────
+# Set of execution_ids the user asked to stop. The per-script worker threads poll
+# this and, when their id appears, kill the remote SPyTest process, mark the script
+# "cancelled", and exit. The finalizer then records the execution/job as "cancelled".
+_exec_cancel_lock = Lock()
+_exec_cancel: set = set()
+
+
+class ExecutionCancelled(Exception):
+    """Raised inside a worker when the user stops the execution while it waits for DUTs."""
+
+
+def _request_exec_cancel(execution_id: int):
+    with _exec_cancel_lock:
+        _exec_cancel.add(execution_id)
+
+
+def _is_exec_cancelled(execution_id: int) -> bool:
+    with _exec_cancel_lock:
+        return execution_id in _exec_cancel
+
+
+def _clear_exec_cancel(execution_id: int):
+    with _exec_cancel_lock:
+        _exec_cancel.discard(execution_id)
 
 
 def _init_pending_scripts(execution_id: int):
@@ -5027,6 +5440,57 @@ def cancel_script_from_execution(execution_id: int, body: dict, db: Session = De
         "script": script_name,
         "execution_id": execution_id
     }
+
+
+@app.post("/api/executions/{execution_id}/stop")
+def stop_execution_endpoint(execution_id: int, db: Session = Depends(get_db)):
+    """Stop a running execution: terminate all running scripts and mark it cancelled.
+
+    Sets the execution-level cancel flag. Each worker thread polls it (≤10 s), kills its
+    remote SPyTest process, marks the script "cancelled", and exits; the finalizer then
+    records the execution and parent job as "cancelled" and releases the DUT locks. For
+    immediacy, this endpoint also best-effort kills any already-known running PIDs now,
+    so the remote scripts don't keep running until the next poll tick.
+    """
+    execution = db.query(Execution).filter(Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    if execution.status not in ("running", "pending"):
+        # Already finished — nothing to stop; report the real status back.
+        return {"status": execution.status, "execution_id": execution_id,
+                "message": "Execution is not running"}
+
+    _request_exec_cancel(execution_id)
+    log_execution(db, execution_id, "SYSTEM", "WARN",
+                  "■ Stop requested by user — terminating running scripts…")
+
+    # Best-effort immediate kill of any running PIDs we already track (don't wait for poll)
+    killed = 0
+    try:
+        with _exec_queue_lock:
+            state = _exec_queue_state.get(execution_id)
+            running = ([(s.get("name"), s.get("pid")) for s in state["scripts"]
+                        if s.get("status") == "running" and s.get("pid")]
+                       if state else [])
+        host = None
+        if running and execution.job_id:
+            _job = db.query(ExecutionJob).filter(ExecutionJob.id == execution.job_id).first()
+            if _job and _job.host_id:
+                host = db.query(DUT).filter(DUT.id == _job.host_id).first()
+        if running and host:
+            kssh = SSHConnectionManager(host.ip_address, host.port, host.username, host.password)
+            if kssh.connect():
+                for _name, _pid in running:
+                    kssh.execute_command(
+                        f"kill -TERM {_pid} 2>/dev/null; sleep 1; kill -KILL {_pid} 2>/dev/null",
+                        timeout=10)
+                    killed += 1
+                kssh.disconnect()
+    except Exception as _e:
+        logger.warning(f"[STOP] Immediate kill best-effort failed for exec {execution_id}: {_e}")
+
+    return {"status": "stopping", "execution_id": execution_id, "killed_now": killed}
 
 
 # ============================================================================
@@ -5577,6 +6041,7 @@ def _run_spytest_execution(
     options: dict,
     available_dut_count: int = 1,
     base_path: str = "",
+    job_id: int = None,
 ):
     """Background thread: Smart SPyTest execution with true parallel DUT allocation.
 
@@ -5782,6 +6247,9 @@ def _run_spytest_execution(
                 When the canvas has no connections, simple FIFO is always used.
                 """
                 while True:
+                    # Abort a queued script immediately if the user stopped the execution
+                    if _is_exec_cancelled(execution_id):
+                        raise ExecutionCancelled()
                     with pool_lock:
                         if len(available_pool) >= needed:
                             # Topology-aware path: canvas has connections AND
@@ -5925,8 +6393,20 @@ def _run_spytest_execution(
 
                     # --- Poll until the process exits -----------------------
                     last_lines_seen = 0
+                    cancelled = False
                     while True:
                         _time.sleep(10)
+                        # User pressed Stop — kill the remote SPyTest process and bail out
+                        if _is_exec_cancelled(execution_id):
+                            s_ssh.execute_command(
+                                f"kill -TERM {pid} 2>/dev/null; sleep 1; kill -KILL {pid} 2>/dev/null",
+                                timeout=10,
+                            )
+                            log_execution(sdb, execution_id, sname, "WARN",
+                                          f"■ Stopped by user — killed PID {pid}")
+                            _q_update_script(execution_id, sname, "cancelled")
+                            cancelled = True
+                            break
                         chk_out, _, _ = s_ssh.execute_command(
                             f"kill -0 {pid} 2>/dev/null && echo RUNNING || echo DONE",
                             timeout=5,
@@ -5950,6 +6430,11 @@ def _run_spytest_execution(
                         if "DONE" in chk_out:
                             break
 
+                    if cancelled:
+                        # Stopped by user — don't mark done or collect results
+                        s_ssh.execute_command(f"rm -f {temp_tb_path}", timeout=5)
+                        return
+
                     log_execution(sdb, execution_id, sname, "INFO", "✓ Script completed")
                     _q_update_script(execution_id, sname, "done")
                     # Collect CSV results and persist TestCaseResult rows
@@ -5957,6 +6442,10 @@ def _run_spytest_execution(
                                               script_path, log_dir, sdb)
                     s_ssh.execute_command(f"rm -f {temp_tb_path}", timeout=5)
 
+                except ExecutionCancelled:
+                    log_execution(sdb, execution_id, sname, "WARN",
+                                  "■ Stopped by user before DUTs were allocated")
+                    _q_update_script(execution_id, sname, "cancelled")
                 except Exception as ex:
                     log_execution(sdb, execution_id, sname, "ERROR",
                                   f"Script error: {ex}")
@@ -5983,16 +6472,28 @@ def _run_spytest_execution(
             for t in threads:
                 t.join()
 
-            # ── Mark master execution done ────────────────────────────────────
-            execution.status = "completed"
+            # ── Mark master execution done (or cancelled if the user stopped it) ──
+            _was_cancelled = _is_exec_cancelled(execution_id)
+            final_status = "cancelled" if _was_cancelled else "completed"
+            execution.status = final_status
             execution.end_time = datetime.utcnow()
             if execution.start_time:
                 execution.duration_seconds = int(
                     (execution.end_time - execution.start_time).total_seconds()
                 )
             db.commit()
-            log_execution(db, execution_id, "SYSTEM", "INFO",
-                          f"✓ All scripts finished ({execution.duration_seconds}s)")
+            log_execution(db, execution_id, "SYSTEM",
+                          "WARN" if _was_cancelled else "INFO",
+                          (f"■ Execution stopped by user ({execution.duration_seconds}s)"
+                           if _was_cancelled else
+                           f"✓ All scripts finished ({execution.duration_seconds}s)"))
+            # Update parent job status
+            if job_id:
+                _job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id).first()
+                if _job and _job.status == "running":
+                    _job.status = final_status
+                    db.commit()
+            _clear_exec_cancel(execution_id)
             _q_cleanup(execution_id)
             # Enhancement 2: Clean up pending scripts structure
             _cleanup_pending_scripts(execution_id)
@@ -6008,7 +6509,16 @@ def _run_spytest_execution(
             execution.status = "failed"
             execution.end_time = datetime.utcnow()
             db.commit()
+        if job_id:
+            try:
+                _job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id).first()
+                if _job and _job.status == "running":
+                    _job.status = "failed"
+                    db.commit()
+            except Exception:
+                pass
         log_execution(db, execution_id, "SYSTEM", "ERROR", f"Execution failed: {e}")
+        _clear_exec_cancel(execution_id)
         _q_cleanup(execution_id)
         # Enhancement 2: Clean up pending scripts structure on failure
         _cleanup_pending_scripts(execution_id)
@@ -6140,6 +6650,385 @@ def release_dut_lock(dut_id: int, db: Session = Depends(get_db)):
     lock.locked_since = None
     db.commit()
     return {"status": "released", "dut_id": dut_id}
+
+
+# ============================================================================
+# API — Execution Jobs (named job containers for the Execute tab)
+# ============================================================================
+
+@app.post("/api/execution-jobs")
+def create_execution_job(request: Request, body: dict, db: Session = Depends(get_db)):
+    """Create a new named execution job for the current session."""
+    session_id = request.headers.get("X-Session-ID", "default")
+    name = body.get("name") or f"Job-{datetime.utcnow().strftime('%H%M')}"
+    job = ExecutionJob(name=name, session_id=session_id)
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return {"id": job.id, "name": job.name, "status": job.status, "created_at": job.created_at.isoformat() if job.created_at else None}
+
+
+@app.get("/api/execution-jobs")
+def list_execution_jobs(request: Request, db: Session = Depends(get_db)):
+    """List all execution jobs for the current session (most recent first)."""
+    session_id = request.headers.get("X-Session-ID", "default")
+    jobs = (db.query(ExecutionJob)
+            .filter(ExecutionJob.session_id == session_id)
+            .order_by(ExecutionJob.created_at.desc())
+            .limit(50)
+            .all())
+    result = []
+    for j in jobs:
+        exec_count = db.query(Execution).filter(Execution.job_id == j.id).count()
+        result.append({
+            "id": j.id,
+            "name": j.name,
+            "status": j.status,
+            "execution_count": exec_count,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "updated_at": j.updated_at.isoformat() if j.updated_at else None,
+        })
+    return {"jobs": result}
+
+
+@app.get("/api/execution-jobs/{job_id}")
+def get_execution_job(job_id: int, request: Request, db: Session = Depends(get_db)):
+    """Get full state of a specific job."""
+    session_id = request.headers.get("X-Session-ID", "default")
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    executions = (db.query(Execution).filter(Execution.job_id == job_id)
+                  .order_by(Execution.created_at.desc()).all())
+    execs_data = []
+    for e in executions:
+        # BF-11: Aggregate per-script results so the UI can restore the live
+        # results panel when switching back to a completed/failed job.
+        tcrs = (db.query(TestCaseResult)
+                .filter(TestCaseResult.execution_id == e.id).all())
+        script_map = {}
+        for t in tcrs:
+            stem = os.path.basename(t.script_path or "").replace(".py", "") or "unknown"
+            if stem not in script_map:
+                script_map[stem] = {"passed": 0, "failed": 0, "skipped": 0,
+                                    "duration_s": 0, "status": "running",
+                                    "script_stem": stem}
+            r = (t.result or "").upper()
+            if r in ("PASS", "PASSED"):
+                script_map[stem]["passed"] += 1
+            elif r in ("FAIL", "FAILED", "ERROR"):
+                script_map[stem]["failed"] += 1
+            else:
+                script_map[stem]["skipped"] += 1
+            script_map[stem]["duration_s"] += t.time_seconds or 0
+        # Mark each script's final status
+        for s in script_map.values():
+            s["status"] = "failed" if s["failed"] > 0 else "passed"
+        execs_data.append({
+            "id": e.id, "name": e.name, "status": e.status,
+            "start_time": e.start_time.isoformat() if e.start_time else None,
+            "end_time": e.end_time.isoformat() if e.end_time else None,
+            "script_results": list(script_map.values()),
+        })
+    next_run = None
+    ap_id = f"exec_job_{job.id}"
+    try:
+        ap_job = scheduler.get_job(ap_id)
+        if ap_job and ap_job.next_run_time:
+            from datetime import timezone as _utc_tz
+            next_run = ap_job.next_run_time.astimezone(_utc_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+
+    return {
+        "id": job.id,
+        "name": job.name,
+        "status": job.status,
+        "dut_ids": json.loads(job.dut_ids) if job.dut_ids else [],
+        "base_path": job.base_path or "",
+        "host_id": job.host_id,
+        "topology": json.loads(job.topology) if job.topology else [],
+        "scripts": json.loads(job.scripts) if job.scripts else [],
+        "testbed_path": job.testbed_path or "",
+        "executions": execs_data,
+        "schedule_type":    job.schedule_type or "none",
+        "schedule_at":      job.schedule_at.isoformat() if job.schedule_at else None,
+        "schedule_cron":    job.schedule_cron,
+        "schedule_enabled": bool(job.schedule_enabled),
+        "last_run_at":      job.last_run_at.isoformat() if job.last_run_at else None,
+        "next_run":         next_run,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+    }
+
+
+@app.put("/api/execution-jobs/{job_id}")
+def update_execution_job(job_id: int, request: Request, body: dict, db: Session = Depends(get_db)):
+    """Save/update job state (devices, topology, scripts, base_path)."""
+    session_id = request.headers.get("X-Session-ID", "default")
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if "name" in body:
+        job.name = body["name"]
+    if "dut_ids" in body:
+        job.dut_ids = json.dumps(body["dut_ids"])
+    if "base_path" in body:
+        job.base_path = body["base_path"]
+    if "host_id" in body:
+        job.host_id = body["host_id"]
+    if "topology" in body:
+        job.topology = json.dumps(body["topology"])
+    if "scripts" in body:
+        job.scripts = json.dumps(body["scripts"])
+    if "testbed_path" in body:
+        job.testbed_path = body["testbed_path"] or None
+    if "status" in body and body["status"] in ("idle", "running", "completed", "failed"):
+        job.status = body["status"]
+    job.updated_at = datetime.utcnow()
+    db.commit()
+    return {"id": job.id, "status": job.status}
+
+
+@app.delete("/api/execution-jobs/{job_id}")
+def delete_execution_job(job_id: int, request: Request, db: Session = Depends(get_db)):
+    """Delete a job (only if not currently running)."""
+    session_id = request.headers.get("X-Session-ID", "default")
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status == "running":
+        raise HTTPException(status_code=400, detail="Cannot delete a running job")
+    db.query(Execution).filter(Execution.job_id == job_id).update({"job_id": None})
+    db.delete(job)
+    db.commit()
+    return {"deleted": job_id}
+
+
+@app.get("/api/execution-jobs/{job_id}/conflicts")
+def check_job_conflicts(job_id: int, request: Request, dut_ids: str = "",
+                        db: Session = Depends(get_db)):
+    """Check if any requested DUT ids conflict with another job.
+
+    Two conflict types are detected:
+    - runtime:  DUTLock is non-AVAILABLE (device physically locked by an active execution)
+    - planning: DUT appears in another active/idle/running job's dut_ids selection
+
+    Query param: dut_ids — comma-separated list of DUT ids.
+    Returns: [{dut_id, dut_name, conflicting_job_id, conflicting_job_name, conflict_type}]
+    """
+    session_id = request.headers.get("X-Session-ID", "default")
+    if not dut_ids.strip():
+        return {"conflicts": []}
+    requested = [int(x) for x in dut_ids.split(",") if x.strip().isdigit()]
+    conflicts = []
+    seen_duts = set()  # avoid duplicate entries per DUT
+
+    # ── Pass 1: runtime locks (execution actively running) ──────────────────
+    for did in requested:
+        lock = db.query(DUTLock).filter(
+            DUTLock.dut_id == did,
+            DUTLock.status != "AVAILABLE",
+            DUTLock.lock_type == "exec",
+            DUTLock.job_id != job_id,
+            DUTLock.job_id != None,
+        ).first()
+        if lock:
+            owner_job = db.query(ExecutionJob).filter(ExecutionJob.id == lock.job_id).first()
+            dut = db.query(DUT).filter(DUT.id == did).first()
+            conflicts.append({
+                "dut_id":               did,
+                "dut_name":             dut.name if dut else str(did),
+                "conflicting_job_id":   lock.job_id,
+                "conflicting_job_name": owner_job.name if owner_job else f"Job {lock.job_id}",
+                "conflict_type":        "runtime",
+            })
+            seen_duts.add(did)
+
+    # ── Pass 2: planning-level overlap (DUT selected in another job's dut_ids) ─
+    other_jobs = (db.query(ExecutionJob)
+                  .filter(
+                      ExecutionJob.session_id == session_id,
+                      ExecutionJob.id != job_id,
+                      ExecutionJob.status.notin_(["completed", "failed"]),
+                      ExecutionJob.dut_ids != None,
+                      ExecutionJob.dut_ids != "[]",
+                  ).all())
+    for did in requested:
+        if did in seen_duts:
+            continue  # already reported as runtime conflict
+        for other in other_jobs:
+            try:
+                other_duts = json.loads(other.dut_ids or "[]")
+            except Exception:
+                continue
+            if did in [int(x) for x in other_duts]:
+                dut = db.query(DUT).filter(DUT.id == did).first()
+                conflicts.append({
+                    "dut_id":               did,
+                    "dut_name":             dut.name if dut else str(did),
+                    "conflicting_job_id":   other.id,
+                    "conflicting_job_name": other.name,
+                    "conflict_type":        "planning",
+                })
+                seen_duts.add(did)
+                break  # report the first conflicting job only
+
+    return {"conflicts": conflicts}
+
+
+@app.get("/api/execution-jobs/{job_id}/report/html")
+def job_html_report(job_id: int, request: Request, db: Session = Depends(get_db)):
+    """Generate aggregated HTML report for all executions in this job."""
+    session_id = request.headers.get("X-Session-ID", "default")
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    executions = db.query(Execution).filter(Execution.job_id == job_id).all()
+    if not executions:
+        raise HTTPException(status_code=404, detail="No executions found for this job")
+    all_tcrs = []
+    for ex in executions:
+        tcrs = db.query(TestCaseResult).filter(TestCaseResult.execution_id == ex.id).all()
+        all_tcrs.extend(tcrs)
+    buf = _build_html_dashboard(executions[0], all_tcrs)
+    filename = f"{job.name.replace(' ', '_')}_report.html"
+    return StreamingResponse(iter([buf]), media_type="text/html",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.get("/api/execution-jobs/{job_id}/report/excel")
+def job_excel_report(job_id: int, request: Request, db: Session = Depends(get_db)):
+    """Generate aggregated Excel report for all executions in this job."""
+    if not _HAS_OPENPYXL:
+        raise HTTPException(status_code=503, detail="openpyxl not installed")
+    session_id = request.headers.get("X-Session-ID", "default")
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    executions = db.query(Execution).filter(Execution.job_id == job_id).all()
+    if not executions:
+        raise HTTPException(status_code=404, detail="No executions found for this job")
+    all_tcrs = []
+    for ex in executions:
+        tcrs = db.query(TestCaseResult).filter(TestCaseResult.execution_id == ex.id).all()
+        all_tcrs.extend(tcrs)
+    buf = _build_excel(executions[0], all_tcrs)
+    filename = f"{job.name.replace(' ', '_')}_report.xlsx"
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+# ============================================================================
+# API — Execution Job Scheduler
+# ============================================================================
+
+@app.put("/api/execution-jobs/{job_id}/schedule")
+def set_job_schedule(job_id: int, request: Request, body: dict,
+                     db: Session = Depends(get_db)):
+    """Set or update the schedule for an execution job.
+
+    Body:
+        schedule_type: "none" | "once" | "cron"
+        schedule_at:   ISO datetime string (UTC) — required for type "once"
+        schedule_cron: "HH:MM" (daily) or full cron "min hr dom mon dow" — required for type "cron"
+        enabled:       bool — enable/disable without clearing the schedule
+    """
+    session_id = request.headers.get("X-Session-ID", "default")
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    stype   = body.get("schedule_type", job.schedule_type or "none")
+    enabled = body.get("enabled", True)
+
+    if stype == "none":
+        job.schedule_type    = "none"
+        job.schedule_enabled = False
+        job.schedule_at      = None
+        job.schedule_cron    = None
+    elif stype == "once":
+        sat = body.get("schedule_at")
+        if not sat:
+            raise HTTPException(status_code=400, detail="schedule_at required for type 'once'")
+        try:
+            job.schedule_at = datetime.fromisoformat(sat.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid schedule_at: {sat}")
+        job.schedule_type    = "once"
+        job.schedule_cron    = None
+        job.schedule_enabled = bool(enabled)
+    elif stype == "cron":
+        cron_expr = body.get("schedule_cron", "").strip()
+        if not cron_expr:
+            raise HTTPException(status_code=400, detail="schedule_cron required for type 'cron'")
+        job.schedule_type    = "cron"
+        job.schedule_cron    = cron_expr
+        job.schedule_at      = None
+        job.schedule_enabled = bool(enabled)
+    else:
+        raise HTTPException(status_code=400, detail="schedule_type must be none | once | cron")
+
+    job.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(job)
+
+    # Re-register in APScheduler
+    _register_job_schedule(job)
+
+    next_run = None
+    ap_id = f"exec_job_{job.id}"
+    try:
+        ap_job = scheduler.get_job(ap_id)
+        if ap_job and ap_job.next_run_time:
+            from datetime import timezone as _utc_tz
+            next_run = ap_job.next_run_time.astimezone(_utc_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+
+    return {
+        "id": job.id,
+        "schedule_type": job.schedule_type,
+        "schedule_at": job.schedule_at.isoformat() if job.schedule_at else None,
+        "schedule_cron": job.schedule_cron,
+        "schedule_enabled": job.schedule_enabled,
+        "next_run": next_run,
+    }
+
+
+@app.get("/api/execution-jobs/{job_id}/schedule")
+def get_job_schedule(job_id: int, request: Request, db: Session = Depends(get_db)):
+    """Return current schedule settings for a job."""
+    session_id = request.headers.get("X-Session-ID", "default")
+    job = db.query(ExecutionJob).filter(ExecutionJob.id == job_id,
+                                        ExecutionJob.session_id == session_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    next_run = None
+    ap_id = f"exec_job_{job.id}"
+    try:
+        ap_job = scheduler.get_job(ap_id)
+        if ap_job and ap_job.next_run_time:
+            from datetime import timezone as _utc_tz
+            next_run = ap_job.next_run_time.astimezone(_utc_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+
+    return {
+        "id": job.id,
+        "schedule_type": job.schedule_type or "none",
+        "schedule_at": job.schedule_at.isoformat() if job.schedule_at else None,
+        "schedule_cron": job.schedule_cron,
+        "schedule_enabled": bool(job.schedule_enabled),
+        "last_run_at": job.last_run_at.isoformat() if job.last_run_at else None,
+        "next_run": next_run,
+    }
 
 
 # ============================================================================

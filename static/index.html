@@ -247,6 +247,100 @@
         <!-- ============ EXECUTE TAB ============ -->
         <section id="tab-execute" class="tab-content">
 
+            <!-- Job Header Bar -->
+            <div class="job-header-bar" id="job-header-bar">
+                <span class="material-icons-round" style="font-size:18px;color:var(--primary)">work</span>
+                <label style="font-size:13px;font-weight:600;color:var(--text-secondary);white-space:nowrap">Job:</label>
+                <select id="job-select" class="job-select" onchange="switchJob(parseInt(this.value))" title="Switch between jobs">
+                    <option value="">-- No Jobs --</option>
+                </select>
+                <span id="job-status-badge" class="job-status-badge idle">idle</span>
+                <button class="btn primary small" onclick="createJob()" title="Create a new job">
+                    <span class="material-icons-round" style="font-size:14px">add</span> New Job
+                </button>
+                <button class="btn outline small" onclick="renameActiveJob()" title="Rename this job" id="btn-rename-job">
+                    <span class="material-icons-round" style="font-size:14px">edit</span>
+                </button>
+                <button class="btn outline small" onclick="openScheduleModal()" title="Schedule this job" id="btn-schedule-job">
+                    <span class="material-icons-round" style="font-size:14px">schedule</span> Schedule
+                </button>
+                <span id="job-next-run" style="font-size:11px;color:var(--text-secondary);white-space:nowrap;display:none"></span>
+                <button class="btn outline small" onclick="resetJobToIdle()" title="Reset stuck job back to idle" id="btn-reset-job"
+                    style="display:none;color:#d97706;border-color:#d97706">
+                    <span class="material-icons-round" style="font-size:14px">restart_alt</span> Reset
+                </button>
+                <button class="btn outline small" onclick="deleteActiveJob()" title="Delete this job" id="btn-delete-job"
+                    style="color:var(--error,#ef4444);border-color:var(--error,#ef4444)">
+                    <span class="material-icons-round" style="font-size:14px">delete</span>
+                </button>
+                <div id="conflict-banner" class="conflict-banner"></div>
+            </div>
+
+            <!-- Schedule Modal -->
+            <div id="schedule-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+                <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:12px;padding:24px;width:380px;max-width:95vw">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+                        <h3 style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px">
+                            <span class="material-icons-round" style="color:var(--primary)">schedule</span> Schedule Job
+                        </h3>
+                        <button onclick="closeScheduleModal()" style="background:none;border:none;cursor:pointer;color:var(--text-secondary)">
+                            <span class="material-icons-round">close</span>
+                        </button>
+                    </div>
+
+                    <!-- Type selector -->
+                    <div style="display:flex;gap:8px;margin-bottom:16px">
+                        <label style="flex:1;cursor:pointer">
+                            <input type="radio" name="sched-type" value="none" onchange="onSchedTypeChange()" style="margin-right:4px"> Off
+                        </label>
+                        <label style="flex:1;cursor:pointer">
+                            <input type="radio" name="sched-type" value="once" onchange="onSchedTypeChange()" style="margin-right:4px"> Once
+                        </label>
+                        <label style="flex:1;cursor:pointer">
+                            <input type="radio" name="sched-type" value="cron" onchange="onSchedTypeChange()" style="margin-right:4px"> Recurring
+                        </label>
+                    </div>
+
+                    <!-- Once: datetime picker -->
+                    <div id="sched-once-row" style="display:none;margin-bottom:14px">
+                        <label class="field-label">Run at (your local time)</label>
+                        <input type="datetime-local" id="sched-at-input"
+                            style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-tertiary);color:var(--text);font-size:13px">
+                    </div>
+
+                    <!-- Cron: quick presets + custom -->
+                    <div id="sched-cron-row" style="display:none;margin-bottom:14px">
+                        <label class="field-label">Recurring schedule</label>
+                        <select id="sched-cron-preset" onchange="onCronPresetChange()"
+                            style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-tertiary);color:var(--text);font-size:13px;margin-bottom:8px">
+                            <option value="daily">Daily at a time</option>
+                            <option value="hourly">Every hour</option>
+                            <option value="custom">Custom cron expression</option>
+                        </select>
+                        <div id="sched-daily-row" style="display:flex;gap:8px;align-items:center">
+                            <label style="font-size:12px;color:var(--text-secondary);white-space:nowrap">Every day at</label>
+                            <input type="time" id="sched-daily-time" value="09:00"
+                                style="padding:5px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-tertiary);color:var(--text);font-size:13px">
+                        </div>
+                        <div id="sched-custom-row" style="display:none">
+                            <input type="text" id="sched-cron-expr" placeholder="e.g. 0 9 * * 1-5  (weekdays 09:00)"
+                                style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-tertiary);color:var(--text);font-size:12px;font-family:monospace">
+                            <p style="font-size:11px;color:var(--text-secondary);margin:4px 0 0">Format: minute hour day month weekday</p>
+                        </div>
+                    </div>
+
+                    <!-- Last run / next run info -->
+                    <div id="sched-info" style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;min-height:18px"></div>
+
+                    <div style="display:flex;gap:8px;justify-content:flex-end">
+                        <button class="btn outline" onclick="closeScheduleModal()">Cancel</button>
+                        <button class="btn primary" onclick="saveSchedule()">
+                            <span class="material-icons-round" style="font-size:14px">save</span> Save Schedule
+                        </button>
+                    </div>
+                </div>
+            </div>
+
             <!-- Row 1: VM Selection + Git (single row) -->
             <div class="card glass">
                 <div class="card-header">
@@ -549,7 +643,7 @@
                             <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-secondary);margin-bottom:8px;font-weight:600">
                                 <span class="material-icons-round" style="font-size:13px;vertical-align:middle;color:var(--accent)">list</span> Scripts
                             </div>
-                            <div id="queue-scripts-list" style="display:flex;flex-direction:column;gap:6px">
+                            <div id="queue-scripts-list" style="display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto;padding-right:4px">
                                 <span class="muted" style="font-size:12px">–</span>
                             </div>
                         </div>
@@ -584,19 +678,21 @@
                             0 of 0 scripts done
                         </div>
                     </div>
-                    <table class="data-table" style="font-size:12px">
-                        <thead>
-                            <tr>
-                                <th>Script</th>
-                                <th>Status</th>
-                                <th style="text-align:center">Pass</th>
-                                <th style="text-align:center">Fail</th>
-                                <th style="text-align:center">Skip</th>
-                                <th>Duration</th>
-                            </tr>
-                        </thead>
-                        <tbody id="live-results-tbody"></tbody>
-                    </table>
+                    <div class="live-results-scroll">
+                        <table class="data-table" style="font-size:12px">
+                            <thead>
+                                <tr>
+                                    <th>Script</th>
+                                    <th>Status</th>
+                                    <th style="text-align:center">Pass</th>
+                                    <th style="text-align:center">Fail</th>
+                                    <th style="text-align:center">Skip</th>
+                                    <th>Duration</th>
+                                </tr>
+                            </thead>
+                            <tbody id="live-results-tbody"></tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
 
@@ -606,12 +702,22 @@
                     <h3><span class="material-icons-round">article</span> Live Execution Logs</h3>
                     <div style="display:flex; gap:8px">
                         <button class="btn outline small" onclick="toggleShowOnlyRunning()" id="btn-show-only-running"
-                            style="display:none" title="Hide completed scripts' logs">
-                            <span class="material-icons-round">visibility_off</span> Show Only Running
+                            style="display:none" title="Show all scripts (including completed)">
+                            <span class="material-icons-round">visibility</span> <span id="show-only-running-label">Show All</span>
                         </button>
                         <button class="btn outline small" onclick="downloadLogs()" id="btn-download-logs"
                             style="display:none">
                             <span class="material-icons-round">download</span> Download
+                        </button>
+                        <button id="btn-job-html" onclick="downloadJobReport('html')"
+                            style="display:none"
+                            class="btn outline small" title="Download HTML report for this entire job">
+                            <span class="material-icons-round" style="font-size:14px">summarize</span> Job HTML
+                        </button>
+                        <button id="btn-job-excel" onclick="downloadJobReport('excel')"
+                            style="display:none"
+                            class="btn outline small" title="Download Excel report for this entire job">
+                            <span class="material-icons-round" style="font-size:14px">table_chart</span> Job Excel
                         </button>
                     </div>
                 </div>
@@ -968,16 +1074,14 @@
         <!-- USERS VIEW -->
         <!-- ========================================== -->
         <section id="tab-users" class="tab-content">
-            <div class="view-header">
-                <h2>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+                <h2 style="display:flex;align-items:center;gap:8px;margin:0">
                     <span class="material-icons-round">manage_accounts</span>
                     User Management
                 </h2>
-                <div class="header-actions">
-                    <button class="btn btn-outline" onclick="loadUsers(); loadActiveSessions();">
-                        <span class="material-icons-round">refresh</span> Refresh
-                    </button>
-                </div>
+                <button class="btn outline small" onclick="loadUsers(); loadActiveSessions();">
+                    <span class="material-icons-round">refresh</span> Refresh
+                </button>
             </div>
 
             <div class="um-grid">

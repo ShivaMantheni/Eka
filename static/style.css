@@ -833,7 +833,21 @@ input::placeholder {
 /* ---- Data Tables ---- */
 .data-table {
     width: 100%;
-    border-collapse: collapse;
+    border-collapse: separate;
+    border-spacing: 0;
+}
+
+/* Live Results — scrollable body so hundreds of scripts don't overflow the card.
+   thead stays pinned via position:sticky. */
+.live-results-scroll {
+    max-height: 360px;
+    overflow-y: auto;
+}
+.live-results-scroll thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--bg-tertiary);
 }
 
 .data-table th,
@@ -900,6 +914,12 @@ input::placeholder {
 .badge.failed {
     background: var(--red-bg);
     color: var(--red);
+}
+
+.badge.cancelled,
+.badge.stopping {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
 }
 
 /* ---- VS Progress Indicator ---- */
@@ -3163,4 +3183,428 @@ input::placeholder {
         max-width: 100%;
         min-width: 100%;
     }
+}
+
+/* ── Execution Jobs — Job Header Bar ───────────────────────────────────────── */
+.job-header-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: var(--surface2, var(--bg-secondary));
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+}
+.job-select {
+    flex: 1;
+    max-width: 240px;
+    min-width: 120px;
+    padding: 5px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text);
+    font-size: 13px;
+}
+.job-status-badge {
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+.job-status-badge.idle      { background: rgba(100,116,139,0.15); color: #64748b; }
+.job-status-badge.running   { background: rgba(59,130,246,0.15);  color: #3b82f6; }
+.job-status-badge.completed { background: rgba(34,197,94,0.15);   color: #22c55e; }
+.job-status-badge.failed    { background: rgba(239,68,68,0.15);   color: #ef4444; }
+.job-status-badge.cancelled { background: rgba(245,158,11,0.15);  color: #f59e0b; }
+.job-status-badge.stopping  { background: rgba(245,158,11,0.15);  color: #f59e0b; }
+.conflict-banner {
+    display: none;
+    padding: 5px 10px;
+    background: rgba(245,158,11,0.12);
+    border: 1px solid rgba(245,158,11,0.4);
+    border-radius: 6px;
+    color: #d97706;
+    font-size: 12px;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+}
+.conflict-banner.visible { display: flex; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   User Management — full redesign
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Two-column grid */
+.um-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+    margin-top: 16px;
+    align-items: start;
+}
+@media (max-width: 920px) {
+    .um-grid { grid-template-columns: 1fr; }
+}
+
+/* Panel card */
+.um-panel {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.18);
+}
+
+/* Panel header bar */
+.um-panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+}
+
+.um-panel-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.um-panel-title .material-icons-round {
+    font-size: 17px;
+    color: var(--accent);
+}
+
+/* Count badge on panel header */
+.users-count-badge {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 10px;
+    border-radius: 12px;
+    background: var(--accent-glow);
+    color: var(--accent);
+    letter-spacing: 0.02em;
+}
+
+/* Scrollable panel body */
+.um-scroll {
+    max-height: 560px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 0;
+}
+
+/* ── Alphabetical section divider (left panel) ───────────────────────────── */
+.um-alpha-divider {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 20px 6px;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--bg-card);
+}
+
+.um-alpha-divider span {
+    font-size: 11px;
+    font-weight: 800;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    flex-shrink: 0;
+}
+
+.um-alpha-divider::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+    opacity: 0.6;
+}
+
+/* ── User rows (left panel) ──────────────────────────────────────────────── */
+.user-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border);
+    transition: background 0.15s;
+    cursor: default;
+}
+
+.user-row:last-child { border-bottom: none; }
+
+.user-row:hover {
+    background: var(--bg-hover);
+}
+
+.user-row-avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    font-weight: 700;
+    color: #fff;
+    flex-shrink: 0;
+    background: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%);
+}
+
+.user-row-avatar.is-admin {
+    background: linear-gradient(135deg, #7c3aed 0%, #9333ea 100%);
+}
+
+.user-row-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.user-row-name {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.user-row-email {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 1px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.user-row-roles {
+    display: flex;
+    gap: 5px;
+    flex-shrink: 0;
+}
+
+/* Role pill shared */
+.user-role-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 9px;
+    border-radius: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    background: var(--blue-bg);
+    color: var(--blue);
+}
+
+.user-role-badge.is-admin {
+    background: var(--purple-bg);
+    color: var(--purple);
+}
+
+/* ── Session cards (right panel) ─────────────────────────────────────────── */
+.session-card {
+    margin: 10px 12px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 14px 16px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.session-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 4px 16px rgba(99,102,241,0.1);
+}
+
+/* Avatar + info + role badge in a single row */
+.session-card-top {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.session-avatar {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    font-weight: 700;
+    color: #fff;
+    flex-shrink: 0;
+    background: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%);
+}
+
+.session-avatar-admin {
+    background: linear-gradient(135deg, #7c3aed 0%, #9333ea 100%);
+}
+
+.session-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.session-name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.session-email {
+    font-size: 0.76rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.session-you-tag {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 7px;
+    border-radius: 8px;
+    background: var(--green-bg);
+    color: var(--green);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+}
+
+.session-role-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 9px;
+    border-radius: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    flex-shrink: 0;
+}
+
+.session-role-badge.admin {
+    background: var(--purple-bg);
+    color: var(--purple);
+}
+
+.session-role-badge.user {
+    background: var(--blue-bg);
+    color: var(--blue);
+}
+
+/* Bottom row: chips left, revoke right — on a single line */
+.session-card-bottom {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+}
+
+.session-card-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    flex: 1;
+}
+
+.session-meta-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--bg-tertiary);
+    border-radius: 6px;
+    padding: 3px 8px;
+}
+
+.session-meta-chip .material-icons-round {
+    font-size: 12px;
+}
+
+.session-card-actions {
+    flex-shrink: 0;
+}
+
+/* ── Light theme overrides ───────────────────────────────────────────────── */
+[data-theme="light"] .card,
+[data-theme="light"] .glass {
+    background: rgba(255,255,255,0.92);
+    border-color: rgba(0,0,0,0.08);
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+[data-theme="light"] .data-table th {
+    background: #eef0f7;
+}
+
+[data-theme="light"] .live-results-scroll thead th {
+    background: #eef0f7;
+}
+
+[data-theme="light"] .um-panel {
+    background: #fff;
+    border-color: rgba(0,0,0,0.08);
+    box-shadow: 0 2px 16px rgba(0,0,0,0.07);
+}
+
+[data-theme="light"] .um-panel-head {
+    background: #f4f6fb;
+    border-bottom-color: rgba(0,0,0,0.07);
+}
+
+[data-theme="light"] .um-alpha-divider {
+    background: #fff;
+}
+
+[data-theme="light"] .user-row:hover {
+    background: rgba(0,0,0,0.03);
+}
+
+[data-theme="light"] .session-card {
+    background: #fff;
+    border-color: rgba(0,0,0,0.08);
+}
+
+[data-theme="light"] .session-card:hover {
+    box-shadow: 0 4px 14px rgba(99,102,241,0.08);
+}
+
+[data-theme="light"] .session-meta-chip {
+    background: #eef0f7;
+}
+
+[data-theme="light"] #exec-log-container {
+    background: #1e2333;
+}
+
+[data-theme="light"] .job-header-bar {
+    background: #fff;
+    border-color: rgba(0,0,0,0.08);
 }
