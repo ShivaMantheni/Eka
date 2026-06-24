@@ -78,7 +78,6 @@ class ExecutionLog(Base):
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 VS_SOURCE_IMAGE = os.getenv("VS_SOURCE_IMAGE", "/home/hp/anuradha_build_imgs/target/sonic-vs.img")
-VS_IMAGES_PATH = "/var/lib/libvirt/images/"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - vs-service - %(levelname)s - %(message)s")
@@ -94,7 +93,7 @@ def get_db():
     try: yield db
     finally: db.close()
 
-# ── SSH Manager (own isolated copy) ───────────────────────────────────────────
+# ── SSH Manager ────────────────────────────────────────────────────────────────
 class SSHManager:
     def __init__(self, host, port=22, username="admin", password=""):
         self.host, self.port, self.username, self.password = host, port, username, password
@@ -130,6 +129,26 @@ def log_exec(db, execution_id, dut_name, level, message):
     db.add(entry)
     db.commit()
 
+def _sudocmd(password: str, cmd: str) -> str:
+    safe = password.replace("'", "'\\''")
+    return f"echo '{safe}' | sudo -S {cmd}"
+
+def _extract_image_path_from_xml(ssh: SSHManager, xml_full_path: str) -> str:
+    """Read the VS XML on the remote host and return the disk image path."""
+    extract_cmd = _sudocmd_static(
+        f"python3 -c \""
+        f"import xml.etree.ElementTree as ET; "
+        f"root = ET.parse('{xml_full_path}').getroot(); "
+        f"matches = [d.find('source').get('file') for d in root.iter('disk') "
+        f"if d.get('device')=='disk' and d.find('source') is not None]; "
+        f"print(matches[0] if matches else '')\""
+    )
+    out, err, rc = ssh.execute_command(extract_cmd, timeout=15)
+    return out.strip()
+
+def _sudocmd_static(cmd: str) -> str:
+    return f"sudo {cmd}"
+
 # ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
@@ -142,9 +161,6 @@ def list_vms(dut_id: int, db: Session = Depends(get_db)):
     dut = db.query(DUT).filter(DUT.id == dut_id).first()
     if not dut:
         raise HTTPException(status_code=404, detail="DUT not found")
-    if dut.status != "online":
-        raise HTTPException(status_code=425,
-                            detail=f"Device {dut.name} is {dut.status}. Wait for it to come online.")
 
     ssh = SSHManager(dut.ip_address, dut.port, dut.username, dut.password)
     if not ssh.connect():
@@ -193,14 +209,51 @@ def list_xml_files(dut_id: int, db: Session = Depends(get_db)):
     finally:
         ssh.disconnect()
 
+# ── POST /api/vs/{dut_id}/action ──────────────────────────────────────────────
+@app.post("/api/vs/{dut_id}/action")
+def vs_action(dut_id: int, body: dict, db: Session = Depends(get_db)):
+    """Quick VM action: start, destroy, reboot, shutdown, suspend, resume."""
+    dut = db.query(DUT).filter(DUT.id == dut_id).first()
+    if not dut:
+        raise HTTPException(status_code=404, detail="DUT not found")
+
+    vs_name = body.get("vs_name", "").strip()
+    action = body.get("action", "").strip().lower()
+
+    if not vs_name or not action:
+        raise HTTPException(status_code=400, detail="vs_name and action are required")
+
+    allowed = ["start", "destroy", "reboot", "shutdown", "suspend", "resume"]
+    if action not in allowed:
+        raise HTTPException(status_code=400, detail=f"Invalid action. Allowed: {', '.join(allowed)}")
+
+    ssh = SSHManager(dut.ip_address, dut.port, dut.username, dut.password)
+    if not ssh.connect():
+        raise HTTPException(status_code=503, detail=f"Cannot connect to {dut.name}")
+
+    try:
+        if dut.password:
+            safe_pass = dut.password.replace("'", "'\\''")
+            command = f"echo '{safe_pass}' | sudo -S virsh {action} {vs_name}"
+        else:
+            command = f"sudo virsh {action} {vs_name}"
+
+        output, error, exit_code = ssh.execute_command(command, timeout=30)
+        if exit_code != 0:
+            return {"status": "error", "vs_name": vs_name, "action": action,
+                    "message": error.strip() or f"Command failed (exit {exit_code})"}
+        return {"status": "success", "vs_name": vs_name, "action": action,
+                "message": output.strip() or f"'{action}' executed on '{vs_name}'"}
+    finally:
+        ssh.disconnect()
+
 # ── POST /api/vs/update-image ─────────────────────────────────────────────────
 @app.post("/api/vs/update-image")
 def update_vs_image(body: dict, db: Session = Depends(get_db)):
-    """Start VS image update for a single VM."""
+    """Start VS image update for a single VM. Image path resolved from XML."""
     dut_id = body.get("dut_id")
     vs_name = body.get("vs_name", "").strip()
     source_image = body.get("source_image_path", VS_SOURCE_IMAGE).strip()
-    target_image_name = body.get("target_image_name", "").strip()
     source_server_id = body.get("source_server_id")
 
     if not dut_id or not vs_name:
@@ -210,11 +263,8 @@ def update_vs_image(body: dict, db: Session = Depends(get_db)):
     if not dut:
         raise HTTPException(status_code=404, detail="DUT not found")
 
-    if not target_image_name:
-        target_image_name = f"{vs_name}.img"
-
     xml_path = dut.xml_path or "/home/hp/prajwal/VMs"
-    target_image_path = f"{VS_IMAGES_PATH}{target_image_name}"
+    xml_full_path = f"{xml_path}/{vs_name}.xml"
 
     execution = Execution(
         name=f"vs_update_{vs_name}_{int(datetime.utcnow().timestamp())}",
@@ -224,8 +274,7 @@ def update_vs_image(body: dict, db: Session = Depends(get_db)):
     db.refresh(execution)
 
     thread = Thread(target=_run_vs_update,
-                    args=(execution.id, dut_id, vs_name, f"{xml_path}/{vs_name}.xml",
-                          source_image, target_image_path, source_server_id),
+                    args=(execution.id, dut_id, vs_name, xml_full_path, source_image),
                     daemon=True)
     thread.start()
 
@@ -242,8 +291,7 @@ def update_vs_image_batch(body: dict, db: Session = Depends(get_db)):
     vs_entries = body.get("vs_entries")
     if not vs_entries:
         vs_names = body.get("vs_names", [])
-        target_name = body.get("target_image_name", "").strip()
-        vs_entries = [{"vs_name": n, "target_image_name": target_name} for n in vs_names]
+        vs_entries = [{"vs_name": n} for n in vs_names]
 
     if not dut_id or not vs_entries:
         raise HTTPException(status_code=400, detail="dut_id and vs_entries required")
@@ -268,12 +316,8 @@ def update_vs_image_batch(body: dict, db: Session = Depends(get_db)):
             "vs_count": len(vs_entries),
             "message": f"VS batch update started for {len(vs_entries)} VM(s) on {dut.name}"}
 
-def _sudocmd(password: str, cmd: str) -> str:
-    safe = password.replace("'", "'\\''")
-    return f"echo '{safe}' | sudo -S {cmd}"
-
-def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path,
-                   source_image, target_image_path, source_server_id=None):
+# ── Background: single VM update ──────────────────────────────────────────────
+def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image):
     db = SessionLocal()
     execution = None
     try:
@@ -292,6 +336,10 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path,
 
         log_exec(db, execution_id, dut.name, "INFO",
                  f"Starting VS image update for '{vs_name}'")
+        log_exec(db, execution_id, dut.name, "INFO",
+                 f"  Source image: {source_image}")
+        log_exec(db, execution_id, dut.name, "INFO",
+                 f"  Target image: (resolving from XML)")
 
         ssh = SSHManager(dut.ip_address, dut.port, dut.username, dut.password)
         if not ssh.connect():
@@ -302,17 +350,40 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path,
             db.commit()
             return
 
+        def sudocmd(cmd):
+            safe = dut.password.replace("'", "'\\''")
+            return f"echo '{safe}' | sudo -S {cmd}"
+
         try:
-            IMAGES_DIR = "/var/lib/libvirt/images"
+            # Resolve image path from XML on the remote host
+            log_exec(db, execution_id, dut.name, "INFO",
+                     f"▶ Resolving image path from XML: {xml_full_path}")
+            extract_cmd = sudocmd(
+                f"python3 -c \""
+                f"import xml.etree.ElementTree as ET; "
+                f"root = ET.parse('{xml_full_path}').getroot(); "
+                f"matches = [d.find('source').get('file') for d in root.iter('disk') "
+                f"if d.get('device')=='disk' and d.find('source') is not None]; "
+                f"print(matches[0] if matches else '')\""
+            )
+            xml_out, xml_err, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+            target_image_path = xml_out.strip()
+            if xml_rc != 0 or not target_image_path:
+                log_exec(db, execution_id, dut.name, "ERROR",
+                         f"  ✗ Could not resolve image path from XML: "
+                         f"{xml_err.strip() or 'No <disk device=disk> source found'}")
+                execution.status = "failed"
+                execution.end_time = datetime.utcnow()
+                db.commit()
+                return
+            log_exec(db, execution_id, dut.name, "INFO",
+                     f"  ✓ Resolved image path: {target_image_path}")
+
             steps = [
-                ("Step 1/4: Destroying VM",
-                 f"virsh destroy {vs_name}", True),
-                ("Step 2/4: Removing old image",
-                 _sudocmd(dut.password, f"rm -f {target_image_path}"), False),
-                ("Step 3/4: Copying new image",
-                 _sudocmd(dut.password, f"cp {source_image} {target_image_path}"), False),
-                ("Step 4/4: Starting VM",
-                 f"virsh start {vs_name}", False),
+                ("Step 1/4: Destroying VM",   f"virsh destroy {vs_name}",                               True),
+                ("Step 2/4: Removing old image", sudocmd(f"rm -f {target_image_path}"),                 False),
+                ("Step 3/4: Copying new image",  sudocmd(f"cp {source_image} {target_image_path}"),     False),
+                ("Step 4/4: Starting VM",      f"virsh start {vs_name}",                                False),
             ]
 
             all_ok = True
@@ -334,16 +405,15 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path,
                             all_ok = False
                             break
                     else:
-                        log_exec(db, execution_id, dut.name, "INFO",
-                                 f"  ✓ {step_name} completed")
+                        log_exec(db, execution_id, dut.name, "INFO", f"  ✓ {step_name} completed")
                 except Exception as e:
                     log_exec(db, execution_id, dut.name, "ERROR", f"  ✗ {step_name} error: {e}")
                     all_ok = False
                     break
 
             execution.status = "completed" if all_ok else "failed"
-            msg = "✓ VS image update completed successfully" if all_ok else "✗ VS image update FAILED"
-            log_exec(db, execution_id, dut.name, "INFO" if all_ok else "ERROR", msg)
+            log_exec(db, execution_id, dut.name, "INFO" if all_ok else "ERROR",
+                     "✓ VS image update completed" if all_ok else "✗ VS image update FAILED")
 
         finally:
             ssh.disconnect()
@@ -363,6 +433,7 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path,
     finally:
         db.close()
 
+# ── Background: batch VM update ───────────────────────────────────────────────
 def _run_vs_batch_update(execution_id, dut, vs_entries, source_image):
     db = SessionLocal()
     execution = None
@@ -384,25 +455,49 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image):
             db.commit()
             return
 
-        IMAGES_DIR = "/var/lib/libvirt/images"
+        def sudocmd(cmd):
+            safe = dut.password.replace("'", "'\\''")
+            return f"echo '{safe}' | sudo -S {cmd}"
+
         try:
             all_success = True
             for idx, entry in enumerate(vs_entries, 1):
                 vs_name = entry.get("vs_name", "").strip()
-                per_vm_target = entry.get("target_image_name", "").strip()
                 if not vs_name:
                     continue
-                target_name = per_vm_target if per_vm_target else f"{vs_name}.img"
+
                 log_exec(db, execution_id, dut.name, "INFO",
-                         f"══ VM {idx}/{total}: {vs_name} (target: {target_name}) ══")
+                         f"══ VM {idx}/{total}: {vs_name} ══")
+
+                # Resolve image path from XML
+                xml_path = dut.xml_path or "/home/hp/prajwal/VMs"
+                xml_full_path = f"{xml_path}/{vs_name}.xml"
+                log_exec(db, execution_id, dut.name, "INFO",
+                         f"  Resolving image path from XML: {xml_full_path}")
+                extract_cmd = sudocmd(
+                    f"python3 -c \""
+                    f"import xml.etree.ElementTree as ET; "
+                    f"root = ET.parse('{xml_full_path}').getroot(); "
+                    f"matches = [d.find('source').get('file') for d in root.iter('disk') "
+                    f"if d.get('device')=='disk' and d.find('source') is not None]; "
+                    f"print(matches[0] if matches else '')\""
+                )
+                xml_out, xml_err, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+                dest_image_path = xml_out.strip()
+                if xml_rc != 0 or not dest_image_path:
+                    log_exec(db, execution_id, dut.name, "ERROR",
+                             f"  ✗ Could not resolve image path: "
+                             f"{xml_err.strip() or 'No <disk device=disk> source found'}")
+                    all_success = False
+                    continue
+                log_exec(db, execution_id, dut.name, "INFO",
+                         f"  Resolved image path: {dest_image_path}")
 
                 steps = [
-                    ("Step 1/4: Destroying VM", f"virsh destroy {vs_name}", True),
-                    ("Step 2/4: Removing old image",
-                     _sudocmd(dut.password, f"rm -f {IMAGES_DIR}/{target_name}"), False),
-                    ("Step 3/4: Copying new image",
-                     _sudocmd(dut.password, f"cp {source_image} {IMAGES_DIR}/{target_name}"), False),
-                    ("Step 4/4: Starting VM", f"virsh start {vs_name}", False),
+                    ("Step 1/4: Destroying VM",      f"virsh destroy {vs_name}",                            True),
+                    ("Step 2/4: Removing old image",  sudocmd(f"rm -f {dest_image_path}"),                  False),
+                    ("Step 3/4: Copying new image",   sudocmd(f"cp {source_image} {dest_image_path}"),      False),
+                    ("Step 4/4: Starting VM",         f"virsh start {vs_name}",                             False),
                 ]
                 vm_ok = True
                 for step_name, command, allow_fail in steps:
@@ -459,7 +554,7 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image):
         db.close()
 
 # ── WebSocket: VS Update Log Streaming ────────────────────────────────────────
-@app.websocket("/ws/execution/{execution_id}")
+@app.websocket("/ws/vs/execution/{execution_id}")
 async def ws_vs_logs(websocket: WebSocket, execution_id: int):
     await websocket.accept()
     db = SessionLocal()
