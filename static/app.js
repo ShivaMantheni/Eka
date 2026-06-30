@@ -265,42 +265,18 @@ function renderUserBadge() {
 }
 
 /**
- * Logout: terminate local session + redirect to OnePalC Hub logout if SSO is enabled
+ * Logout: clear browser cookie only — session and all workspace data stay intact in DB.
+ * On next login via OnePalC the same session is reused, restoring devices and scripts.
  */
 async function logoutUser() {
-    const sessionId = localStorage.getItem('eka-session-id');
-
-    // Clear localStorage first so no re-entry on redirect
+    // Clear only localStorage — the server-side session stays active to preserve data
     localStorage.removeItem('eka-session-id');
     localStorage.removeItem('eka-user-name');
     localStorage.removeItem('eka-user-email');
     localStorage.removeItem('eka-user-role');
 
-    // Hide badge
-    const badge = document.getElementById('user-badge');
-    const logoutBtn = document.getElementById('logout-btn');
-    if (badge) badge.style.display = 'none';
-    if (logoutBtn) logoutBtn.style.display = 'none';
-
-    try {
-        const cfgRes = await fetch(`${API}/api/onepalc/config`);
-        if (cfgRes.ok) {
-            const cfg = await cfgRes.json();
-            if (cfg.enabled && cfg.hub_auth_url) {
-                // SSO logout: backend terminates session cookie + redirects to Hub logout
-                window.location.href = `${API}/api/onepalc/logout`;
-                return;
-            }
-        }
-    } catch (_) { /* ignore */ }
-
-    // Non-SSO: terminate session via API then reload
-    if (sessionId) {
-        try {
-            await fetch(`${API}/api/sessions/${sessionId}`, { method: 'DELETE' });
-        } catch (_) { /* ignore */ }
-    }
-    window.location.reload();
+    // Redirect through backend logout (clears the eka_session_id cookie, then to OnePalC)
+    window.location.href = `${API}/api/onepalc/logout`;
 }
 
 /**

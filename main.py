@@ -9017,23 +9017,14 @@ def onepalc_logout(request: Request, db: Session = Depends(get_db)):
     """
     from fastapi.responses import RedirectResponse
 
-    # Terminate ALL active sessions for this user (cookie session + any other open tabs/devices)
+    # Logout: only clear the browser cookie — keep the session ACTIVE in the DB so that
+    # devices, scripts and all workspace data are preserved for when the user logs back in.
+    # The hub-callback reuses existing active sessions on next login (see reuse logic above).
     session_id = request.cookies.get("eka_session_id", "").strip()
     if session_id:
-        current = db.query(UserSession).filter(UserSession.session_id == session_id).first()
-        if current:
-            user_name = current.user_name
-            try:
-                # Mark every active session for this user as terminated
-                db.query(UserSession).filter(
-                    UserSession.user_name == user_name,
-                    UserSession.status == "active"
-                ).update({"status": "terminated"})
-                db.commit()
-                logger.info(f"[OnePalC] Logout: all sessions terminated for user '{user_name}'")
-            except Exception as e:
-                logger.error(f"[OnePalC] Failed to terminate sessions on logout: {e}")
-                db.rollback()
+        session = db.query(UserSession).filter(UserSession.session_id == session_id).first()
+        if session:
+            logger.info(f"[OnePalC] Logout: clearing cookie for user '{session.user_name}' — session kept active for data preservation")
 
     logout_url = _ONEPALC_HUB_AUTH_URL.replace("/login", "/logout") if _ONEPALC_HUB_AUTH_URL else "/"
     response = RedirectResponse(url=logout_url, status_code=302)
