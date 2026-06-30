@@ -201,8 +201,45 @@ async function initializeSession() {
         }
     }
 
-    // No valid session - auto-create one without modal
-    await autoCreateSession();
+    // No localStorage session — check if SSO set the eka_session_id cookie
+    // (happens when backend does the redirect but frontend localStorage was cleared)
+    const cookieSession = document.cookie.split(';').map(c => c.trim())
+        .find(c => c.startsWith('eka_session_id='));
+    if (cookieSession) {
+        const cookieId = cookieSession.split('=')[1];
+        const valid = await validateSession(cookieId);
+        if (valid) {
+            localStorage.setItem('eka-session-id', cookieId);
+            console.log('Session restored from SSO cookie:', cookieId);
+            renderUserBadge();
+            startSessionKeepAlive();
+            return;
+        }
+    }
+
+    // No valid session — redirect to OnePalC login
+    try {
+        const cfgRes = await fetch(`${API}/api/onepalc/config`);
+        if (cfgRes.ok) {
+            const cfg = await cfgRes.json();
+            if (cfg.hub_auth_url) {
+                const callback = cfg.callback_url || (window.location.origin + '/hub-callback');
+                const loginUrl = `${cfg.hub_auth_url}?app_name=${encodeURIComponent(cfg.app_name)}&redirect_uri=${encodeURIComponent(callback)}`;
+                window.location.href = loginUrl;
+                return;
+            }
+        }
+    } catch (_) { /* ignore */ }
+
+    // Fallback: hub URL not reachable — show a plain error message (no manual modal)
+    document.body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100vh;
+        background:#111;color:#fff;font-family:sans-serif;flex-direction:column;gap:16px">
+        <span style="font-size:48px">🔒</span>
+        <h2 style="margin:0">Authentication Required</h2>
+        <p style="margin:0;color:#aaa">Could not reach OnePalC login server. Contact your administrator.</p>
+        <button onclick="location.reload()" style="padding:10px 24px;background:#4CAF50;color:#fff;
+            border:none;border-radius:6px;cursor:pointer;font-size:14px">Retry</button>
+    </div>`;
 }
 
 /**
@@ -211,18 +248,59 @@ async function initializeSession() {
 function renderUserBadge() {
     const badge = document.getElementById('user-badge');
     const badgeName = document.getElementById('user-badge-name');
+    const logoutBtn = document.getElementById('logout-btn');
     const userName = localStorage.getItem('eka-user-name');
-    
+
     if (badge && badgeName && userName) {
         badgeName.textContent = userName;
         badge.style.display = 'inline-flex';
-        
+        if (logoutBtn) logoutBtn.style.display = 'inline-flex';
+
         // Add role to tooltip if available
         const role = localStorage.getItem('eka-user-role');
         if (role) {
             badge.title = 'User: ' + userName + ' | Role: ' + role;
         }
     }
+}
+
+/**
+ * Logout: terminate local session + redirect to OnePalC Hub logout if SSO is enabled
+ */
+async function logoutUser() {
+    const sessionId = localStorage.getItem('eka-session-id');
+
+    // Clear localStorage first so no re-entry on redirect
+    localStorage.removeItem('eka-session-id');
+    localStorage.removeItem('eka-user-name');
+    localStorage.removeItem('eka-user-email');
+    localStorage.removeItem('eka-user-role');
+
+    // Hide badge
+    const badge = document.getElementById('user-badge');
+    const logoutBtn = document.getElementById('logout-btn');
+    if (badge) badge.style.display = 'none';
+    if (logoutBtn) logoutBtn.style.display = 'none';
+
+    try {
+        const cfgRes = await fetch(`${API}/api/onepalc/config`);
+        if (cfgRes.ok) {
+            const cfg = await cfgRes.json();
+            if (cfg.enabled && cfg.hub_auth_url) {
+                // SSO logout: backend terminates session cookie + redirects to Hub logout
+                window.location.href = `${API}/api/onepalc/logout`;
+                return;
+            }
+        }
+    } catch (_) { /* ignore */ }
+
+    // Non-SSO: terminate session via API then reload
+    if (sessionId) {
+        try {
+            await fetch(`${API}/api/sessions/${sessionId}`, { method: 'DELETE' });
+        } catch (_) { /* ignore */ }
+    }
+    window.location.reload();
 }
 
 /**
@@ -1512,6 +1590,9 @@ function _syncExecutionView(latestExec, jobScripts) {
 
 async function switchJob(newId) {
     if (!newId || newId === activeJobId) return;
+    // Clear schedule label immediately so old job's time never bleeds into new job
+    const _nrEl = document.getElementById('job-next-run');
+    if (_nrEl) { _nrEl.textContent = ''; _nrEl.style.display = 'none'; }
     // Flush the OUTGOING job's state without blocking the switch.
     // This used to `await saveJobState(true)` here — but this call sits OUTSIDE the try
     // below, so if the PUT stalled while the server was busy during a running execution,
@@ -1649,6 +1730,8 @@ async function deleteActiveJob() {
         }
         activeJobList = activeJobList.filter(j => j.id !== activeJobId);
         activeJobId = null;
+        const _nrEl = document.getElementById('job-next-run');
+        if (_nrEl) { _nrEl.textContent = ''; _nrEl.style.display = 'none'; }
         if (activeJobList.length > 0) {
             await switchJob(activeJobList[0].id);
         } else {
@@ -1728,27 +1811,37 @@ async function openScheduleModal() {
     if (!modal) return;
     modal.style.display = 'flex';
 
+    // Always reset fields first so stale values from a previous job never show
+    document.querySelectorAll('input[name="sched-type"]').forEach(r => { r.checked = r.value === 'none'; });
+    document.getElementById('sched-at-input').value = '';
+    document.getElementById('sched-cron-preset').value = 'daily';
+    document.getElementById('sched-daily-time').value = '';
+    document.getElementById('sched-cron-expr').value = '';
+    const infoEl = document.getElementById('sched-info');
+    if (infoEl) infoEl.textContent = '';
+    onSchedTypeChange();
+    onCronPresetChange();
+
     // Load current schedule from server
     try {
         const res = await fetch(`${API}/api/execution-jobs/${activeJobId}/schedule`,
             { headers: getSessionHeaders() });
         const data = res.ok ? await res.json() : {};
 
-        // Set radio
-        const radios = document.querySelectorAll('input[name="sched-type"]');
-        radios.forEach(r => { r.checked = r.value === (data.schedule_type || 'none'); });
+        // Set radio to actual schedule type
+        const stype = data.schedule_type || 'none';
+        document.querySelectorAll('input[name="sched-type"]').forEach(r => { r.checked = r.value === stype; });
         onSchedTypeChange();
 
-        // Populate once field
+        // Populate once field — only if this job actually has a schedule_at
         if (data.schedule_at) {
-            // Convert UTC ISO to local datetime-local string
             const d = new Date(data.schedule_at + 'Z');
             const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000)
                 .toISOString().slice(0, 16);
             document.getElementById('sched-at-input').value = local;
         }
 
-        // Populate cron fields
+        // Populate cron fields — only if this job has a cron expression
         if (data.schedule_cron) {
             const expr = data.schedule_cron;
             if (/^\d{1,2}:\d{2}$/.test(expr)) {
@@ -1763,21 +1856,17 @@ async function openScheduleModal() {
             onCronPresetChange();
         }
 
-        // Info line — show times in local timezone
-        const info = document.getElementById('sched-info');
+        // Info line
         const parts = [];
-        if (data.last_run_at) {
-            parts.push(`Last run: ${new Date(data.last_run_at + 'Z').toLocaleString()}`);
-        }
+        if (data.last_run_at) parts.push(`Last run: ${new Date(data.last_run_at + 'Z').toLocaleString()}`);
         if (data.next_run) {
             try {
-                const utcStr = data.next_run.replace(' UTC', 'Z').replace(' ', 'T');
-                parts.push(`Next run: ${new Date(utcStr).toLocaleString()}`);
+                parts.push(`Next run: ${new Date(data.next_run.replace(' UTC', 'Z').replace(' ', 'T')).toLocaleString()}`);
             } catch (_) {
                 parts.push(`Next run: ${data.next_run}`);
             }
         }
-        if (info) info.textContent = parts.join('  ·  ');
+        if (infoEl) infoEl.textContent = parts.join('  ·  ');
     } catch (_) {}
 }
 
@@ -1849,17 +1938,24 @@ async function saveSchedule() {
 function _renderNextRunLabel(data) {
     const el = document.getElementById('job-next-run');
     if (!el) return;
-    if (data && data.next_run && data.schedule_enabled) {
-        // next_run is "YYYY-MM-DD HH:MM UTC" — convert to local time for display
-        try {
-            const utcStr = data.next_run.replace(' UTC', 'Z').replace(' ', 'T');
-            const local  = new Date(utcStr).toLocaleString([], {
-                month: 'short', day: 'numeric',
-                hour: '2-digit', minute: '2-digit',
-            });
-            el.textContent = `⏰ Next: ${local}`;
-        } catch (_) {
-            el.textContent = `⏰ ${data.next_run}`;
+    if (data && data.schedule_enabled && data.schedule_type && data.schedule_type !== 'none') {
+        if (data.next_run) {
+            try {
+                const utcStr = data.next_run.replace(' UTC', 'Z').replace(' ', 'T');
+                const local  = new Date(utcStr).toLocaleString([], {
+                    month: 'short', day: 'numeric',
+                    hour: '2-digit', minute: '2-digit',
+                });
+                el.textContent = `⏰ Next: ${local}`;
+            } catch (_) {
+                el.textContent = `⏰ ${data.next_run}`;
+            }
+        } else {
+            // schedule_enabled but next_run not yet computed (scheduler still loading)
+            const typeHint = data.schedule_type === 'once' && data.schedule_at
+                ? new Date(data.schedule_at + 'Z').toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+                : data.schedule_cron || '';
+            el.textContent = `⏰ Scheduled${typeHint ? ': ' + typeHint : ''}`;
         }
         el.style.display = '';
     } else {
@@ -5495,11 +5591,21 @@ function onVSHostChange() {
     const dutId = document.getElementById('vs-host').value;
     selectedVSNames.clear();
     updateVSSelectionSummary();
+    // Reset spin source dropdown
+    const spinSel = document.getElementById('spin-source-vs');
+    if (spinSel) spinSel.innerHTML = '<option value="">-- Select host device first --</option>';
+    const xmlEl = document.getElementById('spin-xml-preview');
+    const imgEl = document.getElementById('spin-image-preview');
+    if (xmlEl) { xmlEl.value = ''; xmlEl.placeholder = 'Select a VS above'; }
+    if (imgEl) { imgEl.value = ''; imgEl.placeholder = 'Select a VS to read image path'; }
+
     if (!dutId) {
         document.getElementById('vs-vm-list').innerHTML = '<p class="muted" style="padding:16px;text-align:center">Select a host device to see VMs</p>';
+        document.getElementById('vs-stats-bar').style.display = 'none';
         return;
     }
     loadVSList(dutId);
+    fetchVSNames();
 }
 
 function refreshVSList() {
@@ -5553,6 +5659,8 @@ async function loadVSList(dutId) {
         const data = await res.json();
         if (!data.vms || !data.vms.length) {
             el.innerHTML = '<p class="muted" style="padding:16px;text-align:center">No VMs found on this host.</p>';
+            document.getElementById('vs-stats-bar').style.display = 'none';
+
             updateVSSelectionCount();
             return;
         }
@@ -5566,7 +5674,7 @@ async function loadVSList(dutId) {
                     </th>
                     <th>VM Name</th>
                     <th>State</th>
-                    <th>Target Image Name</th>
+                    <th></th>
                     <th style="width:100px">Action</th>
                 </tr>
             </thead>
@@ -5593,12 +5701,8 @@ async function loadVSList(dutId) {
                             : 'var(--text-muted)';
 
             const checked = selectedVSNames.has(vm.name) ? 'checked' : '';
-            // Auto-generate target: sp-Sonic-102 → Dlink-sonic-vs2.img
-            const numMatch = vm.name.match(/(\d+)\s*$/);
-            const vsNum = numMatch ? numMatch[1].replace(/^10/, (m) => m === '10' ? '10' : m).replace(/^0+/, '') : '';
-            // Extract trailing number: sp-Sonic-101 → 1, sp-Sonic-110 → 10
-            const rawNum = numMatch ? parseInt(numMatch[1], 10) % 100 : 0;
-            const defaultTarget = rawNum > 0 ? `Dlink-sonic-vs${rawNum}.img` : `${vm.name}.img`;
+            // Image path is resolved from the VM's XML on the backend — show it read-only here
+            const xmlImageName = vm.image_path ? vm.image_path.split('/').pop() : '';
 
             // Action button based on state
             let actionBtn = '';
@@ -5644,10 +5748,10 @@ async function loadVSList(dutId) {
                 </td>
                 <td><span class="badge ${stateClass}" style="white-space:nowrap">${esc(vm.state)}</span></td>
                 <td>
-                    <input type="text" class="vs-target-input" data-vm="${esc(vm.name)}"
-                        value="${esc(defaultTarget)}"
-                        placeholder="${esc(defaultTarget)}"
-                        style="width:100%;padding:5px 8px;font-size:0.82rem;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:var(--mono)">
+                    <span style="font-family:var(--mono);font-size:0.8rem;color:var(--text-secondary)"
+                          title="Resolved automatically from ${esc(vm.name)}.xml on the host">
+                        ${esc(xmlImageName)}
+                    </span>
                 </td>
                 <td>${actionBtn}</td>
             </tr>`;
@@ -5655,6 +5759,24 @@ async function loadVSList(dutId) {
 
         html += `</tbody></table>`;
         el.innerHTML = html;
+
+        // Compute and show T/R/D/P stats
+        let cntR = 0, cntP = 0, cntD = 0;
+        data.vms.forEach(vm => {
+            const s = (vm.state || '').toLowerCase();
+            if (s.includes('running')) cntR++;
+            else if (s.includes('paused')) cntP++;
+            else cntD++;
+        });
+        const cntT = data.vms.length;
+        const statsBar = document.getElementById('vs-stats-bar');
+        statsBar.innerHTML =
+            `<span style="font-weight:600;color:var(--text-secondary)">T:<span style="color:var(--text-primary);margin-left:3px">${cntT}</span></span>` +
+            `<span style="font-weight:600;color:var(--green)">R:${cntR}</span>` +
+            `<span style="font-weight:600;color:var(--text-muted)">D:${cntD}</span>` +
+            (cntP > 0 ? `<span style="font-weight:600;color:var(--yellow,#f59e0b)">P:${cntP}</span>` : '');
+        statsBar.style.display = 'flex';
+
         updateVSSelectAllCheckbox();
         updateVSSelectionCount();
     } catch (e) {
@@ -5695,9 +5817,232 @@ function updateVSSelectAllCheckbox() {
 function updateVSSelectionCount() {
     const countEl = document.getElementById('vs-selection-count');
     const btn = document.getElementById('btn-vs-update');
+    const btnRemove = document.getElementById('btn-remove-vs');
     const n = selectedVSNames.size;
     if (countEl) countEl.textContent = n > 0 ? `${n} selected` : '';
     if (btn) btn.disabled = n === 0;
+    if (btnRemove) btnRemove.disabled = n === 0;
+}
+
+function updateSpinPreview() {
+    const proj = (document.getElementById('spin-project').value || '').toUpperCase().trim();
+    const user = (document.getElementById('spin-username').value || '').trim();
+    const num  = (document.getElementById('spin-number').value || '').trim();
+    const vsName = proj && user && num ? `${proj}_${user}_${num}` : '—';
+    document.getElementById('spin-vs-preview').textContent = vsName;
+}
+
+async function fetchVSNames() {
+    const dutId = document.getElementById('vs-host').value;
+    if (!dutId) { toast('Select a host device first', 'error'); return; }
+    const sel = document.getElementById('spin-source-vs');
+    sel.innerHTML = '<option value="">Loading…</option>';
+    try {
+        const res = await fetch(`${API}/api/vs/${dutId}/vs-names`);
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+        const data = await res.json();
+        const names = data.vs_names || [];
+        if (names.length === 0) {
+            sel.innerHTML = '<option value="">No VS XML files found on host</option>';
+            return;
+        }
+        sel.innerHTML = '<option value="">-- Select VS --</option>' +
+            names.map(n => `<option value="${n}">${n}</option>`).join('');
+    } catch (e) {
+        sel.innerHTML = '<option value="">Error loading VS names</option>';
+        toast('Failed to fetch VS names: ' + e.message, 'error');
+    }
+}
+
+async function onSourceVSChange() {
+    const dutId  = document.getElementById('vs-host').value;
+    const vsName = document.getElementById('spin-source-vs').value;
+    const xmlEl  = document.getElementById('spin-xml-preview');
+    const imgEl  = document.getElementById('spin-image-preview');
+
+    if (!vsName) {
+        xmlEl.value = ''; imgEl.value = '';
+        xmlEl.placeholder = 'Select a VS above';
+        imgEl.placeholder = 'Select a VS to read image path';
+        return;
+    }
+
+    // Show XML path immediately from DUT data
+    const dut = dutsData.find(d => d.id == dutId);
+    if (dut && dut.xml_path) xmlEl.value = `${dut.xml_path}/${vsName}.xml`;
+
+    // Fetch image path from XML on host
+    imgEl.value = '';
+    imgEl.placeholder = 'Reading image path from XML…';
+    try {
+        const res = await fetch(`${API}/api/vs/${dutId}/xml-info?vs_name=${encodeURIComponent(vsName)}`);
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+        const data = await res.json();
+        imgEl.value = data.image_path || '';
+        if (!data.image_path) imgEl.placeholder = 'Image path not found in XML';
+    } catch (e) {
+        imgEl.placeholder = 'Failed to read image path';
+        toast('Could not read XML: ' + e.message, 'error');
+    }
+}
+
+async function spinVS() {
+    const dutId    = document.getElementById('vs-host').value;
+    const sourceVS = document.getElementById('spin-source-vs').value;
+    const proj     = (document.getElementById('spin-project').value || '').toUpperCase().trim();
+    const user     = (document.getElementById('spin-username').value || '').trim();
+    const num      = (document.getElementById('spin-number').value || '').trim();
+
+    if (!dutId)    { toast('Select a host device first', 'error'); return; }
+    if (!sourceVS) { toast('Select a source VS first', 'error'); return; }
+    if (!proj || proj.length !== 4) { toast('Project name must be exactly 4 letters', 'error'); return; }
+    if (!user)     { toast('Username is required', 'error'); return; }
+    if (!num)      { toast('VS number is required', 'error'); return; }
+
+    const vsName = `${proj}_${user}_${num}`;
+
+    if (!confirm(`Spin new VS "${vsName}" from "${sourceVS}"?\n\n  1. Clone XML with new name\n  2. virsh define\n  3. virsh start`)) return;
+
+    const progressTitle = document.getElementById('vs-progress-title');
+    if (progressTitle) progressTitle.textContent = `Spin VS — ${vsName}`;
+    _initVSProgress(['Validate + Clone XML', 'Define VS', 'Start VS']);
+
+    const logEl = document.getElementById('vs-log-container');
+    logEl.innerHTML = `<div class="log-placeholder"><span class="material-icons-round spin">sync</span><p>Spinning up ${vsName}…</p></div>`;
+
+    const btnSpin = document.getElementById('btn-spin-vs');
+    btnSpin.disabled = true;
+    btnSpin.innerHTML = '<span class="material-icons-round spin">sync</span> Spinning…';
+
+    try {
+        const res = await fetch(`${API}/api/vs/${dutId}/spin`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ vs_name: vsName, source_vs: sourceVS }),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || res.statusText);
+        }
+        const data = await res.json();
+        toast(`Spin started for ${vsName}`, 'success');
+        await waitForVSCompletion(data.execution_id, vsName, logEl);
+        toast(`✓ ${vsName} is running`, 'success');
+        setTimeout(() => loadVSList(dutId), 2000);
+    } catch (e) {
+        toast(`Spin failed: ${e.message}`, 'error');
+    } finally {
+        btnSpin.disabled = false;
+        btnSpin.innerHTML = '<span class="material-icons-round">play_circle</span> Spin VS';
+    }
+}
+
+async function removeSelectedVS() {
+    const dutId = document.getElementById('vs-host').value;
+    if (!dutId) { toast('Select a host device first', 'error'); return; }
+    if (selectedVSNames.size === 0) { toast('Select a VM from the list first', 'error'); return; }
+    if (selectedVSNames.size > 1) { toast('Select only one VM to remove at a time', 'error'); return; }
+
+    const vsName = [...selectedVSNames][0];
+
+    // Two-step confirmation: type VS name exactly
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:2000;display:flex;align-items:center;justify-content:center';
+
+    const modal = document.createElement('div');
+    modal.style.cssText = 'background:var(--bg-secondary);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:450px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5)';
+    modal.innerHTML = `
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+            <span class="material-icons-round" style="color:var(--red);font-size:32px">delete_forever</span>
+            <h3 style="margin:0;font-size:1.2rem;color:var(--text-primary)">Remove VS Permanently</h3>
+        </div>
+        <p style="color:var(--text-secondary);margin:0 0 8px 0;line-height:1.6">
+            This will <strong style="color:var(--red)">permanently delete</strong> VS:
+            <strong style="color:var(--text-primary)">${esc(vsName)}</strong>
+        </p>
+        <p style="color:var(--text-muted);font-size:0.85rem;margin:0 0 16px 0">
+            Removes: virsh undefine, XML file, image file. This cannot be undone.
+        </p>
+        <p style="color:var(--text-muted);font-size:0.88rem;margin:0 0 6px 0">Type VS name to confirm:</p>
+        <input type="text" id="vs-remove-confirm-input" placeholder="Enter: ${esc(vsName)}"
+            style="width:100%;padding:10px;font-size:0.95rem;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:var(--mono);margin-bottom:8px;box-sizing:border-box">
+        <div id="vs-remove-error" style="color:var(--red);font-size:0.82rem;margin-bottom:12px;display:none"></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button id="vs-remove-cancel" class="btn outline" style="padding:8px 16px">Cancel</button>
+            <button id="vs-remove-confirm" class="btn" style="padding:8px 16px;background:var(--red);border-color:var(--red)">Remove</button>
+        </div>`;
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const confirmed = await new Promise((resolve) => {
+        const inp = document.getElementById('vs-remove-confirm-input');
+        const errDiv = document.getElementById('vs-remove-error');
+        setTimeout(() => inp.focus(), 100);
+
+        document.getElementById('vs-remove-confirm').addEventListener('click', () => {
+            if (inp.value.trim() === vsName) {
+                document.body.removeChild(overlay); resolve(true);
+            } else {
+                errDiv.textContent = `Name does not match "${vsName}"`;
+                errDiv.style.display = 'block';
+                inp.select();
+            }
+        });
+        document.getElementById('vs-remove-cancel').addEventListener('click', () => {
+            document.body.removeChild(overlay); resolve(false);
+        });
+        inp.addEventListener('keypress', e => { if (e.key === 'Enter') document.getElementById('vs-remove-confirm').click(); });
+        overlay.addEventListener('keydown', e => { if (e.key === 'Escape') document.getElementById('vs-remove-cancel').click(); });
+    });
+
+    if (!confirmed) return;
+
+    // Set up progress UI for remove (3 steps + step 4 hidden)
+    const progressTitle = document.getElementById('vs-progress-title');
+    if (progressTitle) progressTitle.textContent = `Remove VS — ${vsName}`;
+    _initVSProgress(['Destroy + Undefine', 'Remove XML', 'Remove Image', '']);
+
+    const logEl = document.getElementById('vs-log-container');
+    logEl.innerHTML = `<div class="log-placeholder"><span class="material-icons-round spin">sync</span><p>Removing ${vsName}...</p></div>`;
+
+    const btnRemove = document.getElementById('btn-remove-vs');
+    btnRemove.disabled = true;
+    btnRemove.innerHTML = '<span class="material-icons-round spin">sync</span> Removing...';
+
+    try {
+        const res = await fetch(`${API}/api/vs/${dutId}/remove/${encodeURIComponent(vsName)}`, {
+            method: 'DELETE',
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || res.statusText);
+        }
+        const data = await res.json();
+        toast(`Removal started for ${vsName}`, 'info');
+        await waitForVSCompletion(data.execution_id, vsName, logEl);
+        toast(`✓ ${vsName} removed`, 'success');
+        selectedVSNames.clear();
+        updateVSSelectionCount();
+        setTimeout(() => loadVSList(dutId), 2000);
+    } catch (e) {
+        toast(`Remove failed: ${e.message}`, 'error');
+    } finally {
+        btnRemove.disabled = selectedVSNames.size === 0;
+        btnRemove.innerHTML = '<span class="material-icons-round">delete_forever</span> Remove Selected VS';
+    }
+}
+
+function _initVSProgress(labels) {
+    const progress = document.getElementById('vs-progress');
+    progress.style.display = '';
+    progress.querySelectorAll('.vs-step').forEach((s, i) => {
+        s.classList.remove('active', 'done', 'error', 'pending');
+        s.classList.add('pending');
+        const lbl = labels[i] || '';
+        const lblEl = document.getElementById(`vs-step-label-${i + 1}`);
+        if (lblEl) lblEl.textContent = lbl;
+        s.style.display = lbl ? '' : 'none';
+    });
 }
 
 function updateVSSelectionSummary() {
@@ -5841,31 +6186,25 @@ async function startVSUpdate() {
     if (!dutId) { toast('Select a host device', 'error'); return; }
     if (!selectedVSNames.size) { toast('Select at least one VM using the checkboxes', 'error'); return; }
 
-    // Build per-VM list: read target image from each row's input
+    // Build per-VM list — no target name needed, backend reads it from each VM's XML
     const vsEntries = [];
-    selectedVSNames.forEach(vmName => {
-        const input = document.querySelector(`.vs-target-input[data-vm="${vmName}"]`);
-        const targetImage = input ? input.value.trim() : `${vmName}.img`;
-        vsEntries.push({ vs_name: vmName, target_image_name: targetImage || `${vmName}.img` });
-    });
+    selectedVSNames.forEach(vmName => vsEntries.push({ vs_name: vmName }));
 
-    console.log('[VS] vsEntries:', vsEntries);
-
-    // Show inline confirmation in log area instead of browser confirm()
+    // Show inline confirmation
     const logEl = document.getElementById('vs-log-container');
     const vmRows = vsEntries.map(e =>
-        `<div style="padding:3px 0;font-family:var(--mono);font-size:0.82rem">• <b>${esc(e.vs_name)}</b> → ${esc(e.target_image_name)}</div>`
+        `<div style="padding:3px 0;font-family:var(--mono);font-size:0.82rem">• <b>${esc(e.vs_name)}</b> <span style="color:var(--text-secondary)">(image name from XML)</span></div>`
     ).join('');
 
-    // Get source server name for display
     const sourceServerName = sourceServerId ? (dutsData.find(d => d.id == sourceServerId)?.name || 'Unknown') : 'Host Device (Local)';
     const copyMethod = sourceServerId ? '(Direct SCP Copy)' : '(Local Copy)';
 
     logEl.innerHTML = `<div style="padding:16px">
-        <div style="font-weight:600;margin-bottom:8px">⚠ Confirm batch update for ${vsEntries.length} VM(s):</div>
+        <div style="font-weight:600;margin-bottom:8px">⚠ Confirm update for ${vsEntries.length} VM(s):</div>
         ${vmRows}
         <div style="margin-top:8px;font-size:0.82rem;color:var(--text-secondary)">Source Server: ${esc(sourceServerName)} ${copyMethod}</div>
-        <div style="font-size:0.82rem;color:var(--text-secondary)">Source Path: ${esc(sourceImage)}</div>
+        <div style="font-size:0.82rem;color:var(--text-secondary)">Source Image: <span style="font-family:var(--mono)">${esc(sourceImage)}</span></div>
+        <div style="font-size:0.82rem;color:var(--text-secondary);margin-top:4px">Target path &amp; filename resolved from each VM's XML file on the host.</div>
         <div style="margin-top:12px;display:flex;gap:8px">
             <button class="btn primary" onclick="execVSUpdate()" style="padding:8px 20px">
                 <span class="material-icons-round" style="font-size:16px">rocket_launch</span> Confirm & Start Update
@@ -5893,13 +6232,9 @@ async function execVSUpdate() {
 
     // Reset progress UI
     vsLogs = [];
-    const progress = document.getElementById('vs-progress');
-    progress.style.display = '';
-    // Initialize all steps to pending, reset any previous states
-    progress.querySelectorAll('.vs-step').forEach(s => {
-        s.classList.remove('active', 'done', 'error', 'pending');
-        s.classList.add('pending');
-    });
+    const progressTitle = document.getElementById('vs-progress-title');
+    if (progressTitle) progressTitle.textContent = 'Update VS Image';
+    _initVSProgress(['Destroy VM', 'Remove Old Image', 'Copy New Image', 'Start VM']);
     const logEl = document.getElementById('vs-log-container');
     logEl.innerHTML = `<div class="log-placeholder"><span class="material-icons-round spin">sync</span><p>Starting VS image update for ${vsEntries.length} VM(s)...</p></div>`;
 
@@ -5982,7 +6317,7 @@ async function execVSUpdate() {
 
     // Done — all VMs processed
     btn.disabled = false;
-    btn.innerHTML = '<span class="material-icons-round">rocket_launch</span> Update Image & Restart VMs';
+    btn.innerHTML = '<span class="material-icons-round">rocket_launch</span> Update Image &amp; Restart Selected VMs';
 
     if (allOk) {
         toast(`All ${vsEntries.length} VM(s) updated successfully!`, 'success');
@@ -6172,16 +6507,14 @@ function updateVSProgress(log) {
     // Debug: Log all messages to console for debugging
     console.log('[VS Progress] Message:', msg);
 
-    // Map backend steps to UI steps (keep only 4)
-    // Step 1/6 → UI Step 1 (Destroy VM)
-    // Step 2/6 → UI Step 2 (Remove Old Image)
-    // Step 3/6 → UI Step 3 (Copy New Image)
-    // Step 6/6 → UI Step 4 (Start VM)
+    // Map backend steps to UI steps
+    // Update (6-step): 1/6→1, 2/6→2, 3/6→3, 6/6→4
+    // Spin  (4-step):  1/4→1, 2/4→2, 3/4→3, 4/4→4
+    // Remove(3-step):  1/3→1, 2/3→2, 3/3→3
     const stepMap = {
-        'Step 1/6': '1',
-        'Step 2/6': '2',
-        'Step 3/6': '3',
-        'Step 6/6': '4',
+        'Step 1/6': '1', 'Step 2/6': '2', 'Step 3/6': '3', 'Step 6/6': '4',
+        'Step 1/4': '1', 'Step 2/4': '2', 'Step 3/4': '3', 'Step 4/4': '4',
+        'Step 1/3': '1', 'Step 2/3': '2', 'Step 3/3': '3',
     };
 
     let stepFound = false;
@@ -7145,110 +7478,212 @@ async function loadUsers() {
     const countBadge = document.getElementById('users-count-badge');
     if (!container) return;
 
-    // Show loading state
     container.innerHTML = `
-        <div class="user-row" style="justify-content:center; padding:32px; border:none;">
+        <div class="user-row" style="justify-content:center;padding:32px;border:none;">
             <span class="loader"></span>
-            <span style="margin-left:12px; color:var(--text-muted); font-size:0.9rem;">Loading users…</span>
+            <span style="margin-left:12px;color:var(--text-muted);font-size:0.9rem;">Loading users…</span>
         </div>`;
     if (countBadge) countBadge.style.display = 'none';
 
     try {
-        const res = await fetch('/api/onepalc/users?_t=' + Date.now());
-        if (!res.ok) throw new Error('Failed to fetch users. Ensure SSO is enabled and the API Token is correct.');
+        const res = await fetch(`${API}/api/users`, { headers: getSessionHeaders() });
+        if (!res.ok) throw new Error(`Failed to load users (HTTP ${res.status})`);
+        const data = await res.json();
+        const users = Array.isArray(data) ? data : (data.users || []);
 
-        let data = await res.json();
-        console.log('Hub API Payload:', data);
+        if (countBadge) {
+            countBadge.textContent = users.length;
+            countBadge.style.display = 'inline-flex';
+        }
 
-        if (data.error) throw new Error(data.error);
-
-        let users = Array.isArray(data) ? data : (data.users || data.data || []);
-        console.log('Extracted users array length:', users.length);
-
-        // Filter: only show users who have at least one application role assigned
-        const ekaUsers = users.filter(u =>
-            Array.isArray(u.application_roles) && u.application_roles.length > 0
-        );
-        console.log(`Filtered to ${ekaUsers.length} Eka users (with application_roles)`);
-
-        if (ekaUsers.length === 0) {
+        if (users.length === 0) {
             container.innerHTML = `
-                <div class="user-row" style="justify-content:center; padding:40px; border:none; color:var(--text-muted);">
-                    No users found. Check AccessHub assignment for this application.
+                <div class="user-row" style="justify-content:center;padding:40px;border:none;color:var(--text-muted);flex-direction:column;gap:8px;text-align:center">
+                    <span class="material-icons-round" style="font-size:36px;opacity:0.3">group_off</span>
+                    <span>No users yet. Click <b>Add User</b> to create the first account.</span>
                 </div>`;
             return;
         }
 
-        // Update count badge
-        if (countBadge) {
-            countBadge.textContent = ekaUsers.length;
-            countBadge.style.display = 'inline-flex';
-        }
-
-        // Sort alphabetically by display name then group by first letter
-        ekaUsers.sort((a, b) => {
-            const na = (a.display_name || a.name || a.email || '').toLowerCase();
-            const nb = (b.display_name || b.name || b.email || '').toLowerCase();
-            return na.localeCompare(nb);
+        // Sort: admins first, then alphabetically
+        users.sort((a, b) => {
+            if (a.role === 'admin' && b.role !== 'admin') return -1;
+            if (b.role === 'admin' && a.role !== 'admin') return 1;
+            return (a.full_name || a.username || '').localeCompare(b.full_name || b.username || '');
         });
 
         container.innerHTML = '';
-        let currentLetter = null;
+        users.forEach(u => {
+            const displayName = u.full_name || u.username;
+            const initial     = displayName.charAt(0).toUpperCase();
+            const isAdmin     = u.role === 'admin';
+            const isActive    = u.is_active !== false;
 
-        ekaUsers.forEach(u => {
-            // Extract application roles
-            let rolesArr = [];
-            if (u.application_roles && Array.isArray(u.application_roles)) {
-                rolesArr = u.application_roles.map(r => r.role_name);
-            } else if (u.roles) {
-                if (typeof u.roles === 'string') rolesArr = [u.roles];
-                else if (Array.isArray(u.roles)) rolesArr = u.roles;
-                else rolesArr = Object.values(u.roles);
-            }
-
-            const isAdmin = rolesArr.some(r => r.toLowerCase() === 'admin');
-            const rolesHtml = rolesArr.length > 0
-                ? rolesArr.map(r => {
-                    const cls = r.toLowerCase() === 'admin' ? 'is-admin' : '';
-                    return `<span class="user-role-badge ${cls}">${esc(r)}</span>`;
-                  }).join('')
-                : '<span class="user-role-badge" style="opacity:0.4">—</span>';
-
-            const displayName = u.display_name || u.name || '—';
-            const email       = u.email || 'No email';
-            const sortKey     = (displayName !== '—' ? displayName : email);
-            const initial     = sortKey.charAt(0).toUpperCase();
-            const letter      = /[A-Z]/.test(initial) ? initial : '#';
-
-            // Insert alphabetical divider when the first letter changes
-            if (letter !== currentLetter) {
-                currentLetter = letter;
-                const div = document.createElement('div');
-                div.className = 'um-alpha-divider';
-                div.innerHTML = `<span>${letter}</span>`;
-                container.appendChild(div);
-            }
+            const roleBadge = `<span class="user-role-badge${isAdmin ? ' is-admin' : ''}">${esc(u.role || 'operator')}</span>`;
+            const statusBadge = isActive
+                ? `<span style="font-size:0.68rem;background:rgba(16,185,129,0.12);color:var(--green,#10b981);border:1px solid rgba(16,185,129,0.3);border-radius:4px;padding:2px 7px">active</span>`
+                : `<span style="font-size:0.68rem;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:4px;padding:2px 7px">inactive</span>`;
 
             const row = document.createElement('div');
             row.className = 'user-row';
+            row.id = `user-row-${u.id}`;
             row.innerHTML = `
-                <div class="user-row-avatar${isAdmin ? ' is-admin' : ''}">${initial}</div>
-                <div class="user-row-info">
-                    <div class="user-row-name">${esc(displayName)}</div>
-                    <div class="user-row-email">${esc(email)}</div>
+                <div class="user-row-avatar${isAdmin ? ' is-admin' : ''}" style="opacity:${isActive ? 1 : 0.45}">${esc(initial)}</div>
+                <div class="user-row-info" style="flex:1;min-width:0">
+                    <div class="user-row-name" style="display:flex;align-items:center;gap:6px">
+                        ${esc(displayName)}
+                        ${statusBadge}
+                    </div>
+                    <div class="user-row-email" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                        <span style="font-family:var(--mono);font-size:0.75rem;color:var(--text-secondary)">@${esc(u.username)}</span>
+                        ${u.email ? `<span style="color:var(--text-muted);font-size:0.75rem">${esc(u.email)}</span>` : ''}
+                    </div>
+                    ${u.last_login ? `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:2px">Last login: ${_timeAgo(u.last_login)}</div>` : ''}
                 </div>
-                <div class="user-row-roles">${rolesHtml}</div>
-            `;
+                <div class="user-row-roles" style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+                    ${roleBadge}
+                    <button class="btn-icon" title="Toggle active/inactive"
+                        onclick="toggleUserActive(${u.id}, ${isActive})"
+                        style="padding:4px 6px;font-size:12px;color:${isActive ? 'var(--green,#10b981)' : 'var(--text-muted)'}">
+                        <span class="material-icons-round" style="font-size:16px">${isActive ? 'toggle_on' : 'toggle_off'}</span>
+                    </button>
+                    <button class="btn-icon" title="Delete user"
+                        onclick="deleteUser(${u.id}, '${esc(u.username)}')"
+                        style="padding:4px 6px;font-size:12px;color:var(--red)">
+                        <span class="material-icons-round" style="font-size:16px">delete</span>
+                    </button>
+                </div>`;
             container.appendChild(row);
         });
 
     } catch (err) {
         console.error('loadUsers error:', err);
         container.innerHTML = `
-            <div class="user-row" style="justify-content:center; padding:40px; border:none; flex-direction:column; gap:8px; color:var(--danger);">
-                <span class="material-icons-round" style="font-size:36px;">error_outline</span>
-                <span style="font-size:0.88rem; text-align:center;">${err.message}</span>
+            <div class="user-row" style="justify-content:center;padding:40px;border:none;flex-direction:column;gap:8px;color:var(--red)">
+                <span class="material-icons-round" style="font-size:36px">error_outline</span>
+                <span style="font-size:0.88rem;text-align:center">${esc(err.message)}</span>
             </div>`;
+    }
+}
+
+function showAddUserModal() {
+    const overlay = document.createElement('div');
+    overlay.id = 'add-user-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:2000;display:flex;align-items:center;justify-content:center';
+    overlay.innerHTML = `
+        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:440px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5)">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+                <span class="material-icons-round" style="color:var(--accent);font-size:26px">person_add</span>
+                <h3 style="margin:0;font-size:1.15rem">Add New User</h3>
+            </div>
+
+            <label class="field-label">Username <span style="color:var(--red)">*</span></label>
+            <input type="text" id="nu-username" placeholder="john_doe" class="input-full" style="margin-bottom:12px">
+
+            <label class="field-label">Full Name</label>
+            <input type="text" id="nu-fullname" placeholder="John Doe" class="input-full" style="margin-bottom:12px">
+
+            <label class="field-label">Email</label>
+            <input type="email" id="nu-email" placeholder="john@example.com" class="input-full" style="margin-bottom:12px">
+
+            <label class="field-label">Password <span style="color:var(--red)">*</span> <span class="muted">(min 6 characters)</span></label>
+            <input type="password" id="nu-password" placeholder="••••••" class="input-full" style="margin-bottom:12px">
+
+            <label class="field-label">Role</label>
+            <select id="nu-role" class="select-full" style="margin-bottom:20px">
+                <option value="operator" selected>Operator</option>
+                <option value="admin">Admin</option>
+            </select>
+
+            <div id="nu-error" style="color:var(--red);font-size:0.82rem;margin-bottom:12px;display:none"></div>
+            <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button class="btn outline" onclick="document.getElementById('add-user-overlay').remove()">Cancel</button>
+                <button class="btn primary" onclick="submitAddUser()">
+                    <span class="material-icons-round" style="font-size:16px">save</span> Create User
+                </button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    setTimeout(() => document.getElementById('nu-username').focus(), 80);
+    overlay.addEventListener('keydown', e => {
+        if (e.key === 'Escape') overlay.remove();
+        if (e.key === 'Enter') submitAddUser();
+    });
+}
+
+async function submitAddUser() {
+    const username  = (document.getElementById('nu-username').value || '').trim();
+    const full_name = (document.getElementById('nu-fullname').value || '').trim();
+    const email     = (document.getElementById('nu-email').value || '').trim();
+    const password  = (document.getElementById('nu-password').value || '');
+    const role      = document.getElementById('nu-role').value;
+    const errEl     = document.getElementById('nu-error');
+
+    if (!username) { errEl.textContent = 'Username is required'; errEl.style.display = 'block'; return; }
+    if (password.length < 6) { errEl.textContent = 'Password must be at least 6 characters'; errEl.style.display = 'block'; return; }
+    errEl.style.display = 'none';
+
+    try {
+        const res = await fetch(`${API}/api/users`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...getSessionHeaders() },
+            body: JSON.stringify({ username, full_name: full_name || null, email: email || null, password, role }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            errEl.textContent = data.detail || `Server error ${res.status} — check core service logs`;
+            errEl.style.display = 'block';
+            return;
+        }
+        document.getElementById('add-user-overlay').remove();
+        toast(`✓ User "${username}" created`, 'success');
+        loadUsers();
+    } catch (e) {
+        errEl.textContent = e.message;
+        errEl.style.display = 'block';
+    }
+}
+
+async function deleteUser(userId, username) {
+    if (!confirm(`Delete user "${username}"?\n\nThis cannot be undone.`)) return;
+    try {
+        const res = await fetch(`${API}/api/users/${userId}`, {
+            method: 'DELETE',
+            headers: getSessionHeaders(),
+        });
+        if (!res.ok) {
+            const d = await res.json().catch(() => ({}));
+            throw new Error(d.detail || `HTTP ${res.status}`);
+        }
+        toast(`User "${username}" deleted`, 'success');
+        const row = document.getElementById(`user-row-${userId}`);
+        if (row) row.remove();
+        // Update count badge
+        const badge = document.getElementById('users-count-badge');
+        if (badge) {
+            const n = parseInt(badge.textContent || '0') - 1;
+            badge.textContent = Math.max(0, n);
+        }
+    } catch (e) {
+        toast(`Delete failed: ${e.message}`, 'error');
+    }
+}
+
+async function toggleUserActive(userId, currentlyActive) {
+    try {
+        const res = await fetch(`${API}/api/users/${userId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', ...getSessionHeaders() },
+            body: JSON.stringify({ is_active: !currentlyActive }),
+        });
+        if (!res.ok) {
+            const d = await res.json().catch(() => ({}));
+            throw new Error(d.detail || `Server error ${res.status}`);
+        }
+        toast(`User ${currentlyActive ? 'deactivated' : 'activated'}`, 'success');
+        loadUsers();
+    } catch (e) {
+        toast(`Update failed: ${e.message}`, 'error');
     }
 }
 

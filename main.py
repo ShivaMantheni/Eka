@@ -39,6 +39,7 @@ import zipfile
 import io
 import base64
 import socket
+import bcrypt
 
 try:
     import openpyxl
@@ -353,6 +354,21 @@ class AuditLog(Base):
     details = Column(Text)  # JSON details
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
+
+
+class User(Base):
+    """Local user accounts for the User Management tab."""
+    __tablename__ = "users"
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    username      = Column(String(100), nullable=False, unique=True, index=True)
+    email         = Column(String(255), unique=True, nullable=True)
+    full_name     = Column(String(200), nullable=True)
+    password_hash = Column(String(255), nullable=False)
+    role          = Column(String(20), nullable=False, default="operator")  # admin | operator
+    is_active     = Column(Boolean, nullable=False, default=True)
+    created_at    = Column(DateTime, default=datetime.utcnow)
+    updated_at    = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_login    = Column(DateTime, nullable=True)
 
 
 class ExecutionJob(Base):
@@ -3070,96 +3086,150 @@ async def terminal_websocket(websocket: WebSocket, dut_id: int):
             }
 
         # Task 1: Read from SSH channel and send to browser
+        # ── shared reconnect state ────────────────────────────────────────────
+        _pty_channel   = [channel]           # mutable cell so inner tasks share it
+        _reconnecting  = asyncio.Event()     # set while reconnect is in progress
+        _terminal_dead = asyncio.Event()     # set to tear down all tasks
+
+        async def _reconnect_pty(reason: str):
+            """Try to get a new SSH connection + PTY and update _pty_channel[0]."""
+            if _reconnecting.is_set():
+                return   # another task is already handling it
+            _reconnecting.set()
+            MAX_RECON = 5
+            try:
+                await websocket.send_json({
+                    "type": "reconnecting",
+                    "message": f"SSH session lost ({reason}) — reconnecting…"
+                })
+                for attempt in range(1, MAX_RECON + 1):
+                    wait = min(2 ** (attempt - 1), 30)
+                    await asyncio.sleep(wait)
+                    try:
+                        new_ssh = ssh_pool.get_connection(
+                            dut_id,
+                            dut_data['ip_address'],
+                            dut_data['port'],
+                            dut_data['username'],
+                            dut_data['password'],
+                        )
+                        if not new_ssh:
+                            raise Exception("Pool returned no connection")
+                        ssh_pool.mark_connection_as_terminal(dut_id)
+                        new_ch = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: new_ssh.client.invoke_shell(
+                                term='xterm-256color', width=80, height=24
+                            )
+                        )
+                        new_ch.settimeout(0.0)
+                        _pty_channel[0] = new_ch
+                        await websocket.send_json({
+                            "type": "reconnected",
+                            "message": f"Reconnected (attempt {attempt})"
+                        })
+                        logger.info(f"[PTY] Reconnected for DUT {dut_id} on attempt {attempt}")
+                        return
+                    except Exception as re:
+                        logger.warning(f"[PTY] Reconnect attempt {attempt}/{MAX_RECON} for DUT {dut_id}: {re}")
+                # All attempts exhausted
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Could not reconnect to device — please close and reopen the terminal."
+                })
+                _terminal_dead.set()
+            finally:
+                _reconnecting.clear()
+
         async def read_from_ssh():
             """Continuously read output from SSH PTY and stream to browser."""
             try:
-                while True:
-                    # Check if channel is still open
-                    if channel.closed:
-                        logger.info(f"[PTY] SSH channel closed by remote host for DUT {dut_id}")
-                        break
-
-                    # Check if channel has data available (non-blocking)
-                    if channel.recv_ready():
+                while not _terminal_dead.is_set():
+                    ch = _pty_channel[0]
+                    if _reconnecting.is_set():
+                        await asyncio.sleep(0.1)
+                        continue
+                    if ch.closed:
+                        logger.info(f"[PTY] Channel closed for DUT {dut_id} — triggering reconnect")
+                        asyncio.create_task(_reconnect_pty("channel closed"))
+                        await asyncio.sleep(0.5)
+                        continue
+                    if ch.recv_ready():
                         try:
-                            data = channel.recv(4096)  # Read up to 4KB
+                            data = ch.recv(4096)
                             if data:
                                 await websocket.send_bytes(data)
                             else:
-                                # Empty data means channel closed
-                                logger.info(f"[PTY] SSH channel closed (EOF) for DUT {dut_id}")
-                                break
+                                logger.info(f"[PTY] EOF from SSH for DUT {dut_id} — triggering reconnect")
+                                asyncio.create_task(_reconnect_pty("EOF"))
+                                await asyncio.sleep(0.5)
                         except Exception as recv_err:
-                            logger.error(f"[PTY] Error receiving data from SSH channel (DUT {dut_id}): {recv_err}")
-                            break
-
-                    # Small delay to prevent CPU spinning
-                    await asyncio.sleep(0.01)
-
+                            logger.error(f"[PTY] recv error DUT {dut_id}: {recv_err}")
+                            asyncio.create_task(_reconnect_pty(str(recv_err)))
+                            await asyncio.sleep(0.5)
+                    else:
+                        await asyncio.sleep(0.01)
             except asyncio.CancelledError:
-                logger.info(f"[PTY] SSH reader task cancelled for DUT {dut_id}")
                 raise
             except Exception as e:
-                logger.error(f"[PTY] Error reading from SSH (DUT {dut_id}): {type(e).__name__}: {e}", exc_info=True)
+                logger.error(f"[PTY] read_from_ssh error DUT {dut_id}: {e}", exc_info=True)
 
         # Task 2: Read from browser and send to SSH channel
         async def read_from_browser():
             """Continuously read input from browser and send to SSH PTY."""
             try:
-                while True:
+                while not _terminal_dead.is_set():
                     data = await websocket.receive()
-
+                    if _reconnecting.is_set():
+                        continue    # drop keystrokes during reconnect
+                    ch = _pty_channel[0]
                     if "bytes" in data:
-                        # Binary data (keyboard input from xterm.js)
                         try:
-                            channel.send(data["bytes"])
+                            ch.send(data["bytes"])
                         except Exception as send_err:
-                            logger.error(f"[PTY] Error sending data to SSH channel (DUT {dut_id}): {send_err}")
-                            break
-
+                            logger.error(f"[PTY] send error DUT {dut_id}: {send_err}")
+                            asyncio.create_task(_reconnect_pty(str(send_err)))
                     elif "text" in data:
-                        # Text data (control messages like resize)
                         try:
                             msg = json.loads(data["text"])
-
                             if msg.get("type") == "resize":
-                                # Handle terminal resize event
                                 cols = msg.get("cols", 80)
                                 rows = msg.get("rows", 24)
-                                channel.resize_pty(width=cols, height=rows)
-                                logger.info(f"[PTY] Terminal resized to {cols}x{rows} for DUT {dut_id}")
-
+                                ch.resize_pty(width=cols, height=rows)
+                                logger.info(f"[PTY] Resized to {cols}x{rows} for DUT {dut_id}")
                         except json.JSONDecodeError:
-                            logger.warning(f"[PTY] Invalid JSON message from browser: {data['text']}")
+                            logger.warning(f"[PTY] Invalid JSON from browser: {data['text']}")
                         except Exception as resize_err:
-                            logger.error(f"[PTY] Error resizing terminal (DUT {dut_id}): {resize_err}")
-
+                            logger.error(f"[PTY] resize error DUT {dut_id}: {resize_err}")
             except WebSocketDisconnect:
                 logger.info(f"[PTY] WebSocket disconnected for DUT {dut_id}")
+                _terminal_dead.set()
             except asyncio.CancelledError:
-                logger.info(f"[PTY] Browser reader task cancelled for DUT {dut_id}")
                 raise
             except Exception as e:
-                logger.error(f"[PTY] Error reading from browser (DUT {dut_id}): {type(e).__name__}: {e}", exc_info=True)
+                logger.error(f"[PTY] read_from_browser error DUT {dut_id}: {e}", exc_info=True)
 
-        # Task 3: Send heartbeat every 30 seconds to keep connection alive
+        # Task 3: Send heartbeat every 30 seconds + detect stale channel
         async def send_heartbeat():
-            """Send periodic heartbeat to keep WebSocket and SSH session alive."""
+            """Periodic heartbeat — also probes the SSH channel to detect silent drops."""
             try:
-                while True:
-                    await asyncio.sleep(30)  # Heartbeat every 30 seconds
+                while not _terminal_dead.is_set():
+                    await asyncio.sleep(30)
                     try:
                         await websocket.send_json({"type": "heartbeat", "timestamp": time.time()})
-                        ssh_pool.release_connection(dut_id)  # Update last_used timestamp
-                        logger.debug(f"[PTY] Heartbeat sent for DUT {dut_id}")
+                        ssh_pool.release_connection(dut_id)
+                        # Active probe: if channel is silently dead, trigger reconnect
+                        ch = _pty_channel[0]
+                        if ch.closed or (not ch.get_transport() or not ch.get_transport().is_active()):
+                            logger.warning(f"[PTY] Heartbeat detected dead channel for DUT {dut_id}")
+                            asyncio.create_task(_reconnect_pty("heartbeat probe"))
                     except Exception as hb_err:
-                        logger.error(f"[PTY] Failed to send heartbeat for DUT {dut_id}: {hb_err}")
+                        logger.error(f"[PTY] Heartbeat error DUT {dut_id}: {hb_err}")
                         break
             except asyncio.CancelledError:
-                logger.info(f"[PTY] Heartbeat task cancelled for DUT {dut_id}")
                 raise
             except Exception as e:
-                logger.error(f"[PTY] Error in heartbeat task (DUT {dut_id}): {type(e).__name__}: {e}")
+                logger.error(f"[PTY] send_heartbeat error DUT {dut_id}: {e}")
 
         # Run all three tasks concurrently (bidirectional streaming + keepalive)
         await asyncio.gather(
@@ -8441,6 +8511,140 @@ def get_testbed_info(host_id: int, testbed: str, db: Session = Depends(get_db)):
 
 
 # ============================================================================
+# USER MANAGEMENT  (/api/users)
+# ============================================================================
+
+def _hash_password(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except Exception:
+        return False
+
+def _user_out(u: "User") -> dict:
+    return {
+        "id":         u.id,
+        "username":   u.username,
+        "email":      u.email,
+        "full_name":  u.full_name,
+        "role":       u.role,
+        "is_active":  u.is_active,
+        "created_at": u.created_at.isoformat() if u.created_at else None,
+        "last_login": u.last_login.isoformat() if u.last_login else None,
+    }
+
+
+@app.get("/api/users/stats/summary")
+def user_stats(db: Session = Depends(get_db)):
+    """Return total / active / inactive counts and per-role breakdown."""
+    all_users = db.query(User).all()
+    total    = len(all_users)
+    active   = sum(1 for u in all_users if u.is_active)
+    by_role  = {}
+    for u in all_users:
+        by_role[u.role] = by_role.get(u.role, 0) + 1
+    return {
+        "total":    total,
+        "active":   active,
+        "inactive": total - active,
+        "by_role":  {"admin": by_role.get("admin", 0), "operator": by_role.get("operator", 0)},
+    }
+
+
+@app.get("/api/users")
+def list_users(db: Session = Depends(get_db)):
+    """List all users."""
+    users = db.query(User).order_by(User.created_at.desc()).all()
+    return {"users": [_user_out(u) for u in users]}
+
+
+@app.post("/api/users")
+def create_user(body: dict, db: Session = Depends(get_db)):
+    """Create a new user."""
+    username = (body.get("username") or "").strip()
+    password = body.get("password", "")
+    if not username:
+        raise HTTPException(status_code=400, detail="username is required")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(status_code=409, detail=f"Username '{username}' already exists")
+    email = (body.get("email") or "").strip() or None
+    if email and db.query(User).filter(User.email == email).first():
+        raise HTTPException(status_code=409, detail=f"Email '{email}' already in use")
+    user = User(
+        username      = username,
+        email         = email,
+        full_name     = (body.get("full_name") or "").strip() or None,
+        password_hash = _hash_password(password),
+        role          = body.get("role", "operator"),
+        is_active     = True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return _user_out(user)
+
+
+@app.get("/api/users/{user_id}")
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return _user_out(user)
+
+
+@app.put("/api/users/{user_id}")
+def update_user(user_id: int, body: dict, db: Session = Depends(get_db)):
+    """Update user profile (full_name, email, role, is_active)."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if "full_name" in body:
+        user.full_name = (body["full_name"] or "").strip() or None
+    if "email" in body:
+        email = (body["email"] or "").strip() or None
+        if email and email != user.email:
+            if db.query(User).filter(User.email == email, User.id != user_id).first():
+                raise HTTPException(status_code=409, detail=f"Email '{email}' already in use")
+        user.email = email
+    if "role" in body:
+        user.role = body["role"]
+    if "is_active" in body:
+        user.is_active = bool(body["is_active"])
+    user.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(user)
+    return _user_out(user)
+
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.delete(user)
+    db.commit()
+    return {"status": "deleted", "user_id": user_id}
+
+
+@app.post("/api/users/{user_id}/change-password")
+def change_password(user_id: int, body: dict, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    new_password = body.get("new_password", "")
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    user.password_hash = _hash_password(new_password)
+    user.updated_at = datetime.utcnow()
+    db.commit()
+    return {"status": "success", "message": "Password changed successfully"}
+
+
+# ============================================================================
 # HEALTH CHECK
 # ============================================================================
 
@@ -8515,7 +8719,6 @@ def onepalc_config():
         "hub_auth_url": _ONEPALC_HUB_AUTH_URL,
         "app_name":     _ONEPALC_APP_NAME,
         "callback_url": _ONEPALC_CALLBACK_URL,
-        "api_token":    _ONEPALC_API_TOKEN,
     }
 
 @app.get("/api/onepalc/users")
@@ -8814,17 +9017,22 @@ def onepalc_logout(request: Request, db: Session = Depends(get_db)):
     """
     from fastapi.responses import RedirectResponse
 
-    # Mark the session as terminated so it's cleaned up by the background job
+    # Terminate ALL active sessions for this user (cookie session + any other open tabs/devices)
     session_id = request.cookies.get("eka_session_id", "").strip()
     if session_id:
-        session = db.query(UserSession).filter(UserSession.session_id == session_id).first()
-        if session and session.status == "active":
-            session.status = "terminated"
+        current = db.query(UserSession).filter(UserSession.session_id == session_id).first()
+        if current:
+            user_name = current.user_name
             try:
+                # Mark every active session for this user as terminated
+                db.query(UserSession).filter(
+                    UserSession.user_name == user_name,
+                    UserSession.status == "active"
+                ).update({"status": "terminated"})
                 db.commit()
-                logger.info(f"[OnePalC] Logout: session {session_id} marked as terminated (user: {session.user_name})")
+                logger.info(f"[OnePalC] Logout: all sessions terminated for user '{user_name}'")
             except Exception as e:
-                logger.error(f"[OnePalC] Failed to terminate session on logout: {e}")
+                logger.error(f"[OnePalC] Failed to terminate sessions on logout: {e}")
                 db.rollback()
 
     logout_url = _ONEPALC_HUB_AUTH_URL.replace("/login", "/logout") if _ONEPALC_HUB_AUTH_URL else "/"

@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VS Manager — Redesign Plan</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #0f1117; color: #e2e8f0; padding: 32px; }
+  h1 { font-size: 1.4rem; color: #7dd3fc; margin-bottom: 4px; }
+  .sub { color: #64748b; font-size: 0.82rem; margin-bottom: 32px; }
+  h2 { font-size: 0.9rem; color: #94a3b8; margin: 32px 0 14px;
+       border-bottom: 1px solid #1e293b; padding-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+  .tab-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 1040px; }
+  .col-label { font-size: 0.68rem; color: #475569; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+
+  .card { border: 1px solid #1e293b; border-radius: 10px; overflow: hidden; background: #131926; margin-bottom: 12px; }
+  .card.green-border { border-color: #166534; }
+  .card-head { background: #1a2236; padding: 10px 14px; display: flex; align-items: center;
+               gap: 8px; font-size: 0.84rem; font-weight: 600; border-bottom: 1px solid #1e293b; }
+  .card-head.green { background: #0d2018; border-bottom-color: #166534; }
+  .card-body { padding: 14px; }
+  .divider { border-top: 1px dashed #253048; margin: 14px 0; }
+
+  .fl { color: #64748b; font-size: 0.72rem; margin-bottom: 4px; display: block; }
+  .muted { color: #475569; }
+  .input-mock { background: #0d1220; border: 1px solid #253048; border-radius: 6px;
+                padding: 7px 10px; color: #94a3b8; font-size: 0.8rem; width: 100%; }
+  .select-mock { background: #0d1220; border: 1px solid #253048; border-radius: 6px;
+                 padding: 7px 10px; color: #94a3b8; font-size: 0.8rem;
+                 display: flex; justify-content: space-between; align-items: center; }
+  .mb10 { margin-bottom: 10px; }
+  .row  { display: flex; gap: 8px; align-items: flex-end; }
+  .grow { flex: 1; min-width: 0; }
+
+  .btn-update { background: linear-gradient(135deg,#3b82f6,#6366f1); border: none; border-radius: 7px;
+                color: #fff; padding: 8px 14px; font-size: 0.78rem; font-weight: 600;
+                white-space: nowrap; display: flex; align-items: center; gap: 5px; cursor: pointer; flex-shrink: 0; }
+  .btn-spin   { background: linear-gradient(135deg,#10b981,#059669); border: none; border-radius: 7px;
+                color: #fff; padding: 9px 16px; font-size: 0.82rem; font-weight: 600;
+                display: flex; align-items: center; gap: 6px; cursor: pointer; flex: 1; justify-content: center; }
+  .btn-remove { background: linear-gradient(135deg,#dc2626,#991b1b); border: none; border-radius: 7px;
+                color: #fff; padding: 9px 16px; font-size: 0.82rem; font-weight: 600;
+                display: flex; align-items: center; gap: 6px; cursor: pointer; flex: 1; justify-content: center; }
+  .btn-icon   { background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+                padding: 7px 10px; color: #94a3b8; font-size: 0.85rem; cursor: pointer; flex-shrink: 0; }
+
+  .vm-table { width: 100%; font-size: 0.76rem; border-collapse: collapse; }
+  .vm-table th { background: #0d1220; padding: 6px 10px; color: #475569; border-bottom: 1px solid #1e293b; font-weight: 600; text-align: left; }
+  .vm-table td { padding: 6px 10px; border-bottom: 1px solid #0f1117; }
+  .badge-run { background: #14532d; color: #4ade80; font-size: 0.65rem; padding: 2px 7px; border-radius: 4px; }
+  .badge-off { background: #1e293b; color: #64748b; font-size: 0.65rem; padding: 2px 7px; border-radius: 4px; }
+  .stats-row { display: flex; gap: 14px; font-size: 0.78rem; padding: 7px 10px;
+               border-bottom: 1px solid #1e293b; background: #0d1220; }
+
+  .name-row { display: flex; gap: 6px; align-items: flex-end; margin-bottom: 12px; }
+  .nf   { flex: 1; min-width: 0; }
+  .nfsm { flex: 0 0 62px; }
+  .nb-eq { color: #475569; padding-bottom: 9px; font-size: 0.9rem; flex-shrink: 0; }
+  .preview-box { background: #0a1628; border: 1px solid #3b82f6; border-radius: 6px;
+                 padding: 7px 12px; color: #7dd3fc; font-weight: 700;
+                 font-family: monospace; font-size: 0.95rem; white-space: nowrap; }
+  .preview-lbl { color: #3b82f6; font-size: 0.68rem; margin-bottom: 4px; display: block; }
+
+  /* path tree */
+  .path-block { background: #0a130a; border: 1px solid #1a3a1a; border-radius: 8px;
+                padding: 12px 14px; margin-bottom: 12px; font-family: monospace; font-size: 0.75rem; }
+  .path-line  { display: flex; align-items: baseline; gap: 6px; margin-bottom: 5px; line-height: 1.5; }
+  .path-line:last-child { margin-bottom: 0; }
+  .pt-label { color: #475569; font-size: 0.68rem; min-width: 72px; font-family: 'Segoe UI', sans-serif; flex-shrink: 0; }
+  .pt-path  { color: #6ee7b7; }
+  .pt-path b { color: #4ade80; }
+  .pt-path .dim { color: #475569; }
+  .pt-tag   { font-size: 0.63rem; background: #0d2018; border: 1px solid #166534;
+               color: #6ee7b7; padding: 1px 6px; border-radius: 3px; margin-left: 6px;
+               font-family: 'Segoe UI', sans-serif; white-space: nowrap; }
+  .pt-tag.red { background: #1a0808; border-color: #7f1d1d; color: #fca5a5; }
+
+  .remove-note { font-size: 0.72rem; color: #64748b; margin-top: 10px; line-height: 1.7; }
+  .remove-note .hi { color: #fca5a5; }
+
+  .new-badge { background: #10b981; color: #fff; font-size: 0.6rem; font-weight: 700;
+               padding: 2px 6px; border-radius: 4px; }
+
+  .step-lbl  { font-size: 0.67rem; color: #475569; margin-bottom: 5px; }
+  .steps-row { display: flex; gap: 0; margin-bottom: 10px; }
+  .step-box  { flex: 1; text-align: center; padding: 7px 2px; background: #1a2236;
+               border: 1px solid #1e293b; font-size: 0.63rem; color: #475569; position: relative; }
+  .step-box:not(:last-child)::after { content: '›'; position: absolute; right: -7px;
+    top: 50%; transform: translateY(-50%); color: #334155; font-size: 1rem; z-index: 1; }
+  .step-num     { display: block; font-size: 0.88rem; font-weight: 700; color: #3b82f6; margin-bottom: 2px; }
+  .step-num.red { color: #ef4444; }
+  .log-mock  { background: #080d18; border: 1px solid #1e293b; border-radius: 6px;
+               padding: 10px; font-family: monospace; font-size: 0.72rem; min-height: 66px; }
+  .log-step  { color: #7dd3fc; margin-bottom: 3px; }
+  .log-ok    { color: #4ade80; margin-bottom: 3px; }
+  .log-dim   { color: #334155; margin-bottom: 3px; }
+  .shared-tag { margin-left: auto; font-size: 0.65rem; color: #475569; background: #1a2236;
+                border: 1px dashed #253048; border-radius: 4px; padding: 2px 8px; }
+
+  .auth-flow  { display: flex; align-items: center; gap: 4px; margin-top: 10px; flex-wrap: wrap; font-size: 0.68rem; }
+  .af-box     { background: #1a2236; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; text-align: center; color: #94a3b8; }
+  .af-box.warn{ background: #2d1515; border-color: #7f1d1d; color: #fca5a5; }
+  .af-box.ok  { background: #0d2018; border-color: #166534; color: #4ade80; }
+  .af-arrow   { color: #334155; font-size: 1rem; }
+
+  .legend { display: flex; gap: 20px; margin-top: 20px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 0.78rem; color: #64748b; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .dot-blue { background:#3b82f6; } .dot-green { background:#10b981; }
+  .dot-red  { background:#dc2626; } .dot-gray  { background:#334155; }
+
+  table.ch { border-collapse: collapse; width: 100%; font-size: 0.8rem; margin-top: 8px; max-width: 1040px; }
+  table.ch th { background: #1a2236; padding: 8px 12px; text-align: left; color: #94a3b8; font-weight: 600; }
+  table.ch td { padding: 8px 12px; border-top: 1px solid #1a2236; color: #cbd5e1; vertical-align: top; }
+  code { background: #0d1220; padding: 2px 5px; border-radius: 3px; font-size: 0.78em; color: #7dd3fc; }
+</style>
+</head>
+<body>
+
+<h1>VS Manager — Redesigned Layout</h1>
+<div class="sub">Review mockup only · no code changed · reply <b>Approve</b> to implement</div>
+
+<!-- ── Image path structure ── -->
+<h2>Image Path Structure (corrected)</h2>
+<div class="path-block" style="max-width:680px">
+  <div class="path-line">
+    <div class="pt-label">Exists already</div>
+    <div class="pt-path">/var/lib/libvirt/images/<b>hp</b>/
+      <span class="pt-tag">user folder — already on host, no mkdir</span>
+    </div>
+  </div>
+  <div class="path-line">
+    <div class="pt-label">Spin copies to</div>
+    <div class="pt-path">/var/lib/libvirt/images/<b>hp</b>/<b>sonic-vs.img</b>
+      <span class="pt-tag">same filename as source — straight into user folder</span>
+    </div>
+  </div>
+  <div class="path-line" style="margin-top:6px">
+    <div class="pt-label" style="color:#fca5a5">Remove deletes</div>
+    <div class="pt-path">
+      <span style="color:#ef4444">rm -f</span> /var/lib/libvirt/images/<b>hp</b>/<b>sonic-vs.img</b>
+      <span class="pt-tag red">image file only (path read from VM's XML)</span>
+    </div>
+  </div>
+  <div class="path-line">
+    <div class="pt-label" style="color:#fca5a5"></div>
+    <div class="pt-path">
+      <span style="color:#ef4444">rm -f</span> <span class="dim">{xml_path}/</span><b>EKAThp1</b>.xml
+      <span class="pt-tag red">XML definition file</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── Layout ── -->
+<h2>Layout Mockup</h2>
+<div class="tab-layout">
+
+  <!-- ════ LEFT ════ -->
+  <div>
+    <div class="col-label">Left Column — one combined card</div>
+    <div class="card">
+      <div class="card-head"><span>🖥</span> VS Manager</div>
+      <div class="card-body">
+
+        <div class="mb10">
+          <div class="fl">Host Device</div>
+          <div class="row">
+            <div class="grow"><div class="select-mock"><span>-- Select Host Device --</span><span>▾</span></div></div>
+            <button class="btn-icon">↻</button>
+          </div>
+        </div>
+
+        <div style="border:1px solid #1e293b;border-radius:7px;overflow:hidden;max-height:240px;overflow-y:auto">
+          <div class="stats-row">
+            <span style="color:#94a3b8">T: <b style="color:#e2e8f0">48</b></span>
+            <span style="color:#4ade80;font-weight:600">R: 36</span>
+            <span style="color:#64748b">D: 12</span>
+          </div>
+          <table class="vm-table">
+            <thead>
+              <tr><th style="width:26px">☑</th><th>VM Name</th><th>State</th><th>Image</th><th style="width:64px">Action</th></tr>
+            </thead>
+            <tbody>
+              <tr style="background:#0a1a10">
+                <td>☑</td>
+                <td><span style="color:#4ade80;margin-right:5px">▶</span><b>EKAThp1</b></td>
+                <td><span class="badge-run">running</span></td>
+                <td style="color:#64748b;font-family:monospace;font-size:0.7rem">sonic-vs.img</td>
+                <td style="color:#f59e0b;font-size:0.82rem">⏸ ⏹</td>
+              </tr>
+              <tr>
+                <td>☐</td>
+                <td><span style="color:#475569;margin-right:5px">⏹</span><b>EKATath2</b></td>
+                <td><span class="badge-off">shut off</span></td>
+                <td style="color:#64748b;font-family:monospace;font-size:0.7rem">sonic-vs.img</td>
+                <td style="color:#4ade80;font-size:0.82rem">▶</td>
+              </tr>
+              <tr>
+                <td>☐</td>
+                <td><span style="color:#475569;margin-right:5px">⏹</span><b>EKATath3</b></td>
+                <td><span class="badge-off">shut off</span></td>
+                <td style="color:#64748b;font-family:monospace;font-size:0.7rem">sonic-vs.img</td>
+                <td style="color:#4ade80;font-size:0.82rem">▶</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="mb10">
+          <div class="fl">Source Image Server <span class="muted">(optional — leave blank for local copy)</span></div>
+          <div class="row">
+            <div class="grow"><div class="select-mock"><span style="color:#475569">-- Use Host Device (Local Copy) --</span><span>▾</span></div></div>
+            <button class="btn-update">🚀 Update &amp; Restart</button>
+          </div>
+        </div>
+        <div class="fl">Source Image Path <span class="muted">(full path — shared for all selected VMs)</span></div>
+        <div class="input-mock">/home/hp/anuradha_build_imgs/target/sonic-vs.img</div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- ════ RIGHT ════ -->
+  <div>
+    <div class="col-label">Right Column</div>
+
+    <div class="card green-border">
+      <div class="card-head green"><span>🆕</span> Spin New VS <span class="new-badge" style="margin-left:6px">NEW</span></div>
+      <div class="card-body">
+
+        <!-- One row: Project + Username + No. = VS Name -->
+        <div class="name-row">
+          <div class="nf">
+            <div class="fl">Project (4 letters)</div>
+            <div class="input-mock">EKAT</div>
+          </div>
+          <div class="nb-eq">+</div>
+          <div class="nf">
+            <div class="fl">Username</div>
+            <div class="input-mock">hp</div>
+          </div>
+          <div class="nb-eq">+</div>
+          <div class="nfsm">
+            <div class="fl">No.</div>
+            <div class="select-mock"><span>1</span><span>▾</span></div>
+          </div>
+          <div class="nb-eq">=</div>
+          <div>
+            <div class="preview-lbl">VS Name</div>
+            <div class="preview-box">EKAThp1</div>
+          </div>
+        </div>
+
+        <!-- Auto paths — read only -->
+        <div class="path-block">
+          <div class="path-line">
+            <div class="pt-label">XML</div>
+            <div class="pt-path"><span class="dim">{xml_path from Devices tab}/</span><b>EKAThp1</b>.xml</div>
+          </div>
+          <div class="path-line">
+            <div class="pt-label">Copy image to</div>
+            <div class="pt-path">/var/lib/libvirt/images/<b>hp</b>/<b>sonic-vs.img</b>
+              <span class="pt-tag">user folder — no new folder created</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Source image -->
+        <div class="fl">Source Image Path</div>
+        <div class="input-mock" style="margin-bottom:12px">/home/hp/anuradha_build_imgs/target/sonic-vs.img</div>
+
+        <!-- Spin + Remove — same row -->
+        <div style="display:flex;gap:8px">
+          <button class="btn-spin">🔄 Spin VS</button>
+          <button class="btn-remove">🗑 Remove Selected VS</button>
+        </div>
+
+        <div class="remove-note">
+          <b class="hi">Remove</b> uses VS checked (☑) in VM table · two confirmations required:<br>
+          <span class="hi">①</span> "Remove VS completely?" → Yes / Cancel<br>
+          <span class="hi">②</span> Type the VS name exactly to confirm<br>
+          Removes: virsh destroy + undefine ·
+          <span class="hi">rm</span> XML file ·
+          <span class="hi">rm</span> image file (path read from XML) <span style="color:#475569">· user folder kept</span>
+        </div>
+
+        <div class="auth-flow">
+          <div class="af-box">Select VS<br>in table (☑)</div>
+          <div class="af-arrow">→</div>
+          <div class="af-box">Click<br>Remove</div>
+          <div class="af-arrow">→</div>
+          <div class="af-box warn">Dialog 1<br>"Remove<br>completely?"</div>
+          <div class="af-arrow">→</div>
+          <div class="af-box warn">Dialog 2<br>Type VS name<br>to confirm</div>
+          <div class="af-arrow">→</div>
+          <div class="af-box ok">SSH:<br>destroy·undef<br>rm xml·rm img</div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Shared Progress -->
+    <div class="card">
+      <div class="card-head">
+        <span>🛠</span> Update Progress
+        <span class="shared-tag">shared — Update / Spin / Remove</span>
+      </div>
+      <div class="card-body">
+
+        <div class="step-lbl">Update VS (6 steps):</div>
+        <div class="steps-row">
+          <div class="step-box"><span class="step-num">①</span>Destroy</div>
+          <div class="step-box"><span class="step-num">②</span>Rm img</div>
+          <div class="step-box"><span class="step-num">③</span>Copy img</div>
+          <div class="step-box"><span class="step-num">④</span>Undef</div>
+          <div class="step-box"><span class="step-num">⑤</span>Define</div>
+          <div class="step-box"><span class="step-num">⑥</span>Start</div>
+        </div>
+
+        <div class="step-lbl">Spin VS (4 steps — copy to user folder, no mkdir):</div>
+        <div class="steps-row">
+          <div class="step-box"><span class="step-num">①</span>Validate XML</div>
+          <div class="step-box"><span class="step-num">②</span>Copy image to user folder</div>
+          <div class="step-box"><span class="step-num">③</span>virsh define</div>
+          <div class="step-box"><span class="step-num">④</span>virsh start</div>
+        </div>
+
+        <div class="step-lbl">Remove VS (3 steps):</div>
+        <div class="steps-row" style="margin-bottom:10px">
+          <div class="step-box" style="border-color:#7f1d1d"><span class="step-num red">①</span>destroy + undef</div>
+          <div class="step-box" style="border-color:#7f1d1d"><span class="step-num red">②</span>rm XML file</div>
+          <div class="step-box" style="border-color:#7f1d1d"><span class="step-num red">③</span>rm image file</div>
+        </div>
+
+        <div class="log-mock">
+          <div class="log-step">▶ Step 1/4: Validating XML...</div>
+          <div class="log-ok">  ✓ /home/hp/xml/EKAThp1.xml exists</div>
+          <div class="log-step">▶ Step 2/4: Copying image to user folder...</div>
+          <div class="log-ok">  ✓ cp sonic-vs.img → /var/lib/libvirt/images/hp/sonic-vs.img</div>
+          <div class="log-step">▶ Step 3/4: virsh define /home/hp/xml/EKAThp1.xml</div>
+          <div class="log-dim">  (in progress...)</div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="dot dot-blue"></div>Existing (merged)</div>
+  <div class="legend-item"><div class="dot dot-green"></div>New — Spin VS</div>
+  <div class="legend-item"><div class="dot dot-red"></div>New — Remove VS</div>
+  <div class="legend-item"><div class="dot dot-gray"></div>Shared — unchanged</div>
+</div>
+
+<h2>What Changes</h2>
+<table class="ch">
+  <tr><th>File</th><th>Change</th></tr>
+  <tr>
+    <td><code>static/index.html</code></td>
+    <td>Merge Host + VM table + Update VS into one <b>VS Manager</b> card (left).<br>
+        Add <b>Spin New VS</b> card (right) with one-row name builder, auto path display, source image input, and Spin + Remove buttons side by side.</td>
+  </tr>
+  <tr>
+    <td><code>static/app.js</code></td>
+    <td>
+      <code>spinVS()</code> — builds vs_name, shows auto path preview, POSTs to spin endpoint.<br>
+      <code>removeSelectedVS()</code> — reads selected VS from <code>selectedVSNames</code>, two-step confirm, DELETE to remove endpoint.
+    </td>
+  </tr>
+  <tr>
+    <td><code>services/vs-service/main.py</code></td>
+    <td>
+      <code>POST /api/vs/{dut_id}/spin</code> — 4 steps:<br>
+      &nbsp;&nbsp;① <code>test -f {xml_path}/{vs_name}.xml</code><br>
+      &nbsp;&nbsp;② <code>sudo cp {source_image} /var/lib/libvirt/images/{username}/{filename}</code><br>
+      &nbsp;&nbsp;③ <code>sudo virsh define {xml_full}</code><br>
+      &nbsp;&nbsp;④ <code>sudo virsh start {vs_name}</code><br><br>
+      <code>DELETE /api/vs/{dut_id}/remove/{vs_name}</code> — 3 steps:<br>
+      &nbsp;&nbsp;① <code>sudo virsh destroy {vs_name}; sudo virsh undefine {vs_name}</code><br>
+      &nbsp;&nbsp;② <code>sudo rm -f {xml_path}/{vs_name}.xml</code><br>
+      &nbsp;&nbsp;③ Read image path from XML → <code>sudo rm -f {image_path}</code>
+    </td>
+  </tr>
+  <tr>
+    <td><code>nginx/nginx.conf</code></td>
+    <td>No change.</td>
+  </tr>
+</table>
+
+<div style="margin-top:28px;padding:14px 18px;background:#0d2018;border:1px solid #166534;
+            border-radius:8px;font-size:0.84rem;color:#86efac;max-width:1040px">
+  ✅ <b>Review only — no code changed yet.</b> Reply <b>"Approve"</b> to implement.
+</div>
+
+</body>
+</html>

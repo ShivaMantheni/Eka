@@ -45,6 +45,9 @@
             <div class="stat-pill" id="user-badge" style="display:none; cursor:pointer;" title="User Info">
                 <span class="material-icons-round">account_circle</span> <span id="user-badge-name">User</span>
             </div>
+            <div class="btn-icon" id="logout-btn" style="display:none;cursor:pointer;padding:6px;" title="Logout" onclick="logoutUser()">
+                <span class="material-icons-round" style="font-size:20px">logout</span>
+            </div>
             <div class="health-dot" id="health-dot" title="Session Status"></div>
         </div>
     </header>
@@ -735,68 +738,135 @@
         <!-- ============ VS MANAGER TAB ============ -->
         <section id="tab-vs" class="tab-content">
             <div class="grid-2">
-                <!-- Left: VS Controls -->
+                <!-- Left: VS Manager (host + VM table + update image) -->
                 <div>
-                    <!-- Host Selection -->
                     <div class="card glass">
                         <div class="card-header">
-                            <h3><span class="material-icons-round">dns</span> Host Device</h3>
+                            <h3><span class="material-icons-round">memory</span> VS Manager</h3>
+                            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+                                <span id="vs-stats-bar" style="display:none;font-size:0.82rem;display:flex;gap:12px;align-items:center"></span>
+                                <span id="vs-selection-count" class="muted" style="font-size:12px"></span>
+                            </div>
                         </div>
                         <div class="card-body">
-                            <select id="vs-host" class="select-full" onchange="onVSHostChange()" style="margin-bottom:12px">
-                                <option value="">-- Select Host Device --</option>
-                            </select>
-                            <button class="btn-icon" onclick="refreshVSList()" title="Refresh VM list">
-                                <span class="material-icons-round">refresh</span>
-                            </button>
-                        </div>
-                    </div>
-
-                    <!-- VM Table -->
-                    <div class="card glass" style="margin-top:16px">
-                        <div class="card-header">
-                            <h3><span class="material-icons-round">view_list</span> Virtual Machines</h3>
-                            <span id="vs-selection-count" class="muted" style="font-size:12px"></span>
-                        </div>
-                        <div class="card-body" style="padding:0;overflow:auto;max-height:420px">
-                            <div id="vs-vm-list">
-                                <p class="muted" style="padding:16px;text-align:center">Select a host device to see VMs
-                                </p>
+                            <!-- Host selector -->
+                            <label class="field-label">Host Device</label>
+                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+                                <select id="vs-host" class="select-full" onchange="onVSHostChange()" style="flex:1">
+                                    <option value="">-- Select Host Device --</option>
+                                </select>
+                                <button class="btn-icon" onclick="refreshVSList()" title="Refresh VM list">
+                                    <span class="material-icons-round">refresh</span>
+                                </button>
                             </div>
+
+                            <!-- VM Table -->
+                            <div style="border:1px solid var(--border);border-radius:7px;overflow:auto;max-height:260px;margin-bottom:14px">
+                                <div id="vs-vm-list">
+                                    <p class="muted" style="padding:16px;text-align:center">Select a host device to see VMs</p>
+                                </div>
+                            </div>
+
+                            <hr style="border:none;border-top:1px dashed var(--border);margin:0 0 14px 0">
+
+                            <!-- Update VS Image: server + button on same row, path below -->
+                            <label class="field-label">Source Image Server <span class="muted">(optional — leave blank for local copy)</span></label>
+                            <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+                                <select id="vs-source-server" class="select-full" style="flex:1">
+                                    <option value="">-- Use Host Device (Local Copy) --</option>
+                                </select>
+                                <button class="btn primary" id="btn-vs-update" onclick="startVSUpdate()" disabled
+                                    style="white-space:nowrap;flex-shrink:0">
+                                    <span class="material-icons-round" style="font-size:16px">rocket_launch</span> Update &amp; Restart
+                                </button>
+                            </div>
+
+                            <label class="field-label">Source Image Path <span class="muted">(full path — shared for all selected VMs)</span></label>
+                            <input type="text" id="vs-source-image"
+                                placeholder="/home/hp/anuradha_build_imgs/target/sonic-vs.img"
+                                value="/home/hp/anuradha_build_imgs/target/sonic-vs.img" class="input-full">
                         </div>
                     </div>
                 </div>
 
-                <!-- Right: Update Form + Progress & Logs -->
+                <!-- Right: Spin New VS + Progress & Logs -->
                 <div>
-                    <!-- Image Update Form (moved here) -->
-                    <div class="card glass">
-                        <div class="card-header">
-                            <h3><span class="material-icons-round">system_update_alt</span> Update VS Image</h3>
+                    <!-- Spin New VS -->
+                    <div class="card glass" style="border-color:var(--green,#10b981)">
+                        <div class="card-header" style="background:rgba(16,185,129,0.06)">
+                            <h3><span class="material-icons-round" style="color:var(--green,#10b981)">add_circle</span> Spin New VS</h3>
                         </div>
                         <div class="card-body">
-                            <label class="field-label">Source Image Server <span class="muted">(optional - leave blank for local copy)</span></label>
-                            <select id="vs-source-server" class="select-full" style="margin-bottom:16px">
-                                <option value="">-- Use Host Device (Local Copy) --</option>
-                            </select>
 
-                            <label class="field-label">Source Image Path <span class="muted">(shared for all selected
-                                    VMs)</span></label>
-                            <input type="text" id="vs-source-image"
-                                value="/home/hp/anuradha_build_imgs/target/sonic-vs.img" class="input-full">
+                            <!-- Step 1: Select source VS -->
+                            <label class="field-label">Select VS <span class="muted">(existing XML on host)</span></label>
+                            <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+                                <select id="spin-source-vs" class="select-full" style="flex:1" onchange="onSourceVSChange()">
+                                    <option value="">-- Select host device first --</option>
+                                </select>
+                                <button class="btn-icon" onclick="fetchVSNames()" title="Refresh VS list">
+                                    <span class="material-icons-round">refresh</span>
+                                </button>
+                            </div>
 
-                            <button class="btn primary big" id="btn-vs-update" onclick="startVSUpdate()"
-                                style="margin-top:16px" disabled>
-                                <span class="material-icons-round">rocket_launch</span> Update Image &amp; Restart
-                                Selected VMs
-                            </button>
+                            <!-- Auto-filled paths from selected VS XML -->
+                            <div style="background:rgba(16,185,129,0.05);border:1px solid rgba(16,185,129,0.2);border-radius:7px;padding:10px 14px;margin-bottom:12px">
+                                <label class="field-label" style="font-size:0.72rem;margin-bottom:4px">XML Path <span class="muted">(auto)</span></label>
+                                <input type="text" id="spin-xml-preview" readonly placeholder="Select a VS above"
+                                    class="input-full" style="margin-bottom:8px;font-family:var(--mono);font-size:0.8rem;color:var(--green,#6ee7b7);background:rgba(16,185,129,0.04);border-color:rgba(16,185,129,0.3);cursor:default">
+                                <label class="field-label" style="font-size:0.72rem;margin-bottom:4px">Image Path <span class="muted">(read from XML)</span></label>
+                                <input type="text" id="spin-image-preview" readonly placeholder="Select a VS to read image path"
+                                    class="input-full" style="font-family:var(--mono);font-size:0.8rem;color:var(--green,#6ee7b7);background:rgba(16,185,129,0.04);border-color:rgba(16,185,129,0.3);cursor:default">
+                            </div>
+
+                            <!-- Step 2: New VS name builder -->
+                            <label class="field-label">New VS Name</label>
+                            <div style="display:flex;gap:6px;align-items:flex-end;margin-bottom:14px">
+                                <div style="flex:2;min-width:0">
+                                    <label class="field-label" style="font-size:0.7rem">Project (4 letters)</label>
+                                    <input type="text" id="spin-project" maxlength="4" placeholder="EKAT"
+                                        class="input-full" style="text-transform:uppercase"
+                                        oninput="this.value=this.value.toUpperCase();updateSpinPreview()">
+                                </div>
+                                <span class="muted" style="padding-bottom:9px;flex-shrink:0">+</span>
+                                <div style="flex:2;min-width:0">
+                                    <label class="field-label" style="font-size:0.7rem">Username</label>
+                                    <input type="text" id="spin-username" placeholder="RAJ"
+                                        class="input-full" oninput="updateSpinPreview()">
+                                </div>
+                                <span class="muted" style="padding-bottom:9px;flex-shrink:0">+</span>
+                                <div style="flex:0 0 52px">
+                                    <label class="field-label" style="font-size:0.7rem">No.</label>
+                                    <input type="number" id="spin-number" placeholder="1" min="1" max="99" value="1"
+                                        class="input-full" oninput="updateSpinPreview()">
+                                </div>
+                                <span class="muted" style="padding-bottom:9px;flex-shrink:0">=</span>
+                                <div style="flex-shrink:0">
+                                    <div style="font-size:0.68rem;color:var(--blue,#3b82f6);margin-bottom:4px;font-weight:600">VS Name</div>
+                                    <div id="spin-vs-preview"
+                                        style="background:rgba(59,130,246,0.08);border:1px solid var(--blue,#3b82f6);border-radius:6px;padding:7px 10px;color:var(--blue,#3b82f6);font-family:var(--mono);font-weight:700;font-size:0.9rem;white-space:nowrap;min-width:80px;text-align:center">
+                                        —
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Spin + Remove buttons -->
+                            <div style="display:flex;gap:8px">
+                                <button class="btn primary" id="btn-spin-vs" onclick="spinVS()" style="flex:1;justify-content:center">
+                                    <span class="material-icons-round">play_circle</span> Spin VS
+                                </button>
+                                <button class="btn" id="btn-remove-vs" onclick="removeSelectedVS()"
+                                    style="flex:1;justify-content:center;background:var(--red);border-color:var(--red)" disabled>
+                                    <span class="material-icons-round">delete_forever</span> Remove VS
+                                </button>
+                            </div>
                         </div>
                     </div>
 
-                    <!-- Progress & Logs -->
+                    <!-- Progress & Logs (shared for update / spin / remove) -->
                     <div class="card glass" style="margin-top:16px">
                         <div class="card-header">
-                            <h3><span class="material-icons-round">engineering</span> Update Progress</h3>
+                            <h3><span class="material-icons-round">engineering</span> <span id="vs-progress-title">VS Progress</span></h3>
                         </div>
                         <div class="card-body">
                             <!-- Step Progress -->
@@ -806,35 +876,35 @@
                                         <span class="step-num">1</span>
                                         <span class="step-icon">✓</span>
                                     </div>
-                                    <span class="step-label">Destroy VM</span>
+                                    <span class="step-label" id="vs-step-label-1">Step 1</span>
                                 </div>
                                 <div class="vs-step" data-step="2">
                                     <div class="step-indicator">
                                         <span class="step-num">2</span>
                                         <span class="step-icon">✓</span>
                                     </div>
-                                    <span class="step-label">Remove Old Image</span>
+                                    <span class="step-label" id="vs-step-label-2">Step 2</span>
                                 </div>
                                 <div class="vs-step" data-step="3">
                                     <div class="step-indicator">
                                         <span class="step-num">3</span>
                                         <span class="step-icon">✓</span>
                                     </div>
-                                    <span class="step-label">Copy New Image</span>
+                                    <span class="step-label" id="vs-step-label-3">Step 3</span>
                                 </div>
                                 <div class="vs-step" data-step="4">
                                     <div class="step-indicator">
                                         <span class="step-num">4</span>
                                         <span class="step-icon">✓</span>
                                     </div>
-                                    <span class="step-label">Start VM</span>
+                                    <span class="step-label" id="vs-step-label-4">Step 4</span>
                                 </div>
                             </div>
                             <!-- Live Logs -->
                             <div class="log-container" id="vs-log-container" style="margin-top:12px">
                                 <div class="log-placeholder">
                                     <span class="material-icons-round">memory</span>
-                                    <p>Select VMs, set target image names, then click Update.</p>
+                                    <p>Select VMs and click an action to begin.</p>
                                 </div>
                             </div>
                         </div>
@@ -1085,14 +1155,20 @@
             </div>
 
             <div class="um-grid">
-                <!-- Left panel: Registered users from AccessHub -->
+                <!-- Left panel: Registered users -->
                 <div class="um-panel">
                     <div class="um-panel-head">
                         <div class="um-panel-title">
                             <span class="material-icons-round">group</span>
                             Registered Users
                         </div>
-                        <span class="users-count-badge" id="users-count-badge" style="display:none"></span>
+                        <div style="display:flex;align-items:center;gap:8px">
+                            <span class="users-count-badge" id="users-count-badge" style="display:none"></span>
+                            <button class="btn primary small" onclick="showAddUserModal()"
+                                style="font-size:0.75rem;padding:5px 10px">
+                                <span class="material-icons-round" style="font-size:14px">person_add</span> Add User
+                            </button>
+                        </div>
                     </div>
                     <div class="users-list um-scroll" id="users-container">
                         <!-- Populated via JS -->

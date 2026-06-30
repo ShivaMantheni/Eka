@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Spin New VS — Feature Plan</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #0f1117; color: #e2e8f0; padding: 32px; }
+  h1 { font-size: 1.5rem; color: #7dd3fc; margin-bottom: 8px; }
+  h2 { font-size: 1.1rem; color: #94a3b8; margin: 28px 0 12px; border-bottom: 1px solid #2d3748; padding-bottom: 6px; }
+  .section { margin-bottom: 40px; }
+
+  /* ── VS Tab Layout ── */
+  .tab-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 960px; }
+  .col-label { font-size: 0.7rem; color: #64748b; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .card {
+    border: 1px solid #2d3748; border-radius: 10px; overflow: hidden; background: #1a2035;
+  }
+  .card-head {
+    background: #1e293b; padding: 10px 14px; display: flex; align-items: center; gap: 8px;
+    font-size: 0.85rem; font-weight: 600; border-bottom: 1px solid #2d3748;
+  }
+  .card-head .icon { font-size: 1rem; }
+  .card-body { padding: 14px; font-size: 0.82rem; }
+  .field-row { margin-bottom: 10px; }
+  .field-label { color: #94a3b8; font-size: 0.75rem; margin-bottom: 4px; display: block; }
+  .input-mock {
+    background: #0f1729; border: 1px solid #334155; border-radius: 6px;
+    padding: 7px 10px; color: #cbd5e1; font-size: 0.8rem; width: 100%;
+  }
+  .select-mock {
+    background: #0f1729; border: 1px solid #334155; border-radius: 6px;
+    padding: 7px 10px; color: #cbd5e1; font-size: 0.8rem; width: 100%;
+    display: flex; justify-content: space-between;
+  }
+  .btn-primary {
+    background: linear-gradient(135deg, #3b82f6, #6366f1);
+    border: none; border-radius: 8px; color: #fff; padding: 9px 18px;
+    font-size: 0.82rem; font-weight: 600; width: 100%; margin-top: 8px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  .btn-spin {
+    background: linear-gradient(135deg, #10b981, #059669);
+    border: none; border-radius: 8px; color: #fff; padding: 9px 18px;
+    font-size: 0.82rem; font-weight: 600; width: 100%; margin-top: 8px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  .new-badge {
+    background: #10b981; color: #fff; font-size: 0.62rem; font-weight: 700;
+    padding: 2px 6px; border-radius: 4px; letter-spacing: 0.5px;
+  }
+  .preview-box {
+    background: #0d1a2e; border: 1px solid #3b82f6; border-radius: 6px;
+    padding: 8px 12px; color: #7dd3fc; font-weight: 700; font-size: 1rem;
+    font-family: monospace; margin: 8px 0;
+  }
+  .auto-path {
+    background: #0d1a0d; border: 1px solid #166534; border-radius: 6px;
+    padding: 6px 10px; color: #86efac; font-size: 0.75rem; font-family: monospace;
+    margin-bottom: 6px;
+  }
+  .auto-label { color: #64748b; font-size: 0.68rem; margin-bottom: 2px; }
+  .grid-3 { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 8px; }
+  .steps-row { display: flex; gap: 0; margin: 10px 0; }
+  .step-box {
+    flex: 1; text-align: center; padding: 8px 4px; background: #1e293b;
+    border: 1px solid #2d3748; font-size: 0.7rem; color: #64748b; position: relative;
+  }
+  .step-box:not(:last-child)::after {
+    content: '›'; position: absolute; right: -7px; top: 50%; transform: translateY(-50%);
+    color: #475569; font-size: 1rem; z-index: 1;
+  }
+  .step-num { display: block; font-size: 1rem; font-weight: 700; color: #3b82f6; margin-bottom: 2px; }
+  .log-mock {
+    background: #0a0e1a; border: 1px solid #1e293b; border-radius: 6px;
+    padding: 10px; font-family: monospace; font-size: 0.72rem; color: #4ade80;
+    min-height: 60px; margin-top: 8px;
+  }
+  .log-line { margin-bottom: 3px; }
+  .log-ok { color: #4ade80; }
+  .log-info { color: #94a3b8; }
+  .log-step { color: #7dd3fc; }
+
+  /* ── Flow Diagram ── */
+  .flow { display: flex; flex-direction: column; align-items: center; gap: 0; max-width: 520px; }
+  .flow-box {
+    background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+    padding: 10px 20px; text-align: center; width: 100%; font-size: 0.82rem;
+  }
+  .flow-box.start { background: #1e3a5f; border-color: #3b82f6; color: #7dd3fc; font-weight: 600; }
+  .flow-box.step  { background: #1a2e1a; border-color: #166534; color: #86efac; }
+  .flow-box.error { background: #2d1515; border-color: #7f1d1d; color: #fca5a5; }
+  .flow-box.end   { background: #1a2035; border-color: #6366f1; color: #a5b4fc; font-weight: 600; }
+  .flow-arrow { font-size: 1.3rem; color: #475569; margin: 2px 0; }
+  .flow-row { display: flex; align-items: center; gap: 12px; width: 100%; }
+  .flow-fail { flex: 1; }
+  .flow-ok { flex: 0 0 auto; font-size: 0.7rem; color: #64748b; }
+
+  /* ── Name breakdown ── */
+  .name-demo { display: flex; gap: 0; font-family: monospace; font-size: 1.1rem; margin: 12px 0; }
+  .name-part {
+    padding: 8px 16px; border: 1px solid; text-align: center;
+  }
+  .name-part.proj { background: #1e3a5f; border-color: #3b82f6; color: #7dd3fc; }
+  .name-part.user { background: #1a2e1a; border-color: #166534; color: #86efac; }
+  .name-part.num  { background: #2d1f00; border-color: #b45309; color: #fcd34d; }
+  .name-label { font-size: 0.68rem; color: #64748b; display: block; margin-top: 4px; font-family: sans-serif; }
+  .plus { display: flex; align-items: center; padding: 0 4px; color: #475569; font-size: 1rem; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+  th { background: #1e293b; padding: 8px 12px; text-align: left; color: #94a3b8; font-weight: 600; }
+  td { padding: 8px 12px; border-top: 1px solid #1e293b; color: #cbd5e1; }
+  code { background: #0f1729; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; color: #7dd3fc; }
+</style>
+</head>
+<body>
+
+<h1>🆕 Spin New VS — Feature Plan</h1>
+<p style="color:#64748b;font-size:0.82rem;margin-top:4px">VS Manager Tab · version-3.1.3</p>
+
+<!-- ── Section 1: VS Name ── -->
+<div class="section">
+  <h2>1 · VS Naming Convention</h2>
+  <div class="name-demo">
+    <div class="name-part proj">EKAT<span class="name-label">Project (4 letters)</span></div>
+    <div class="plus">+</div>
+    <div class="name-part user">hp<span class="name-label">Username</span></div>
+    <div class="plus">+</div>
+    <div class="name-part num">1<span class="name-label">VS Number</span></div>
+  </div>
+  <div style="color:#94a3b8;font-size:0.82rem">Result → <code>EKAThp1</code></div>
+</div>
+
+<!-- ── Section 2: Path Derivation ── -->
+<div class="section">
+  <h2>2 · Auto-Resolved Paths</h2>
+  <table>
+    <tr><th>Path</th><th>Source</th><th>Example</th></tr>
+    <tr>
+      <td>XML File</td>
+      <td><code>dut.xml_path</code> + <code>/vs_name.xml</code> (same field as Devices tab)</td>
+      <td><code>/home/hp/xml/EKAThp1.xml</code></td>
+    </tr>
+    <tr>
+      <td>Image Dir</td>
+      <td>Fixed pattern <code>/var/lib/libvirt/images/vs_name/</code></td>
+      <td><code>/var/lib/libvirt/images/EKAThp1/</code></td>
+    </tr>
+    <tr>
+      <td>Source Image</td>
+      <td>User provides full file path (shared input)</td>
+      <td><code>/home/hp/.../sonic-vs.img</code></td>
+    </tr>
+  </table>
+</div>
+
+<!-- ── Section 3: UI Layout ── -->
+<div class="section">
+  <h2>3 · VS Manager Tab Layout</h2>
+  <div class="tab-layout">
+
+    <!-- Left column -->
+    <div>
+      <div class="col-label">Left Column</div>
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-head"><span class="icon">🖥</span> Host Device</div>
+        <div class="card-body">
+          <div class="select-mock"><span>-- Select Host Device --</span><span>▾</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <span class="icon">📋</span> Virtual Machines
+          <span style="margin-left:auto;font-size:0.75rem;color:#94a3b8">T:48 R:36 D:12</span>
+        </div>
+        <div class="card-body" style="padding:0">
+          <div style="font-size:0.75rem;color:#94a3b8;padding:8px 14px;border-bottom:1px solid #1e293b;display:flex;gap:16px">
+            <span>☑</span><span>VM Name</span><span style="margin-left:auto">State</span><span style="width:60px;text-align:right">Image</span><span style="width:80px;text-align:right">Action</span>
+          </div>
+          <div style="padding:8px 14px;font-size:0.78rem;display:flex;gap:8px;align-items:center;border-bottom:1px solid #0f1117">
+            <span>☑</span>
+            <span style="color:#4ade80;font-size:0.9rem">▶</span>
+            <span style="font-weight:600">EKAThp1</span>
+            <span style="margin-left:auto;background:#14532d;color:#4ade80;font-size:0.68rem;padding:2px 6px;border-radius:4px">running</span>
+            <span style="font-size:0.72rem;color:#64748b">sonic.img</span>
+            <span style="color:#f59e0b;font-size:0.8rem">⏸ ⏹</span>
+          </div>
+          <div style="padding:8px 14px;font-size:0.78rem;display:flex;gap:8px;align-items:center;border-bottom:1px solid #0f1117">
+            <span>☐</span>
+            <span style="color:#94a3b8;font-size:0.9rem">⏹</span>
+            <span style="font-weight:600">EKATath2</span>
+            <span style="margin-left:auto;background:#1e293b;color:#94a3b8;font-size:0.68rem;padding:2px 6px;border-radius:4px">shut off</span>
+            <span style="font-size:0.72rem;color:#64748b">sonic.img</span>
+            <span style="color:#4ade80;font-size:0.8rem">▶</span>
+          </div>
+          <div style="padding:6px 14px;font-size:0.72rem;color:#64748b;text-align:center">...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right column -->
+    <div>
+      <div class="col-label">Right Column</div>
+
+      <!-- Update VS Image card (existing) -->
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-head"><span class="icon">⬆</span> Update VS Image <span style="margin-left:auto;font-size:0.68rem;color:#64748b">existing</span></div>
+        <div class="card-body">
+          <div class="field-row">
+            <div class="field-label">Source Image Server</div>
+            <div class="select-mock"><span style="color:#64748b">-- Use Host Device (Local Copy) --</span><span>▾</span></div>
+          </div>
+          <div class="field-row">
+            <div class="field-label">Source Image Path</div>
+            <div class="input-mock">/home/hp/.../sonic-vs.img</div>
+          </div>
+          <button class="btn-primary">🚀 Update Image &amp; Restart Selected VMs</button>
+        </div>
+      </div>
+
+      <!-- Spin New VS card (NEW) -->
+      <div class="card" style="margin-bottom:12px;border-color:#166534">
+        <div class="card-head" style="background:#0d2018;border-bottom-color:#166534">
+          <span class="icon">🆕</span> Spin New VS
+          <span class="new-badge" style="margin-left:8px">NEW</span>
+        </div>
+        <div class="card-body">
+          <div class="grid-3" style="margin-bottom:10px">
+            <div class="field-row" style="margin:0">
+              <div class="field-label">Project (4 letters)</div>
+              <div class="input-mock">EKAT</div>
+            </div>
+            <div class="field-row" style="margin:0">
+              <div class="field-label">Username</div>
+              <div class="input-mock">hp</div>
+            </div>
+            <div class="field-row" style="margin:0">
+              <div class="field-label">VS No.</div>
+              <div class="select-mock"><span>1</span><span>▾</span></div>
+            </div>
+          </div>
+
+          <div class="auto-label">VS Name Preview</div>
+          <div class="preview-box">EKAThp1</div>
+
+          <div class="auto-label">XML Path (auto from host device config)</div>
+          <div class="auto-path">/home/hp/xml/EKAThp1.xml</div>
+
+          <div class="auto-label">Image Dir (auto)</div>
+          <div class="auto-path">/var/lib/libvirt/images/EKAThp1/</div>
+
+          <div class="field-row" style="margin-top:6px">
+            <div class="field-label">Source Image Path</div>
+            <div class="input-mock">/home/hp/.../sonic-vs.img</div>
+          </div>
+
+          <button class="btn-spin">🔄 Spin VS</button>
+        </div>
+      </div>
+
+      <!-- Progress card -->
+      <div class="card">
+        <div class="card-head"><span class="icon">🛠</span> Progress</div>
+        <div class="card-body">
+          <div class="steps-row">
+            <div class="step-box"><span class="step-num">①</span>Validate<br>XML</div>
+            <div class="step-box"><span class="step-num">②</span>Create<br>img dir</div>
+            <div class="step-box"><span class="step-num">③</span>Copy<br>image</div>
+            <div class="step-box"><span class="step-num">④</span>Define<br>VM</div>
+            <div class="step-box"><span class="step-num">⑤</span>Start<br>VM</div>
+          </div>
+          <div class="log-mock">
+            <div class="log-step">▶ Step 1/5: Validating XML...</div>
+            <div class="log-ok">  ✓ Found /home/hp/xml/EKAThp1.xml</div>
+            <div class="log-step">▶ Step 2/5: Creating image directory...</div>
+            <div class="log-ok">  ✓ mkdir -p /var/lib/libvirt/images/EKAThp1/</div>
+            <div class="log-step">▶ Step 3/5: Copying image...</div>
+            <div class="log-info">  (in progress...)</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Section 4: Backend Flow ── -->
+<div class="section">
+  <h2>4 · Backend Flow — POST /api/vs/{dut_id}/spin</h2>
+  <div class="flow">
+    <div class="flow-box start">POST /api/vs/{dut_id}/spin<br><span style="font-size:0.75rem;color:#94a3b8">{ project, username, number, source_image }</span></div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-box" style="background:#1e293b;border-color:#334155">
+      Build vs_name = project + username + number<br>
+      xml_full = dut.xml_path + "/" + vs_name + ".xml"<br>
+      img_dir  = "/var/lib/libvirt/images/" + vs_name + "/"
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-box step">Step 1/5 · SSH: test -f {xml_full}</div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-box step">Step 2/5 · SSH: sudo mkdir -p {img_dir}</div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-box step">Step 3/5 · SSH: sudo cp {source_image} {img_dir}{filename}</div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-box step">Step 4/5 · SSH: sudo virsh define {xml_full}</div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-box step">Step 5/5 · SSH: sudo virsh start {vs_name}</div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-box end">✓ VS Spun · Refresh VM list</div>
+  </div>
+</div>
+
+<!-- ── Section 5: What changes ── -->
+<div class="section">
+  <h2>5 · Files to Change</h2>
+  <table>
+    <tr><th>File</th><th>Change</th></tr>
+    <tr>
+      <td><code>services/vs-service/main.py</code></td>
+      <td>New <code>POST /api/vs/{dut_id}/spin</code> endpoint + <code>_run_vs_spin()</code> background thread (5 steps, same WebSocket log pattern as update)</td>
+    </tr>
+    <tr>
+      <td><code>static/index.html</code></td>
+      <td>New "Spin New VS" card in right column (below Update card) with 3-input row + preview + auto-path display + Spin button</td>
+    </tr>
+    <tr>
+      <td><code>static/app.js</code></td>
+      <td><code>spinVS()</code> — reads inputs, builds vs_name, shows preview live as user types, POSTs to spin endpoint, streams progress to shared progress panel</td>
+    </tr>
+    <tr>
+      <td><code>nginx/nginx.conf</code></td>
+      <td>No change — <code>/api/vs</code> already routes to <code>eka-vs</code></td>
+    </tr>
+  </table>
+</div>
+
+</body>
+</html>

@@ -3,12 +3,14 @@ version: '3.9'
 # ============================================================
 #  Eka Automation — Docker Compose
 #  Services:
-#    postgres        → Shared PostgreSQL database
 #    eka-core        → Core app (Devices, Dashboard, Logs, Terminal)
 #    eka-execute     → Execute tab (SpyTest, script execution)
 #    eka-vs          → VS Manager tab (virsh, VM lifecycle)
 #    eka-hardware    → Hardware Load tab (ONIE, telnet)
 #    eka-nginx       → API Gateway (routes to correct service)
+#
+#  Database: uses host PostgreSQL via host.docker.internal
+#  Set DATABASE_URL in .env to override (see .env.docker template)
 # ============================================================
 
 networks:
@@ -16,33 +18,10 @@ networks:
     driver: bridge
 
 volumes:
-  postgres_data:      # PostgreSQL data (persistent)
   eka_logs:           # Shared execution logs volume
   eka_images:         # Shared images volume
 
 services:
-
-  # ── PostgreSQL Database ───────────────────────────────────────────────────
-  postgres:
-    image: postgres:15-alpine
-    container_name: eka-postgres
-    environment:
-      POSTGRES_DB:       ${POSTGRES_DB:-eka_automation}
-      POSTGRES_USER:     ${POSTGRES_USER:-eka_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-eka_secret_change_me}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - eka-network
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-eka_user} -d ${POSTGRES_DB:-eka_automation}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    # ports:
-    #   - "5432:5432"   # Uncomment only if you need external DB access (conflicts with host PostgreSQL)
 
   # ── Core Monolith (Devices + Dashboard + Logs + Terminal) ─────────────────
   eka-core:
@@ -50,15 +29,22 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: eka-core
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-eka_user}:${POSTGRES_PASSWORD:-eka_secret_change_me}@postgres:5432/${POSTGRES_DB:-eka_automation}
-      SECRET_KEY:   ${SECRET_KEY:-eka-secret-key-change-in-production}
+      DATABASE_URL:           ${DATABASE_URL:-postgresql://eka_user:eka_password@host.docker.internal:5432/eka_automation}
+      SECRET_KEY:             ${SECRET_KEY:-eka-secret-key-change-in-production}
+      ONEPALC_ENABLED:        ${ONEPALC_ENABLED:-false}
+      ONEPALC_HUB_AUTH_URL:   ${ONEPALC_HUB_AUTH_URL:-}
+      ONEPALC_APP_NAME:       ${ONEPALC_APP_NAME:-Eka-Automation}
+      ONEPALC_CALLBACK_URL:   ${ONEPALC_CALLBACK_URL:-}
+      ONEPALC_ROLE_KEY:       ${ONEPALC_ROLE_KEY:-EKA}
+      ONEPALC_API_TOKEN:      ${ONEPALC_API_TOKEN:-}
+      ONEPALC_JWT_SECRET:     ${ONEPALC_JWT_SECRET:-}
+      ONEPALC_PUBLIC_KEY:     ${ONEPALC_PUBLIC_KEY:-}
     volumes:
       - eka_logs:/app/data/logs
       - eka_images:/app/data/images
-    depends_on:
-      postgres:
-        condition: service_healthy
     networks:
       - eka-network
     restart: unless-stopped
@@ -75,14 +61,13 @@ services:
       context: services/execute-service
       dockerfile: Dockerfile
     container_name: eka-execute
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-eka_user}:${POSTGRES_PASSWORD:-eka_secret_change_me}@postgres:5432/${POSTGRES_DB:-eka_automation}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://eka_user:eka_password@host.docker.internal:5432/eka_automation}
       SPYTEST_BASE: ${SPYTEST_BASE:-/home/hp_test/Eka/sonic-mgmt/spytest}
     volumes:
       - eka_logs:/app/data/logs
-    depends_on:
-      postgres:
-        condition: service_healthy
     networks:
       - eka-network
     restart: unless-stopped
@@ -99,12 +84,11 @@ services:
       context: services/vs-service
       dockerfile: Dockerfile
     container_name: eka-vs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      DATABASE_URL:    postgresql://${POSTGRES_USER:-eka_user}:${POSTGRES_PASSWORD:-eka_secret_change_me}@postgres:5432/${POSTGRES_DB:-eka_automation}
+      DATABASE_URL:    ${DATABASE_URL:-postgresql://eka_user:eka_password@host.docker.internal:5432/eka_automation}
       VS_SOURCE_IMAGE: ${VS_SOURCE_IMAGE:-/home/hp/anuradha_build_imgs/target/sonic-vs.img}
-    depends_on:
-      postgres:
-        condition: service_healthy
     networks:
       - eka-network
     restart: unless-stopped
@@ -121,11 +105,10 @@ services:
       context: services/hardware-service
       dockerfile: Dockerfile
     container_name: eka-hardware
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-eka_user}:${POSTGRES_PASSWORD:-eka_secret_change_me}@postgres:5432/${POSTGRES_DB:-eka_automation}
-    depends_on:
-      postgres:
-        condition: service_healthy
+      DATABASE_URL: ${DATABASE_URL:-postgresql://eka_user:eka_password@host.docker.internal:5432/eka_automation}
     networks:
       - eka-network
     restart: unless-stopped
@@ -157,7 +140,7 @@ services:
       - eka-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/nginx-health"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -95,33 +95,101 @@ def get_db():
 
 # ── SSH Manager ────────────────────────────────────────────────────────────────
 class SSHManager:
+    """SSH manager for VS-service with retry-on-connect and reconnect-on-drop."""
+
+    MAX_CONNECT_RETRIES = 4
+    CONNECT_BACKOFF     = [0, 3, 8, 20]
+    MAX_CMD_RETRIES     = 3
+    CMD_BACKOFF         = [0, 2, 5]
+
     def __init__(self, host, port=22, username="admin", password=""):
         self.host, self.port, self.username, self.password = host, port, username, password
         self.client = None
 
-    def connect(self) -> bool:
+    def _is_alive(self) -> bool:
         try:
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(AutoAddPolicy())
-            self.client.connect(hostname=self.host, port=self.port, username=self.username,
-                                password=self.password, timeout=15, allow_agent=False,
-                                look_for_keys=False)
+            if not self.client:
+                return False
+            t = self.client.get_transport()
+            if not t or not t.is_active():
+                return False
+            t.send_ignore()
             return True
-        except Exception as e:
-            logger.error(f"SSH connect failed: {e}")
+        except Exception:
             return False
 
-    def execute_command(self, command, timeout=300):
-        stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
-        out = stdout.read().decode("utf-8", errors="ignore")
-        err = stderr.read().decode("utf-8", errors="ignore")
-        code = stdout.channel.recv_exit_status()
-        return out, err, code
+    def _open_client(self) -> bool:
+        try:
+            c = paramiko.SSHClient()
+            c.set_missing_host_key_policy(AutoAddPolicy())
+            c.connect(hostname=self.host, port=self.port, username=self.username,
+                      password=self.password, timeout=15, allow_agent=False,
+                      look_for_keys=False, banner_timeout=15, auth_timeout=15)
+            t = c.get_transport()
+            if t:
+                t.set_keepalive(15)
+            self.client = c
+            return True
+        except paramiko.AuthenticationException as e:
+            logger.error(f"SSH auth failed {self.username}@{self.host} — {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"SSH connect attempt failed {self.host}:{self.port} — {e}")
+            return False
+
+    def connect(self, retries: int = MAX_CONNECT_RETRIES) -> bool:
+        import time as _time
+        for attempt in range(retries):
+            delay = self.CONNECT_BACKOFF[min(attempt, len(self.CONNECT_BACKOFF) - 1)]
+            if delay:
+                _time.sleep(delay)
+            if self._open_client():
+                logger.info(f"SSH connected to {self.host}:{self.port} (attempt {attempt + 1})")
+                return True
+        logger.error(f"SSH connection failed after {retries} attempts: {self.host}:{self.port}")
+        return False
+
+    def reconnect(self) -> bool:
+        try:
+            if self.client:
+                self.client.close()
+        except Exception:
+            pass
+        self.client = None
+        return self.connect()
+
+    def execute_command(self, command, timeout=300, cmd_retries=MAX_CMD_RETRIES):
+        import time as _time
+        last_exc = None
+        for attempt in range(cmd_retries):
+            delay = self.CMD_BACKOFF[min(attempt, len(self.CMD_BACKOFF) - 1)]
+            if delay:
+                _time.sleep(delay)
+            if not self._is_alive():
+                logger.warning(f"[SSH-VS] {self.host} connection dead (attempt {attempt + 1}) — reconnecting")
+                if not self.reconnect():
+                    last_exc = Exception(f"Reconnect failed (attempt {attempt + 1})")
+                    continue
+            try:
+                stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
+                out  = stdout.read().decode("utf-8", errors="ignore")
+                err  = stderr.read().decode("utf-8", errors="ignore")
+                code = stdout.channel.recv_exit_status()
+                return out, err, code
+            except Exception as e:
+                logger.warning(f"[SSH-VS] Command failed on {self.host} (attempt {attempt + 1}): {e}")
+                last_exc = e
+                self.client = None
+        raise last_exc or Exception(f"Command failed after {cmd_retries} attempts on {self.host}")
 
     def disconnect(self):
         if self.client:
-            try: self.client.close()
-            except: pass
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            finally:
+                self.client = None
 
 def log_exec(db, execution_id, dut_name, level, message):
     entry = ExecutionLog(execution_id=execution_id, dut_name=dut_name,
@@ -316,10 +384,12 @@ def update_vs_image_batch(body: dict, db: Session = Depends(get_db)):
             "vs_count": len(vs_entries),
             "message": f"VS batch update started for {len(vs_entries)} VM(s) on {dut.name}"}
 
-# ── Background: single VM update ──────────────────────────────────────────────
-def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image):
+# ── Background: single VM update (6-step, matches frontend stepMap) ───────────
+def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image,
+                   source_server_id=None):
     db = SessionLocal()
     execution = None
+    dut = None
     try:
         execution = db.query(Execution).filter(Execution.id == execution_id).first()
         execution.status = "running"
@@ -329,33 +399,48 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image):
         dut = db.query(DUT).filter(DUT.id == dut_id).first()
         if not dut:
             log_exec(db, execution_id, "SYSTEM", "ERROR", "DUT not found")
-            execution.status = "failed"
-            execution.end_time = datetime.utcnow()
-            db.commit()
-            return
+            execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
+        source_server = None
+        if source_server_id:
+            source_server = db.query(DUT).filter(DUT.id == source_server_id).first()
+
+        log_exec(db, execution_id, dut.name, "INFO", f"Starting VS image update for '{vs_name}'")
         log_exec(db, execution_id, dut.name, "INFO",
-                 f"Starting VS image update for '{vs_name}'")
-        log_exec(db, execution_id, dut.name, "INFO",
-                 f"  Source image: {source_image}")
-        log_exec(db, execution_id, dut.name, "INFO",
-                 f"  Target image: (resolving from XML)")
+                 f"  Copy method: {'SCP from ' + source_server.name if source_server else 'Local copy on Host Device'}")
+        log_exec(db, execution_id, dut.name, "INFO", f"  Source image: {source_image}")
+        log_exec(db, execution_id, dut.name, "INFO", f"  XML file: {xml_full_path}")
 
         ssh = SSHManager(dut.ip_address, dut.port, dut.username, dut.password)
         if not ssh.connect():
             log_exec(db, execution_id, dut.name, "ERROR",
                      f"SSH connection FAILED to {dut.ip_address}:{dut.port}")
-            execution.status = "failed"
-            execution.end_time = datetime.utcnow()
-            db.commit()
-            return
+            execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
         def sudocmd(cmd):
             safe = dut.password.replace("'", "'\\''")
             return f"echo '{safe}' | sudo -S {cmd}"
 
+        def run_step(step_name, command, allow_fail=False, timeout=120):
+            log_exec(db, execution_id, dut.name, "INFO", f"▶ {step_name}")
+            log_exec(db, execution_id, dut.name, "INFO", f"  $ {command}")
+            output, error, exit_code = ssh.execute_command(command, timeout=timeout)
+            if output.strip():
+                for line in output.strip().split("\n")[:20]:
+                    log_exec(db, execution_id, dut.name, "INFO", f"    {line}")
+            if exit_code != 0:
+                msg = error.strip() or f"Exit code {exit_code}"
+                if allow_fail:
+                    log_exec(db, execution_id, dut.name, "WARNING",
+                             f"  ⚠ {step_name} (allowed): {msg}")
+                    return True
+                log_exec(db, execution_id, dut.name, "ERROR", f"  ✗ {step_name} FAILED: {msg}")
+                return False
+            log_exec(db, execution_id, dut.name, "INFO", f"  ✓ {step_name} completed successfully")
+            return True
+
         try:
-            # Resolve image path from XML on the remote host
+            # Resolve target image path from XML
             log_exec(db, execution_id, dut.name, "INFO",
                      f"▶ Resolving image path from XML: {xml_full_path}")
             extract_cmd = sudocmd(
@@ -372,48 +457,68 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image):
                 log_exec(db, execution_id, dut.name, "ERROR",
                          f"  ✗ Could not resolve image path from XML: "
                          f"{xml_err.strip() or 'No <disk device=disk> source found'}")
-                execution.status = "failed"
-                execution.end_time = datetime.utcnow()
-                db.commit()
-                return
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+            log_exec(db, execution_id, dut.name, "INFO", f"  ✓ Target path (from XML): {target_image_path}")
             log_exec(db, execution_id, dut.name, "INFO",
-                     f"  ✓ Resolved image path: {target_image_path}")
+                     f"  Will copy: {source_image} → {target_image_path}")
 
-            steps = [
-                ("Step 1/4: Destroying VM",   f"virsh destroy {vs_name}",                               True),
-                ("Step 2/4: Removing old image", sudocmd(f"rm -f {target_image_path}"),                 False),
-                ("Step 3/4: Copying new image",  sudocmd(f"cp {source_image} {target_image_path}"),     False),
-                ("Step 4/4: Starting VM",      f"virsh start {vs_name}",                                False),
-            ]
+            # Step 1/6 — Destroy VM
+            if not run_step("Step 1/6: Destroying VM", sudocmd(f"virsh destroy {vs_name}"), allow_fail=True):
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
+            # Step 2/6 — Remove old image (path comes from XML)
+            if not run_step("Step 2/6: Removing old image", sudocmd(f"rm -f {target_image_path}")):
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+            # Step 3/6 — Copy source image to XML-defined target path (cp src → target renames to XML name)
             all_ok = True
-            for step_name, command, allow_fail in steps:
-                log_exec(db, execution_id, dut.name, "INFO", f"▶ {step_name}")
-                try:
-                    output, error, exit_code = ssh.execute_command(command, timeout=600)
-                    if output.strip():
-                        for line in output.strip().split("\n")[:20]:
-                            log_exec(db, execution_id, dut.name, "INFO", f"    {line}")
-                    if exit_code != 0:
-                        msg = error.strip() or f"Exit code {exit_code}"
-                        if allow_fail:
-                            log_exec(db, execution_id, dut.name, "WARNING",
-                                     f"  ⚠ {step_name} (allowed): {msg}")
-                        else:
-                            log_exec(db, execution_id, dut.name, "ERROR",
-                                     f"  ✗ {step_name} FAILED: {msg}")
-                            all_ok = False
-                            break
-                    else:
-                        log_exec(db, execution_id, dut.name, "INFO", f"  ✓ {step_name} completed")
-                except Exception as e:
-                    log_exec(db, execution_id, dut.name, "ERROR", f"  ✗ {step_name} error: {e}")
+            if source_server:
+                log_exec(db, execution_id, dut.name, "INFO",
+                         "▶ Step 3/6: Copying image from remote server (SCP)")
+                dest_temp = f"/tmp/{os.path.basename(target_image_path)}"
+                safe_pass = source_server.password.replace("'", "'\\''")
+                port_flag = f"-P {source_server.port}" if source_server.port != 22 else ""
+                scp_cmd = (f"sshpass -p '{safe_pass}' scp {port_flag} -o StrictHostKeyChecking=no "
+                           f"{source_server.username}@{source_server.ip_address}:{source_image} {dest_temp}")
+                output, error, exit_code = ssh.execute_command(scp_cmd, timeout=300)
+                if exit_code != 0:
+                    msg = error.strip() or f"Exit code {exit_code}"
+                    log_exec(db, execution_id, dut.name, "ERROR", f"  ✗ Step 3/6 FAILED: {msg}")
                     all_ok = False
-                    break
+                else:
+                    log_exec(db, execution_id, dut.name, "INFO", f"  ✓ Downloaded to {dest_temp}")
+                    if not run_step("Step 3/6: Moving image to destination",
+                                    sudocmd(f"mv {dest_temp} {target_image_path}")):
+                        all_ok = False
+            else:
+                all_ok = run_step("Step 3/6: Copying image (local)",
+                                  sudocmd(f"cp {source_image} {target_image_path}"), timeout=300)
 
-            execution.status = "completed" if all_ok else "failed"
-            log_exec(db, execution_id, dut.name, "INFO" if all_ok else "ERROR",
-                     "✓ VS image update completed" if all_ok else "✗ VS image update FAILED")
+            if not all_ok:
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+            # Step 4/6 — Undefine VM
+            run_step("Step 4/6: Undefining VM", sudocmd(f"virsh undefine {vs_name}"), allow_fail=True)
+
+            # Step 5/6 — Define VM from XML
+            if not run_step("Step 5/6: Defining VM from XML", sudocmd(f"virsh define {xml_full_path}")):
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+            # Step 6/6 — Start VM
+            if not run_step("Step 6/6: Starting VM", sudocmd(f"virsh start {vs_name}")):
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+            # Verify
+            out, _, _ = ssh.execute_command(sudocmd(f"virsh domstate {vs_name}"), timeout=10)
+            state = out.strip()
+            log_exec(db, execution_id, dut.name, "INFO", f"  VM '{vs_name}' state: {state}")
+            if "running" in state.lower():
+                log_exec(db, execution_id, dut.name, "INFO",
+                         f"✓ VS image update completed — '{vs_name}' is running with new image")
+            else:
+                log_exec(db, execution_id, dut.name, "WARNING",
+                         f"⚠ Update done but VM state is '{state}'")
+            execution.status = "completed"
 
         finally:
             ssh.disconnect()
@@ -433,8 +538,8 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image):
     finally:
         db.close()
 
-# ── Background: batch VM update ───────────────────────────────────────────────
-def _run_vs_batch_update(execution_id, dut, vs_entries, source_image):
+# ── Background: batch VM update (6-step per VM) ───────────────────────────────
+def _run_vs_batch_update(execution_id, dut, vs_entries, source_image, source_server_id=None):
     db = SessionLocal()
     execution = None
     try:
@@ -443,21 +548,37 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image):
         execution.start_time = datetime.utcnow()
         db.commit()
 
+        source_server = None
+        if source_server_id:
+            source_server = db.query(DUT).filter(DUT.id == source_server_id).first()
+
         total = len(vs_entries)
-        log_exec(db, execution_id, "SYSTEM", "INFO",
-                 f"═══ Batch VS update: {total} VM(s) ═══")
+        log_exec(db, execution_id, "SYSTEM", "INFO", f"═══ Batch VS update: {total} VM(s) ═══")
 
         ssh = SSHManager(dut.ip_address, dut.port, dut.username, dut.password)
         if not ssh.connect():
             log_exec(db, execution_id, dut.name, "ERROR", "SSH connection FAILED")
-            execution.status = "failed"
-            execution.end_time = datetime.utcnow()
-            db.commit()
-            return
+            execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
         def sudocmd(cmd):
             safe = dut.password.replace("'", "'\\''")
             return f"echo '{safe}' | sudo -S {cmd}"
+
+        def run_step(step_name, command, allow_fail=False, timeout=120):
+            log_exec(db, execution_id, dut.name, "INFO", f"▶ {step_name}")
+            output, error, exit_code = ssh.execute_command(command, timeout=timeout)
+            if output.strip():
+                for line in output.strip().split("\n")[:20]:
+                    log_exec(db, execution_id, dut.name, "INFO", f"    {line}")
+            if exit_code != 0:
+                msg = error.strip() or f"Exit code {exit_code}"
+                if allow_fail:
+                    log_exec(db, execution_id, dut.name, "WARNING", f"  ⚠ {step_name} (allowed): {msg}")
+                    return True
+                log_exec(db, execution_id, dut.name, "ERROR", f"  ✗ {step_name} FAILED: {msg}")
+                return False
+            log_exec(db, execution_id, dut.name, "INFO", f"  ✓ {step_name} completed successfully")
+            return True
 
         try:
             all_success = True
@@ -466,10 +587,10 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image):
                 if not vs_name:
                     continue
 
-                log_exec(db, execution_id, dut.name, "INFO",
-                         f"══ VM {idx}/{total}: {vs_name} ══")
+                log_exec(db, execution_id, dut.name, "INFO", "")
+                log_exec(db, execution_id, dut.name, "INFO", f"══ VM {idx}/{total}: {vs_name} ══")
+                log_exec(db, execution_id, dut.name, "INFO", f"  Source image: {source_image}")
 
-                # Resolve image path from XML
                 xml_path = dut.xml_path or "/home/hp/prajwal/VMs"
                 xml_full_path = f"{xml_path}/{vs_name}.xml"
                 log_exec(db, execution_id, dut.name, "INFO",
@@ -488,52 +609,58 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image):
                     log_exec(db, execution_id, dut.name, "ERROR",
                              f"  ✗ Could not resolve image path: "
                              f"{xml_err.strip() or 'No <disk device=disk> source found'}")
-                    all_success = False
-                    continue
+                    all_success = False; continue
+                log_exec(db, execution_id, dut.name, "INFO", f"  Target path (from XML): {dest_image_path}")
                 log_exec(db, execution_id, dut.name, "INFO",
-                         f"  Resolved image path: {dest_image_path}")
+                         f"  Will copy: {source_image} → {dest_image_path}")
 
-                steps = [
-                    ("Step 1/4: Destroying VM",      f"virsh destroy {vs_name}",                            True),
-                    ("Step 2/4: Removing old image",  sudocmd(f"rm -f {dest_image_path}"),                  False),
-                    ("Step 3/4: Copying new image",   sudocmd(f"cp {source_image} {dest_image_path}"),      False),
-                    ("Step 4/4: Starting VM",         f"virsh start {vs_name}",                             False),
-                ]
                 vm_ok = True
-                for step_name, command, allow_fail in steps:
-                    log_exec(db, execution_id, dut.name, "INFO", f"▶ {step_name}")
-                    try:
-                        output, error, exit_code = ssh.execute_command(command, timeout=600)
-                        if output.strip():
-                            for line in output.strip().split("\n")[:20]:
-                                log_exec(db, execution_id, dut.name, "INFO", f"    {line}")
-                        if exit_code != 0:
-                            msg = error.strip() or f"Exit code {exit_code}"
-                            if allow_fail:
-                                log_exec(db, execution_id, dut.name, "WARNING",
-                                         f"  ⚠ {step_name}: {msg}")
-                            else:
-                                log_exec(db, execution_id, dut.name, "ERROR",
-                                         f"  ✗ {step_name} FAILED: {msg}")
-                                vm_ok = False
-                                break
+                vm_ok = vm_ok and run_step("Step 1/6: Destroying VM",
+                                           sudocmd(f"virsh destroy {vs_name}"), allow_fail=True)
+                vm_ok = vm_ok and run_step("Step 2/6: Removing old image",
+                                           sudocmd(f"rm -f {dest_image_path}"))
+
+                if vm_ok:
+                    if source_server:
+                        log_exec(db, execution_id, dut.name, "INFO",
+                                 "▶ Step 3/6: Copying image from remote server (SCP)")
+                        dest_temp = f"/tmp/{os.path.basename(dest_image_path)}"
+                        safe_pass = source_server.password.replace("'", "'\\''")
+                        port_flag = f"-P {source_server.port}" if source_server.port != 22 else ""
+                        scp_cmd = (f"sshpass -p '{safe_pass}' scp {port_flag} -o StrictHostKeyChecking=no "
+                                   f"{source_server.username}@{source_server.ip_address}:{source_image} {dest_temp}")
+                        _, err, rc = ssh.execute_command(scp_cmd, timeout=300)
+                        if rc != 0:
+                            log_exec(db, execution_id, dut.name, "ERROR",
+                                     f"  ✗ Step 3/6 FAILED: {err.strip() or 'Exit ' + str(rc)}")
+                            vm_ok = False
                         else:
-                            log_exec(db, execution_id, dut.name, "INFO",
-                                     f"  ✓ {step_name} completed")
-                    except Exception as e:
-                        log_exec(db, execution_id, dut.name, "ERROR", f"  ✗ error: {e}")
-                        vm_ok = False
-                        break
+                            vm_ok = run_step("Step 3/6: Moving to destination",
+                                             sudocmd(f"mv {dest_temp} {dest_image_path}"))
+                    else:
+                        vm_ok = run_step("Step 3/6: Copying image (local)",
+                                         sudocmd(f"cp {source_image} {dest_image_path}"), timeout=300)
 
-                if not vm_ok:
-                    all_success = False
-                    log_exec(db, execution_id, dut.name, "ERROR", f"✗ Failed for '{vs_name}'")
+                if vm_ok:
+                    run_step("Step 4/6: Undefining VM",
+                             sudocmd(f"virsh undefine {vs_name}"), allow_fail=True)
+                    vm_ok = run_step("Step 5/6: Defining VM from XML",
+                                     sudocmd(f"virsh define {xml_full_path}"))
+                if vm_ok:
+                    vm_ok = run_step("Step 6/6: Starting VM",
+                                     sudocmd(f"virsh start {vs_name}"))
+
+                if vm_ok:
+                    out, _, _ = ssh.execute_command(sudocmd(f"virsh domstate {vs_name}"), timeout=10)
+                    log_exec(db, execution_id, dut.name, "INFO",
+                             f"✓ '{vs_name}' updated — state: {out.strip()}")
                 else:
-                    log_exec(db, execution_id, dut.name, "INFO", f"✓ '{vs_name}' updated")
+                    log_exec(db, execution_id, dut.name, "ERROR", f"✗ Failed for '{vs_name}'")
+                    all_success = False
 
-            summary = "All VMs updated successfully" if all_success else "Some VMs failed"
+            log_exec(db, execution_id, "SYSTEM", "INFO", "")
             log_exec(db, execution_id, "SYSTEM", "INFO" if all_success else "WARNING",
-                     f"═══ Batch complete: {summary} ═══")
+                     f"═══ Batch complete: {'All VMs updated successfully' if all_success else 'Some VMs failed'} ═══")
             execution.status = "completed"
         finally:
             ssh.disconnect()
@@ -552,6 +679,329 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image):
             db.commit()
     finally:
         db.close()
+
+# ── GET /api/vs/{dut_id}/vs-names ────────────────────────────────────────────
+@app.get("/api/vs/{dut_id}/vs-names")
+def list_vs_names(dut_id: int, db: Session = Depends(get_db)):
+    """List available VS XML files on the host device."""
+    dut = db.query(DUT).filter(DUT.id == dut_id).first()
+    if not dut:
+        raise HTTPException(status_code=404, detail="DUT not found")
+    xml_path = dut.xml_path or "/home/hp/prajwal/VMs"
+    ssh = SSHManager(dut.ip_address, dut.port, dut.username, dut.password)
+    if not ssh.connect():
+        raise HTTPException(status_code=503, detail="SSH connection failed")
+    try:
+        out, _, _ = ssh.execute_command(f"ls {xml_path}/*.xml 2>/dev/null")
+        names = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line.endswith(".xml"):
+                names.append(line.split("/")[-1][:-4])  # strip path + .xml
+        return {"vs_names": sorted(names)}
+    finally:
+        ssh.disconnect()
+
+
+# ── GET /api/vs/{dut_id}/xml-info ────────────────────────────────────────────
+@app.get("/api/vs/{dut_id}/xml-info")
+def get_xml_info(dut_id: int, vs_name: str, db: Session = Depends(get_db)):
+    """Read the image path from a VS XML file on the host."""
+    dut = db.query(DUT).filter(DUT.id == dut_id).first()
+    if not dut:
+        raise HTTPException(status_code=404, detail="DUT not found")
+    xml_path = dut.xml_path or "/home/hp/prajwal/VMs"
+    xml_full_path = f"{xml_path}/{vs_name}.xml"
+    ssh = SSHManager(dut.ip_address, dut.port, dut.username, dut.password)
+    if not ssh.connect():
+        raise HTTPException(status_code=503, detail="SSH connection failed")
+    try:
+        cmd = (f"python3 -c \""
+               f"import xml.etree.ElementTree as ET; "
+               f"t=ET.parse('{xml_full_path}'); "
+               f"src=t.find('.//disk[@device=\\'disk\\']/source'); "
+               f"print(src.get('file','') if src is not None else '')\"")
+        out, _, _ = ssh.execute_command(cmd)
+        return {"xml_path": xml_full_path, "image_path": out.strip()}
+    finally:
+        ssh.disconnect()
+
+
+# ── POST /api/vs/{dut_id}/spin ────────────────────────────────────────────────
+@app.post("/api/vs/{dut_id}/spin")
+def spin_vs(dut_id: int, body: dict, db: Session = Depends(get_db)):
+    """Spin a new VS: clone a source VS XML with a new name, define and start."""
+    vs_name      = body.get("vs_name", "").strip()       # new VS name (PROJ_USER_NUM)
+    source_vs    = body.get("source_vs", "").strip()     # existing VS XML to clone from
+
+    if not vs_name:
+        raise HTTPException(status_code=400, detail="vs_name is required")
+    if not source_vs:
+        raise HTTPException(status_code=400, detail="source_vs is required")
+
+    dut = db.query(DUT).filter(DUT.id == dut_id).first()
+    if not dut:
+        raise HTTPException(status_code=404, detail="DUT not found")
+
+    xml_path     = dut.xml_path or "/home/hp/prajwal/VMs"
+    src_xml      = f"{xml_path}/{source_vs}.xml"
+    new_xml      = f"{xml_path}/{vs_name}.xml"
+
+    execution = Execution(
+        name=f"vs_spin_{vs_name}_{int(datetime.utcnow().timestamp())}",
+        execution_type="image", dut_ids=json.dumps([dut_id]), status="pending")
+    db.add(execution)
+    db.commit()
+    db.refresh(execution)
+
+    thread = Thread(target=_run_vs_spin,
+                    args=(execution.id, dut_id, vs_name, src_xml, new_xml),
+                    daemon=True)
+    thread.start()
+
+    return {"execution_id": execution.id, "status": "started", "vs_name": vs_name,
+            "message": f"VS spin started for '{vs_name}' on {dut.name}"}
+
+
+# ── DELETE /api/vs/{dut_id}/remove/{vs_name} ─────────────────────────────────
+@app.delete("/api/vs/{dut_id}/remove/{vs_name}")
+def remove_vs(dut_id: int, vs_name: str, db: Session = Depends(get_db)):
+    """Remove a VS: destroy, undefine, delete XML and image."""
+    dut = db.query(DUT).filter(DUT.id == dut_id).first()
+    if not dut:
+        raise HTTPException(status_code=404, detail="DUT not found")
+
+    xml_path = dut.xml_path or "/home/hp/prajwal/VMs"
+    xml_full_path = f"{xml_path}/{vs_name}.xml"
+
+    execution = Execution(
+        name=f"vs_remove_{vs_name}_{int(datetime.utcnow().timestamp())}",
+        execution_type="image", dut_ids=json.dumps([dut_id]), status="pending")
+    db.add(execution)
+    db.commit()
+    db.refresh(execution)
+
+    thread = Thread(target=_run_vs_remove,
+                    args=(execution.id, dut_id, vs_name, xml_full_path),
+                    daemon=True)
+    thread.start()
+
+    return {"execution_id": execution.id, "status": "started", "vs_name": vs_name,
+            "message": f"VS removal started for '{vs_name}' on {dut.name}"}
+
+
+# ── Background: spin new VS (4-step) ─────────────────────────────────────────
+def _run_vs_spin(execution_id, dut_id, vs_name, src_xml, new_xml):
+    """Clone an existing VS XML under a new name, define and start it."""
+    db = SessionLocal()
+    execution = None
+    try:
+        execution = db.query(Execution).filter(Execution.id == execution_id).first()
+        execution.status = "running"
+        execution.start_time = datetime.utcnow()
+        db.commit()
+
+        dut = db.query(DUT).filter(DUT.id == dut_id).first()
+        if not dut:
+            log_exec(db, execution_id, "SYSTEM", "ERROR", "DUT not found")
+            execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+        log_exec(db, execution_id, dut.name, "INFO", f"Starting VS spin: '{vs_name}'")
+        log_exec(db, execution_id, dut.name, "INFO", f"  Source XML : {src_xml}")
+        log_exec(db, execution_id, dut.name, "INFO", f"  New XML    : {new_xml}")
+
+        ssh = SSHManager(dut.ip_address, dut.port, dut.username, dut.password)
+        if not ssh.connect():
+            log_exec(db, execution_id, dut.name, "ERROR",
+                     f"SSH connection FAILED to {dut.ip_address}:{dut.port}")
+            execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+        def sudocmd(cmd):
+            safe = dut.password.replace("'", "'\\''")
+            return f"echo '{safe}' | sudo -S {cmd}"
+
+        def run_step(step_name, command, allow_fail=False, timeout=300):
+            log_exec(db, execution_id, dut.name, "INFO", f"▶ {step_name}")
+            output, error, exit_code = ssh.execute_command(command, timeout=timeout)
+            if output.strip():
+                for line in output.strip().split("\n")[:20]:
+                    log_exec(db, execution_id, dut.name, "INFO", f"    {line}")
+            if exit_code != 0:
+                msg = error.strip() or f"Exit code {exit_code}"
+                if allow_fail:
+                    log_exec(db, execution_id, dut.name, "WARNING", f"  ⚠ {step_name}: {msg}")
+                    return True
+                log_exec(db, execution_id, dut.name, "ERROR", f"  ✗ {step_name} FAILED: {msg}")
+                return False
+            log_exec(db, execution_id, dut.name, "INFO", f"  ✓ {step_name} completed successfully")
+            return True
+
+        try:
+            # Step 1/3 — Validate source XML exists
+            if not run_step("Step 1/3: Validate source XML",
+                            sudocmd(f"test -f {src_xml}"), timeout=15):
+                log_exec(db, execution_id, dut.name, "ERROR", f"  XML not found: {src_xml}")
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+            # Step 2/3 — Copy XML and rename <name> element to new VS name
+            clone_cmd = (
+                f"python3 -c \""
+                f"import xml.etree.ElementTree as ET; "
+                f"ET.register_namespace('', ''); "
+                f"t=ET.parse('{src_xml}'); r=t.getroot(); "
+                f"n=r.find('name'); n.text='{vs_name}' if n is not None else None; "
+                f"t.write('{new_xml}', xml_declaration=True, encoding='utf-8')\""
+            )
+            if not run_step("Step 2/3: Clone XML with new name", sudocmd(clone_cmd)):
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+            # Step 3/3 — Define and start
+            if not run_step("Step 3/3: Define VS from XML", sudocmd(f"virsh define {new_xml}")):
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+            if not run_step("Step 3/3: Start VS", sudocmd(f"virsh start {vs_name}")):
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+            out, _, _ = ssh.execute_command(sudocmd(f"virsh domstate {vs_name}"), timeout=10)
+            log_exec(db, execution_id, dut.name, "INFO",
+                     f"✓ VS '{vs_name}' is running — state: {out.strip()}")
+            execution.status = "completed"
+
+        finally:
+            ssh.disconnect()
+
+        execution.end_time = datetime.utcnow()
+        if execution.start_time:
+            execution.duration_seconds = int(
+                (execution.end_time - execution.start_time).total_seconds())
+        db.commit()
+
+    except Exception as e:
+        logger.error(f"VS spin failed: {e}")
+        if execution:
+            execution.status = "failed"
+            execution.end_time = datetime.utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+
+# ── Background: remove VS (3-step) ───────────────────────────────────────────
+def _run_vs_remove(execution_id, dut_id, vs_name, xml_full_path):
+    db = SessionLocal()
+    execution = None
+    try:
+        execution = db.query(Execution).filter(Execution.id == execution_id).first()
+        execution.status = "running"
+        execution.start_time = datetime.utcnow()
+        db.commit()
+
+        dut = db.query(DUT).filter(DUT.id == dut_id).first()
+        if not dut:
+            log_exec(db, execution_id, "SYSTEM", "ERROR", "DUT not found")
+            execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+        log_exec(db, execution_id, dut.name, "INFO", f"Starting VS removal for '{vs_name}'")
+        log_exec(db, execution_id, dut.name, "INFO", f"  XML: {xml_full_path}")
+
+        ssh = SSHManager(dut.ip_address, dut.port, dut.username, dut.password)
+        if not ssh.connect():
+            log_exec(db, execution_id, dut.name, "ERROR",
+                     f"SSH connection FAILED to {dut.ip_address}:{dut.port}")
+            execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+        def sudocmd(cmd):
+            safe = dut.password.replace("'", "'\\''")
+            return f"echo '{safe}' | sudo -S {cmd}"
+
+        def run_step(step_name, command, allow_fail=False, timeout=60):
+            log_exec(db, execution_id, dut.name, "INFO", f"▶ {step_name}")
+            log_exec(db, execution_id, dut.name, "INFO", f"  $ {command}")
+            output, error, exit_code = ssh.execute_command(command, timeout=timeout)
+            if output.strip():
+                for line in output.strip().split("\n")[:20]:
+                    log_exec(db, execution_id, dut.name, "INFO", f"    {line}")
+            if exit_code != 0:
+                msg = error.strip() or f"Exit code {exit_code}"
+                if allow_fail:
+                    log_exec(db, execution_id, dut.name, "WARNING",
+                             f"  ⚠ {step_name} (allowed): {msg}")
+                    return True
+                log_exec(db, execution_id, dut.name, "ERROR", f"  ✗ {step_name} FAILED: {msg}")
+                return False
+            log_exec(db, execution_id, dut.name, "INFO", f"  ✓ {step_name} completed successfully")
+            return True
+
+        try:
+            # Read image path from XML before destroying
+            log_exec(db, execution_id, dut.name, "INFO",
+                     f"▶ Resolving image path from XML before removal")
+            extract_cmd = sudocmd(
+                f"python3 -c \""
+                f"import xml.etree.ElementTree as ET; "
+                f"root = ET.parse('{xml_full_path}').getroot(); "
+                f"matches = [d.find('source').get('file') for d in root.iter('disk') "
+                f"if d.get('device')=='disk' and d.find('source') is not None]; "
+                f"print(matches[0] if matches else '')\""
+            )
+            xml_out, _, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+            image_path = xml_out.strip()
+            if image_path:
+                log_exec(db, execution_id, dut.name, "INFO",
+                         f"  Image path resolved: {image_path}")
+            else:
+                log_exec(db, execution_id, dut.name, "WARNING",
+                         f"  Could not resolve image path — image file will not be deleted")
+
+            # Step 1/3 — Destroy VS (allow_fail: OK if already stopped)
+            run_step("Step 1/3: Destroy VS (stop if running)",
+                     sudocmd(f"virsh destroy {vs_name}"), allow_fail=True)
+            # Still part of step 1 — undefine removes it from libvirt registry
+            log_exec(db, execution_id, dut.name, "INFO",
+                     f"  $ {sudocmd(f'virsh undefine {vs_name}')}")
+            out_ud, err_ud, rc_ud = ssh.execute_command(
+                sudocmd(f"virsh undefine {vs_name}"), timeout=30)
+            if rc_ud != 0:
+                log_exec(db, execution_id, dut.name, "ERROR",
+                         f"  ✗ Step 1/3: Undefine VS FAILED: {err_ud.strip() or 'Exit ' + str(rc_ud)}")
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+            log_exec(db, execution_id, dut.name, "INFO",
+                     f"  ✓ Step 1/3: Destroy + Undefine VS completed successfully")
+
+            # Step 2/3 — Remove XML file
+            if not run_step("Step 2/3: Remove XML file", sudocmd(f"rm -f {xml_full_path}")):
+                execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+
+            # Step 3/3 — Remove image file (only if resolved)
+            if image_path:
+                if not run_step("Step 3/3: Remove image file",
+                                sudocmd(f"rm -f {image_path}")):
+                    execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
+            else:
+                log_exec(db, execution_id, dut.name, "WARNING",
+                         "Step 3/3: Skipped — image path not resolved from XML")
+
+            log_exec(db, execution_id, dut.name, "INFO",
+                     f"✓ VS '{vs_name}' removed successfully")
+            execution.status = "completed"
+
+        finally:
+            ssh.disconnect()
+
+        execution.end_time = datetime.utcnow()
+        if execution.start_time:
+            execution.duration_seconds = int(
+                (execution.end_time - execution.start_time).total_seconds())
+        db.commit()
+
+    except Exception as e:
+        logger.error(f"VS remove failed: {e}")
+        if execution:
+            execution.status = "failed"
+            execution.end_time = datetime.utcnow()
+            db.commit()
+    finally:
+        db.close()
+
 
 # ── WebSocket: VS Update Log Streaming ────────────────────────────────────────
 @app.websocket("/ws/vs/execution/{execution_id}")
