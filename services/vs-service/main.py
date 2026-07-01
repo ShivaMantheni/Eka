@@ -237,10 +237,12 @@ def list_vms(dut_id: int, db: Session = Depends(get_db)):
     try:
         # Try without sudo first; fall back to sudo if it fails
         output, error, exit_code = ssh.execute_command("virsh list --all", timeout=30)
+        logger.info(f"[virsh-list] no-sudo exit={exit_code} stdout={repr(output[:200])} stderr={repr(error[:200])}")
         if exit_code != 0:
             safe_pass = dut.password.replace("'", "'\\''") if dut.password else ""
             cmd = f"echo '{safe_pass}' | sudo -S virsh list --all" if dut.password else "sudo virsh list --all"
             output, error, exit_code = ssh.execute_command(cmd, timeout=30)
+            logger.info(f"[virsh-list] sudo exit={exit_code} stdout={repr(output[:200])} stderr={repr(error[:200])}")
         if exit_code != 0:
             raise HTTPException(status_code=500, detail=f"virsh list failed: {error.strip()}")
 
@@ -259,6 +261,7 @@ def list_vms(dut_id: int, db: Session = Depends(get_db)):
                 "name":  parts[1],
                 "state": " ".join(parts[2:]) if len(parts) > 2 else "shut off",
             })
+        logger.info(f"[virsh-list] parsed {len(vms)} VMs from output")
         return {"dut_id": dut_id, "dut_name": dut.name, "vms": vms}
     except HTTPException:
         raise
