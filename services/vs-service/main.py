@@ -235,16 +235,18 @@ def list_vms(dut_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail=f"Cannot connect to {dut.name}")
 
     try:
-        # Try without sudo first; fall back to sudo if it fails
-        output, error, exit_code = ssh.execute_command("virsh list --all", timeout=30)
-        logger.info(f"[virsh-list] no-sudo exit={exit_code} stdout={repr(output[:200])} stderr={repr(error[:200])}")
+        # Use qemu:///system to see all VMs (not just the SSH user's session VMs).
+        # Try without sudo first; fall back to sudo if connection/permission is denied.
+        output, error, exit_code = ssh.execute_command("virsh -c qemu:///system list --all", timeout=30)
+        logger.info(f"[virsh-list] no-sudo exit={exit_code} stdout={repr(output[:300])} stderr={repr(error[:200])}")
         if exit_code != 0:
             safe_pass = dut.password.replace("'", "'\\''") if dut.password else ""
-            cmd = f"echo '{safe_pass}' | sudo -S virsh list --all" if dut.password else "sudo virsh list --all"
+            cmd = (f"echo '{safe_pass}' | sudo -S virsh -c qemu:///system list --all"
+                   if dut.password else "sudo virsh -c qemu:///system list --all")
             output, error, exit_code = ssh.execute_command(cmd, timeout=30)
-            logger.info(f"[virsh-list] sudo exit={exit_code} stdout={repr(output[:200])} stderr={repr(error[:200])}")
+            logger.info(f"[virsh-list] sudo exit={exit_code} stdout={repr(output[:300])} stderr={repr(error[:200])}")
         if exit_code != 0:
-            raise HTTPException(status_code=500, detail=f"virsh list failed: {error.strip()}")
+            raise HTTPException(status_code=500, detail=f"virsh -c qemu:///system list failed: {error.strip()}")
 
         # Identify VM rows by whether the first column is a numeric id or '-'.
         # This skips the header, separator, and any warning/error lines automatically.
@@ -316,9 +318,9 @@ def vs_action(dut_id: int, body: dict, db: Session = Depends(get_db)):
     try:
         if dut.password:
             safe_pass = dut.password.replace("'", "'\\''")
-            command = f"echo '{safe_pass}' | sudo -S virsh {action} {vs_name}"
+            command = f"echo '{safe_pass}' | sudo -S virsh -c qemu:///system {action} {vs_name}"
         else:
-            command = f"sudo virsh {action} {vs_name}"
+            command = f"sudo virsh -c qemu:///system {action} {vs_name}"
 
         output, error, exit_code = ssh.execute_command(command, timeout=30)
         if exit_code != 0:
@@ -477,7 +479,7 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image,
                      f"  Will copy: {source_image} → {target_image_path}")
 
             # Step 1/6 — Destroy VM
-            if not run_step("Step 1/6: Destroying VM", sudocmd(f"virsh destroy {vs_name}"), allow_fail=True):
+            if not run_step("Step 1/6: Destroying VM", sudocmd(f"virsh -c qemu:///system destroy {vs_name}"), allow_fail=True):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Step 2/6 — Remove old image (path comes from XML)
@@ -512,18 +514,18 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image,
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Step 4/6 — Undefine VM
-            run_step("Step 4/6: Undefining VM", sudocmd(f"virsh undefine {vs_name}"), allow_fail=True)
+            run_step("Step 4/6: Undefining VM", sudocmd(f"virsh -c qemu:///system undefine {vs_name}"), allow_fail=True)
 
             # Step 5/6 — Define VM from XML
-            if not run_step("Step 5/6: Defining VM from XML", sudocmd(f"virsh define {xml_full_path}")):
+            if not run_step("Step 5/6: Defining VM from XML", sudocmd(f"virsh -c qemu:///system define {xml_full_path}")):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Step 6/6 — Start VM
-            if not run_step("Step 6/6: Starting VM", sudocmd(f"virsh start {vs_name}")):
+            if not run_step("Step 6/6: Starting VM", sudocmd(f"virsh -c qemu:///system start {vs_name}")):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Verify
-            out, _, _ = ssh.execute_command(sudocmd(f"virsh domstate {vs_name}"), timeout=10)
+            out, _, _ = ssh.execute_command(sudocmd(f"virsh -c qemu:///system domstate {vs_name}"), timeout=10)
             state = out.strip()
             log_exec(db, execution_id, dut.name, "INFO", f"  VM '{vs_name}' state: {state}")
             if "running" in state.lower():
@@ -630,7 +632,7 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image, source_ser
 
                 vm_ok = True
                 vm_ok = vm_ok and run_step("Step 1/6: Destroying VM",
-                                           sudocmd(f"virsh destroy {vs_name}"), allow_fail=True)
+                                           sudocmd(f"virsh -c qemu:///system destroy {vs_name}"), allow_fail=True)
                 vm_ok = vm_ok and run_step("Step 2/6: Removing old image",
                                            sudocmd(f"rm -f {dest_image_path}"))
 
@@ -657,15 +659,15 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image, source_ser
 
                 if vm_ok:
                     run_step("Step 4/6: Undefining VM",
-                             sudocmd(f"virsh undefine {vs_name}"), allow_fail=True)
+                             sudocmd(f"virsh -c qemu:///system undefine {vs_name}"), allow_fail=True)
                     vm_ok = run_step("Step 5/6: Defining VM from XML",
-                                     sudocmd(f"virsh define {xml_full_path}"))
+                                     sudocmd(f"virsh -c qemu:///system define {xml_full_path}"))
                 if vm_ok:
                     vm_ok = run_step("Step 6/6: Starting VM",
-                                     sudocmd(f"virsh start {vs_name}"))
+                                     sudocmd(f"virsh -c qemu:///system start {vs_name}"))
 
                 if vm_ok:
-                    out, _, _ = ssh.execute_command(sudocmd(f"virsh domstate {vs_name}"), timeout=10)
+                    out, _, _ = ssh.execute_command(sudocmd(f"virsh -c qemu:///system domstate {vs_name}"), timeout=10)
                     log_exec(db, execution_id, dut.name, "INFO",
                              f"✓ '{vs_name}' updated — state: {out.strip()}")
                 else:
@@ -870,12 +872,12 @@ def _run_vs_spin(execution_id, dut_id, vs_name, src_xml, new_xml):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Step 3/3 — Define and start
-            if not run_step("Step 3/3: Define VS from XML", sudocmd(f"virsh define {new_xml}")):
+            if not run_step("Step 3/3: Define VS from XML", sudocmd(f"virsh -c qemu:///system define {new_xml}")):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
-            if not run_step("Step 3/3: Start VS", sudocmd(f"virsh start {vs_name}")):
+            if not run_step("Step 3/3: Start VS", sudocmd(f"virsh -c qemu:///system start {vs_name}")):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
-            out, _, _ = ssh.execute_command(sudocmd(f"virsh domstate {vs_name}"), timeout=10)
+            out, _, _ = ssh.execute_command(sudocmd(f"virsh -c qemu:///system domstate {vs_name}"), timeout=10)
             log_exec(db, execution_id, dut.name, "INFO",
                      f"✓ VS '{vs_name}' is running — state: {out.strip()}")
             execution.status = "completed"
@@ -968,12 +970,12 @@ def _run_vs_remove(execution_id, dut_id, vs_name, xml_full_path):
 
             # Step 1/3 — Destroy VS (allow_fail: OK if already stopped)
             run_step("Step 1/3: Destroy VS (stop if running)",
-                     sudocmd(f"virsh destroy {vs_name}"), allow_fail=True)
+                     sudocmd(f"virsh -c qemu:///system destroy {vs_name}"), allow_fail=True)
             # Still part of step 1 — undefine removes it from libvirt registry
             log_exec(db, execution_id, dut.name, "INFO",
                      f"  $ {sudocmd(f'virsh undefine {vs_name}')}")
             out_ud, err_ud, rc_ud = ssh.execute_command(
-                sudocmd(f"virsh undefine {vs_name}"), timeout=30)
+                sudocmd(f"virsh -c qemu:///system undefine {vs_name}"), timeout=30)
             if rc_ud != 0:
                 log_exec(db, execution_id, dut.name, "ERROR",
                          f"  ✗ Step 1/3: Undefine VS FAILED: {err_ud.strip() or 'Exit ' + str(rc_ud)}")
