@@ -6389,11 +6389,13 @@ function escapeHTML(str) {
 async function waitForVSCompletion(execId, label, logEl) {
     return new Promise((resolve, reject) => {
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${proto}//${location.host}/ws/execution/${execId}`);
+        // VS service streams on /ws/vs/execution/{id} (routed to eka-vs by nginx)
+        const ws = new WebSocket(`${proto}//${location.host}/ws/vs/execution/${execId}`);
+        let settled = false;
         const timeout = setTimeout(() => {
             console.error(`[waitForVSCompletion] Timeout after 10 minutes for exec ${execId}`);
             ws.close();
-            reject(new Error('Update timed out after 10 minutes'));
+            if (!settled) { settled = true; reject(new Error('Update timed out after 10 minutes')); }
         }, 600000); // 10 minute timeout
 
         ws.onopen = () => {
@@ -6409,10 +6411,13 @@ async function waitForVSCompletion(execId, label, logEl) {
                 ws.close();
                 toast(`${label}: ${data.status} (${data.duration || 0}s)`, data.status === 'completed' ? 'success' : 'error');
 
-                if (data.status === 'completed') {
-                    resolve();
-                } else {
-                    reject(new Error(`Update failed with status: ${data.status}`));
+                if (!settled) {
+                    settled = true;
+                    if (data.status === 'completed') {
+                        resolve();
+                    } else {
+                        reject(new Error(`Update failed with status: ${data.status}`));
+                    }
                 }
                 return;
             }
@@ -6432,22 +6437,21 @@ async function waitForVSCompletion(execId, label, logEl) {
 
         ws.onclose = () => {
             console.log(`[waitForVSCompletion] WebSocket closed for exec ${execId}`);
-            // If closed without resolving, fall back to polling
-            if (timeout) {
+            // Only fall back to polling if we haven't settled yet (WS failed before execution_complete)
+            if (!settled) {
                 console.log(`[waitForVSCompletion] Falling back to polling for exec ${execId}`);
-                pollForCompletion(execId, label, timeout, resolve, reject);
+                pollForCompletion(execId, label, timeout, resolve, reject, () => { settled = true; });
             }
         };
     });
 }
 
 // Fallback polling if WebSocket fails
-async function pollForCompletion(execId, label, timeout, resolve, reject) {
+async function pollForCompletion(execId, label, timeout, resolve, reject, markSettled) {
+    // Poll the VS service executions endpoint (same DB, so exec ID is valid)
     const pollInterval = setInterval(async () => {
         try {
-            const res = await fetch(`${API}/api/executions/${execId}`, {
-                headers: getSessionHeaders()
-            });
+            const res = await fetch(`${API}/api/vs/executions/${execId}`);
             if (res.ok) {
                 const exec = await res.json();
                 console.log(`[pollForCompletion] Exec ${execId} status: ${exec.status}`);
@@ -6456,11 +6460,13 @@ async function pollForCompletion(execId, label, timeout, resolve, reject) {
                     clearInterval(pollInterval);
                     clearTimeout(timeout);
                     console.log(`[pollForCompletion] ✓ Exec ${execId} completed`);
+                    if (markSettled) markSettled();
                     resolve();
                 } else if (exec.status === 'failed') {
                     clearInterval(pollInterval);
                     clearTimeout(timeout);
                     console.log(`[pollForCompletion] ✗ Exec ${execId} failed`);
+                    if (markSettled) markSettled();
                     reject(new Error('Update failed'));
                 }
             }

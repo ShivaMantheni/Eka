@@ -235,9 +235,12 @@ def list_vms(dut_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail=f"Cannot connect to {dut.name}")
 
     try:
-        safe_pass = dut.password.replace("'", "'\\''") if dut.password else ""
-        cmd = f"echo '{safe_pass}' | sudo -S virsh list --all" if dut.password else "sudo virsh list --all"
-        output, error, exit_code = ssh.execute_command(cmd, timeout=30)
+        # Try without sudo first; fall back to sudo if it fails
+        output, error, exit_code = ssh.execute_command("virsh list --all", timeout=30)
+        if exit_code != 0:
+            safe_pass = dut.password.replace("'", "'\\''") if dut.password else ""
+            cmd = f"echo '{safe_pass}' | sudo -S virsh list --all" if dut.password else "sudo virsh list --all"
+            output, error, exit_code = ssh.execute_command(cmd, timeout=30)
         if exit_code != 0:
             raise HTTPException(status_code=500, detail=f"virsh list failed: {error.strip()}")
 
@@ -1001,6 +1004,20 @@ def _run_vs_remove(execution_id, dut_id, vs_name, xml_full_path):
             db.commit()
     finally:
         db.close()
+
+
+# ── GET /api/vs/executions/{id} — polling fallback for update status ──────────
+@app.get("/api/vs/executions/{execution_id}")
+def get_vs_execution(execution_id: int, db: Session = Depends(get_db)):
+    execution = db.query(Execution).filter(Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    return {
+        "id": execution.id,
+        "status": execution.status,
+        "start_time": execution.start_time.isoformat() if execution.start_time else None,
+        "end_time": execution.end_time.isoformat() if execution.end_time else None,
+    }
 
 
 # ── WebSocket: VS Update Log Streaming ────────────────────────────────────────
