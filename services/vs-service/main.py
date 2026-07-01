@@ -244,13 +244,26 @@ def list_vms(dut_id: int, db: Session = Depends(get_db)):
         if exit_code != 0:
             raise HTTPException(status_code=500, detail=f"virsh list failed: {error.strip()}")
 
+        # Parse past the separator line (---...) to skip headers and any warnings
         vms = []
-        for line in output.strip().split("\n")[2:]:
-            parts = line.strip().split()
+        past_header = False
+        for line in output.split("\n"):
+            stripped = line.strip()
+            if not past_header:
+                if stripped.startswith("---"):
+                    past_header = True
+                continue
+            if not stripped:
+                continue
+            parts = stripped.split()
             if len(parts) >= 2:
-                vms.append({"id": parts[0] if parts[0] != "-" else None,
-                             "name": parts[1],
-                             "state": " ".join(parts[2:]) if len(parts) > 2 else "unknown"})
+                vm_id   = parts[0] if parts[0] != "-" else None
+                vm_name = parts[1]
+                state   = " ".join(parts[2:]) if len(parts) > 2 else "shut off"
+                # Skip lines that look like error messages (no numeric or '-' id)
+                if vm_id is not None and not vm_id.isdigit():
+                    continue
+                vms.append({"id": vm_id, "name": vm_name, "state": state})
         return {"dut_id": dut_id, "dut_name": dut.name, "vms": vms}
     except HTTPException:
         raise
