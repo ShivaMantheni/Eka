@@ -4100,6 +4100,28 @@ async def websocket_logs(websocket: WebSocket, execution_id: int):
 # ============================================================================
 
 
+def _vs_sudocmd(password: str, cmd: str) -> str:
+    """Wrap a command with sudo -S, feeding the device password via stdin."""
+    if not password:
+        return f"sudo {cmd}"
+    safe_pass = password.replace("'", "'\\''")   # escape single quotes
+    return f"echo '{safe_pass}' | sudo -S {cmd}"
+
+
+def _vs_exec_sudo_fallback(ssh, password: str, cmd: str, timeout=300):
+    """Run a command trying without sudo first; retry with sudo if it fails.
+
+    Same pattern as the VS list fetch: plain command → on non-zero exit,
+    re-run wrapped with sudo. Returns (output, error, exit_code) of the
+    last attempt.
+    """
+    output, error, exit_code = ssh.execute_command(cmd, timeout=timeout)
+    if exit_code != 0:
+        output, error, exit_code = ssh.execute_command(
+            _vs_sudocmd(password, cmd), timeout=timeout)
+    return output, error, exit_code
+
+
 @app.get("/api/vs/list/{dut_id}")
 def list_vms(dut_id: int, db: Session = Depends(get_db)):
     """List all VMs on a DUT host via 'virsh list --all'."""
@@ -4125,16 +4147,10 @@ def list_vms(dut_id: int, db: Session = Depends(get_db)):
         )
 
     try:
-        # Use password with sudo if available (for devices that require it)
-        # The -S flag makes sudo read password from stdin
-        if dut.password:
-            # Escape single quotes in password
-            safe_pass = dut.password.replace("'", "'\\''")
-            cmd = f"echo '{safe_pass}' | sudo -S virsh list --all"
-        else:
-            cmd = "sudo virsh list --all"
-
-        output, error, exit_code = ssh.execute_command(cmd, timeout=30)
+        # Try without sudo first; fall back to sudo if it fails
+        # (sudo -S reads the device password from stdin when needed)
+        output, error, exit_code = _vs_exec_sudo_fallback(
+            ssh, dut.password, "virsh list --all", timeout=30)
         if exit_code != 0:
             raise HTTPException(status_code=500, detail=f"virsh list failed: {error.strip()}")
 
@@ -4364,12 +4380,6 @@ def _run_vs_batch_update(
         log_execution(db, execution_id, dut.name, "INFO",
                       f"  SSH connected: {ssh_user}@{ssh_host}:{ssh_port}")
 
-        # Helper: prepend sudo -S with password for commands needing root
-        def sudocmd(cmd: str) -> str:
-            # Use echo password | sudo -S so sudo doesn't wait for interactive input
-            safe_pass = ssh_pass.replace("'", "'\\''")   # escape single quotes
-            return f"echo '{safe_pass}' | sudo -S {cmd}"
-
         try:
             all_success = True
             for idx, entry in enumerate(vs_entries, 1):
@@ -4388,7 +4398,7 @@ def _run_vs_batch_update(
                 xml_full_path = f"{xml_path}/{vs_name}.xml"
                 log_execution(db, execution_id, dut.name, "INFO",
                               f"  Resolving image path from XML: {xml_full_path}")
-                extract_cmd = sudocmd(
+                extract_cmd = (
                     f"python3 -c \""
                     f"import xml.etree.ElementTree as ET; "
                     f"root = ET.parse('{xml_full_path}').getroot(); "
@@ -4396,7 +4406,9 @@ def _run_vs_batch_update(
                     f"if d.get('device')=='disk' and d.find('source') is not None]; "
                     f"print(matches[0] if matches else '')\""
                 )
-                xml_out, xml_err, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+                # Try without sudo first; retry with sudo on failure (same as VS list fetch)
+                xml_out, xml_err, xml_rc = _vs_exec_sudo_fallback(
+                    ssh, ssh_pass, extract_cmd, timeout=15)
                 dest_image_path = xml_out.strip()
                 if xml_rc != 0 or not dest_image_path:
                     log_execution(db, execution_id, dut.name, "ERROR",
@@ -4407,20 +4419,22 @@ def _run_vs_batch_update(
                 log_execution(db, execution_id, dut.name, "INFO",
                               f"  Resolved image path: {dest_image_path}")
 
-                # Exact 4-step sequence using correct commands:
-                # 1. virsh destroy <vs_name>           (user has libvirt group — no sudo needed)
-                # 2. sudo rm -f <dest_image_path>
-                # 3. sudo cp <source> <dest_image_path>
+                # Exact 4-step sequence using correct commands.
+                # Each step tries without sudo first, then retries with sudo
+                # on failure (same as VS list fetch):
+                # 1. virsh destroy <vs_name>
+                # 2. rm -f <dest_image_path>
+                # 3. cp <source> <dest_image_path>
                 # 4. virsh start <vs_name>
                 steps = [
                     ("Step 1/4: Destroying VM",
                      f"virsh destroy {vs_name}",
                      True),   # allow_fail: VM may already be stopped
                     ("Step 2/4: Removing old image",
-                     sudocmd(f"rm -f {dest_image_path}"),
+                     f"rm -f {dest_image_path}",
                      False),
                     ("Step 3/4: Copying new image",
-                     sudocmd(f"cp {source_image} {dest_image_path}"),
+                     f"cp {source_image} {dest_image_path}",
                      False),
                     ("Step 4/4: Starting VM",
                      f"virsh start {vs_name}",
@@ -4433,7 +4447,13 @@ def _run_vs_batch_update(
                     log_execution(db, execution_id, dut.name, "INFO", f"  $ {command}")
 
                     try:
+                        # Try without sudo first; retry with sudo on failure
                         output, error, exit_code = ssh.execute_command(command, timeout=300)
+                        if exit_code != 0:
+                            log_execution(db, execution_id, dut.name, "INFO",
+                                          f"  ↻ Failed without sudo — retrying with sudo")
+                            output, error, exit_code = ssh.execute_command(
+                                _vs_sudocmd(ssh_pass, command), timeout=300)
 
                         if output.strip():
                             for line in output.strip().split("\n")[:20]:
@@ -4460,10 +4480,11 @@ def _run_vs_batch_update(
                         break
 
                 if vm_ok:
-                    # Verify VM is running
+                    # Verify VM is running (no-sudo first, sudo fallback)
                     log_execution(db, execution_id, dut.name, "INFO",
                                   "Verifying VM status...")
-                    output, _, _ = ssh.execute_command(f"virsh domstate {vs_name}", timeout=10)
+                    output, _, _ = _vs_exec_sudo_fallback(
+                        ssh, ssh_pass, f"virsh domstate {vs_name}", timeout=10)
                     state = output.strip()
                     log_execution(db, execution_id, dut.name, "INFO",
                                   f"  VM '{vs_name}' status: {state}")
@@ -4579,18 +4600,11 @@ def _run_vs_update(
             db.commit()
             return
 
-        # Helper: prepend sudo -S with password for commands needing root
-        def sudocmd(cmd: str) -> str:
-            """Wrap command with sudo -S using device password from stdin."""
-            # Use echo password | sudo -S so sudo doesn't wait for interactive input
-            safe_pass = dut.password.replace("'", "'\\''")   # escape single quotes
-            return f"echo '{safe_pass}' | sudo -S {cmd}"
-
         try:
             # Resolve target image path from the XML on the remote host
             log_execution(db, execution_id, dut.name, "INFO",
                           f"▶ Resolving image path from XML: {xml_full_path}")
-            extract_cmd = sudocmd(
+            extract_cmd = (
                 f"python3 -c \""
                 f"import xml.etree.ElementTree as ET; "
                 f"root = ET.parse('{xml_full_path}').getroot(); "
@@ -4598,7 +4612,9 @@ def _run_vs_update(
                 f"if d.get('device')=='disk' and d.find('source') is not None]; "
                 f"print(matches[0] if matches else '')\""
             )
-            xml_out, xml_err, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+            # Try without sudo first; retry with sudo on failure (same as VS list fetch)
+            xml_out, xml_err, xml_rc = _vs_exec_sudo_fallback(
+                ssh, dut.password, extract_cmd, timeout=15)
             target_image_path = xml_out.strip()
             if xml_rc != 0 or not target_image_path:
                 log_execution(db, execution_id, dut.name, "ERROR",
@@ -4612,12 +4628,13 @@ def _run_vs_update(
                           f"  ✓ Resolved image path: {target_image_path}")
 
             # Steps 1-2: Destroy VM and remove old image
+            # (each step tries without sudo first, retries with sudo on failure)
             steps_pre_copy = [
                 ("Step 1/6: Destroying VM",
-                 sudocmd(f"virsh destroy {vs_name}"),
+                 f"virsh destroy {vs_name}",
                  True),   # allow_fail=True (VM might already be off)
                 ("Step 2/6: Removing old image",
-                 sudocmd(f"rm -f {target_image_path}"),
+                 f"rm -f {target_image_path}",
                  False),
             ]
 
@@ -4627,7 +4644,13 @@ def _run_vs_update(
                 log_execution(db, execution_id, dut.name, "INFO", f"  $ {command}")
 
                 try:
+                    # Try without sudo first; retry with sudo on failure
                     output, error, exit_code = ssh.execute_command(command, timeout=120)
+                    if exit_code != 0:
+                        log_execution(db, execution_id, dut.name, "INFO",
+                                      f"  ↻ Failed without sudo — retrying with sudo")
+                        output, error, exit_code = ssh.execute_command(
+                            _vs_sudocmd(dut.password, command), timeout=120)
 
                     if output.strip():
                         for line in output.strip().split("\n")[:20]:
@@ -4710,12 +4733,14 @@ def _run_vs_update(
                         log_execution(db, execution_id, dut.name, "INFO",
                                       f"  ✓ Image copied to {dest_temp_path}")
 
-                        # Now move from /tmp to final destination with sudo
+                        # Now move from /tmp to final destination
+                        # (no-sudo first, sudo fallback)
                         log_execution(db, execution_id, dut.name, "INFO",
                                       f"  Moving to final location...")
 
-                        move_cmd = sudocmd(f"mv {dest_temp_path} {target_image_path}")
-                        output, error, exit_code = ssh.execute_command(move_cmd, timeout=60)
+                        move_cmd = f"mv {dest_temp_path} {target_image_path}"
+                        output, error, exit_code = _vs_exec_sudo_fallback(
+                            ssh, dut.password, move_cmd, timeout=60)
 
                         if exit_code != 0:
                             msg = error.strip() if error.strip() else f"Exit code {exit_code}"
@@ -4731,14 +4756,15 @@ def _run_vs_update(
                                   f"  ✗ Step 3/6 error: {str(e)}")
                     all_ok = False
             else:
-                # Local copy
+                # Local copy (no-sudo first, sudo fallback)
                 log_execution(db, execution_id, dut.name, "INFO",
                               "▶ Step 3/6: Copying image (local)")
-                copy_cmd = sudocmd(f"cp {source_image} {target_image_path}")
+                copy_cmd = f"cp {source_image} {target_image_path}"
                 log_execution(db, execution_id, dut.name, "INFO", f"  $ {copy_cmd}")
 
                 try:
-                    output, error, exit_code = ssh.execute_command(copy_cmd, timeout=120)
+                    output, error, exit_code = _vs_exec_sudo_fallback(
+                        ssh, dut.password, copy_cmd, timeout=120)
 
                     if output.strip():
                         for line in output.strip().split("\n")[:20]:
@@ -4765,15 +4791,16 @@ def _run_vs_update(
                 return
 
             # Steps 4-6: Undefine, Define, Start VM
+            # (each step tries without sudo first, retries with sudo on failure)
             steps_post_copy = [
                 ("Step 4/6: Undefining VM",
-                 sudocmd(f"virsh undefine {vs_name}"),
+                 f"virsh undefine {vs_name}",
                  True),   # allow_fail=True (might already be undefined)
                 ("Step 5/6: Defining VM from XML",
-                 sudocmd(f"virsh define {xml_full_path}"),
+                 f"virsh define {xml_full_path}",
                  False),
                 ("Step 6/6: Starting VM",
-                 sudocmd(f"virsh start {vs_name}"),
+                 f"virsh start {vs_name}",
                  False),
             ]
 
@@ -4782,7 +4809,13 @@ def _run_vs_update(
                 log_execution(db, execution_id, dut.name, "INFO", f"  $ {command}")
 
                 try:
+                    # Try without sudo first; retry with sudo on failure
                     output, error, exit_code = ssh.execute_command(command, timeout=120)
+                    if exit_code != 0:
+                        log_execution(db, execution_id, dut.name, "INFO",
+                                      f"  ↻ Failed without sudo — retrying with sudo")
+                        output, error, exit_code = ssh.execute_command(
+                            _vs_sudocmd(dut.password, command), timeout=120)
 
                     if output.strip():
                         for line in output.strip().split("\n")[:20]:
@@ -4809,10 +4842,11 @@ def _run_vs_update(
                     break
 
             if all_ok:
-                # Verify VM is running
+                # Verify VM is running (no-sudo first, sudo fallback)
                 log_execution(db, execution_id, dut.name, "INFO",
                               "Verifying VM status...")
-                output, _, _ = ssh.execute_command(sudocmd(f"virsh domstate {vs_name}"), timeout=10)
+                output, _, _ = _vs_exec_sudo_fallback(
+                    ssh, dut.password, f"virsh domstate {vs_name}", timeout=10)
                 state = output.strip()
                 log_execution(db, execution_id, dut.name, "INFO",
                               f"  VM '{vs_name}' status: {state}")
@@ -4884,14 +4918,10 @@ def vs_action(dut_id: int, body: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail=f"Cannot connect to {dut.name}")
 
     try:
-        # Use password with sudo if available (for devices that require it)
-        if dut.password:
-            safe_pass = dut.password.replace("'", "'\\''")
-            command = f"echo '{safe_pass}' | sudo -S virsh {action} {vs_name}"
-        else:
-            command = f"sudo virsh {action} {vs_name}"
-
-        output, error, exit_code = ssh.execute_command(command, timeout=30)
+        # Try without sudo first; fall back to sudo if it fails (same as VS list fetch)
+        command = f"virsh {action} {vs_name}"
+        output, error, exit_code = _vs_exec_sudo_fallback(
+            ssh, dut.password, command, timeout=30)
 
         if exit_code != 0:
             return {
@@ -5817,18 +5847,33 @@ def _rebuild_results_from_tcrs(tcrs: list) -> list:
 
 
 def _extract_feature(module_path: str) -> str:
+    """Feature = the meaningful directory name, e.g. automation/Vrf/Scripts/test_x.py → VRF.
+    Skips generic container folders (Scripts/tests/automation/...) so the Feature
+    column shows the real feature, not 'SCRIPTS'."""
     if not module_path:
         return "Unknown"
-    parts = module_path.replace("\\", "/").split("/")
-    if len(parts) >= 2:
-        feat = parts[-2].replace("iscli_", "").replace("ISCLI_", "")
-        return feat.upper()
-    return parts[0].upper() if parts else "Unknown"
+    parts = [p for p in module_path.replace("\\", "/").split("/") if p]
+    if parts and parts[-1].lower().endswith(".py"):
+        parts = parts[:-1]  # drop the filename
+    GENERIC = {"scripts", "script", "tests", "test", "testcases", "testcase",
+               "automation", "src", "spytest", ""}
+    for p in reversed(parts):
+        name = p.replace("iscli_", "").replace("ISCLI_", "")
+        if name.lower() not in GENERIC:
+            return name.upper()
+    return (parts[0].upper() if parts else "Unknown")
 
 def _extract_tc_id(test_function: str) -> str:
     if not test_function:
         return ""
     return test_function.split(".")[-1] if "." in test_function else test_function
+
+def _is_hook_tcr(t) -> bool:
+    """True if this TestCaseResult is a SpyTest framework hook (module prolog/epilog,
+    session hook) rather than a real testcase — filtered out of reports."""
+    probe = f"{getattr(t, 'test_function', '') or ''} {getattr(t, 'testcase_id', '') or ''} {getattr(t, 'module', '') or ''}".lower()
+    return any(k in probe for k in ("prolog", "epilog", "module_hook",
+                                     "session_prolog", "session_epilog"))
 
 def _fmt_seconds(secs) -> str:
     secs = secs or 0
@@ -5864,6 +5909,7 @@ def _calc_trend(results: list) -> str:
 
 def _build_html_dashboard(execution, results: list, tcrs: list) -> str:
     from collections import defaultdict
+    tcrs = [t for t in tcrs if not _is_hook_tcr(t)]   # drop framework prolog/epilog hooks
     total_p = sum(r.get("passed", 0) for r in results)
     total_f = sum(r.get("failed", 0) for r in results)
     total_s = sum(r.get("skipped", 0) for r in results)
@@ -5984,7 +6030,8 @@ tr:hover td{background:#f8f9fa}
     <div class="summary-card"><h3>Passed</h3><div class="val passed">{total_p}</div><div class="pct">{pp:.1f}%</div></div>
     <div class="summary-card"><h3>Failed</h3><div class="val failed">{total_f}</div><div class="pct">{fp:.1f}%</div></div>
     <div class="summary-card"><h3>Skipped</h3><div class="val skipped">{total_s}</div><div class="pct">{sp:.1f}%</div></div>
-    <div class="summary-card"><h3>Total Runtime</h3><div class="val runtime">{_fmt_seconds(total_runtime_s)}</div></div>
+    <div class="summary-card"><h3>Duration (elapsed)</h3><div class="val runtime">{_fmt_seconds(execution.duration_seconds or 0)}</div><div class="pct">wall-clock start→end</div></div>
+    <div class="summary-card"><h3>Total Test Time</h3><div class="val runtime">{_fmt_seconds(total_runtime_s)}</div><div class="pct">sum of testcase times</div></div>
   </div>
   <div style="margin-top:16px"><h3 style="font-size:14px;color:#495057;margin-bottom:8px">Overall Progress</h3>
     <div class="progress-bar">{overall_prog}</div></div></div>
@@ -6003,6 +6050,7 @@ window.onload=function(){{var first=document.querySelector('.tab-btn');if(first)
 
 
 def _build_excel(execution, results: list, tcrs: list):
+    tcrs = [t for t in tcrs if not _is_hook_tcr(t)]   # drop framework prolog/epilog hooks
     wb = openpyxl.Workbook()
     HDR_FILL  = PatternFill("solid", fgColor="667EEA")
     HDR_FONT  = Font(bold=True, color="FFFFFF")
@@ -6035,22 +6083,18 @@ def _build_excel(execution, results: list, tcrs: list):
     total_f = sum(r.get("failed", 0) for r in results)
     total_s = sum(r.get("skipped", 0) for r in results)
     total   = total_p + total_f + total_s
-    for label, val in [("Execution ID", execution.id), ("Name", execution.name),
-                       ("Status", execution.status),
-                       ("Duration", f"{execution.duration_seconds}s" if execution.duration_seconds else "–"),
-                       ("Scripts Run", len(results))]:
-        row = [("Execution ID", "Name", "Status", "Duration", "Scripts Run").index(label) + 1
-               if label in ("Execution ID", "Name", "Status", "Duration", "Scripts Run") else 1]
+    total_test_time = sum((t.time_seconds or 0) for t in tcrs)   # sum of testcase run-times
     for row, (label, val) in enumerate([("Execution ID", execution.id), ("Name", execution.name),
                                          ("Status", execution.status),
-                                         ("Duration", f"{execution.duration_seconds}s" if execution.duration_seconds else "–"),
+                                         ("Duration (elapsed)", _fmt_seconds(execution.duration_seconds or 0)),
+                                         ("Total Test Time", _fmt_seconds(total_test_time)),
                                          ("Scripts Run", len(results))], 1):
         ws1.cell(row=row, column=1, value=label).font = Font(bold=True)
         ws1.cell(row=row, column=2, value=val)
     ws1.column_dimensions["A"].width = 18; ws1.column_dimensions["B"].width = 40
     for row, (label, val) in enumerate([("Total Tests", total), ("Passed", total_p),
                                          ("Failed", total_f), ("Skipped", total_s),
-                                         ("Pass Rate", f"{total_p/total*100:.1f}%" if total else "–")], 7):
+                                         ("Pass Rate", f"{total_p/total*100:.1f}%" if total else "–")], 8):
         ws1.cell(row=row, column=1, value=label).font = Font(bold=True)
         ws1.cell(row=row, column=2, value=val)
     for col, h in enumerate(["Script","Status","Passed","Failed","Skipped","Duration (s)"], 1):
@@ -7324,45 +7368,65 @@ def generate_master_testbed(body: dict, request: Request, db: Session = Depends(
     if not vm:
         raise HTTPException(status_code=404, detail="VM host not found")
 
-    # Get DUTs from current session (exclude VM host)
+    # ROBUSTNESS: if the caller sends the canvas connections in the request body,
+    # persist them here (replace-all, same as /api/topology/connections) so the
+    # generation always reflects EXACTLY what is on the user's canvas — no reliance
+    # on a separate, fire-and-forget save round-trip having reached the DB first.
+    body_connections = body.get("connections")
+    if isinstance(body_connections, list):
+        db.query(TopologyConnection).delete()
+        persisted = 0
+        for c in body_connections:
+            a = c.get("dut_a") if c.get("dut_a") not in (None, "") else c.get("dut_a_id")
+            b = c.get("dut_b") if c.get("dut_b") not in (None, "") else c.get("dut_b_id")
+            if a in (None, "") or b in (None, ""):
+                continue
+            try:
+                db.add(TopologyConnection(
+                    dut_a_id=int(a), intf_a=c.get("intf_a", "Ethernet0"),
+                    dut_b_id=int(b), intf_b=c.get("intf_b", "Ethernet0"),
+                ))
+                persisted += 1
+            except (ValueError, TypeError):
+                logger.warning(f"⚠ MASTER TESTBED: skipping malformed connection {c}")
+        db.commit()
+        logger.info(f"MASTER TESTBED: persisted {persisted} connection(s) from request body")
+
+    # Get DUTs available to this session (exclude VM host).
+    # Include this session's DUTs AND legacy DUTs with no session (backward compat),
+    # so canvas connections created against legacy/NULL-session devices still resolve.
     query = db.query(DUT).filter(DUT.device_type != "VM")
     if session_id:
-        query = query.filter(DUT.session_id == session_id)
+        query = query.filter(or_(
+            DUT.session_id == session_id,
+            DUT.session_id == None,   # noqa: E711 — legacy rows
+            DUT.session_id == "",
+        ))
     all_duts = query.all()
 
     if not all_duts:
         raise HTTPException(status_code=400, detail="No DUT devices found in session")
 
-    # CRITICAL FIX: Deduplicate DUTs by name to prevent duplicate devices in master testbed
-    # If multiple DUTs have the same name, keep only the first one
-    seen_names = set()
-    unique_duts = []
-    duplicate_count = 0
-    for dut in all_duts:
-        normalized_name = dut.name.replace(" ", "_").replace("-", "_")
-        if normalized_name not in seen_names:
-            seen_names.add(normalized_name)
-            unique_duts.append(dut)
-        else:
-            duplicate_count += 1
-            logger.warning(f"⚠ MASTER TESTBED: Skipping duplicate device '{dut.name}' (ID: {dut.id})")
-
-    if duplicate_count > 0:
-        logger.warning(f"⚠ MASTER TESTBED: Removed {duplicate_count} duplicate device(s) from generation")
-
-    all_duts = unique_duts  # Use deduplicated list
-
-    # Get ALL topology connections
+    # Get ALL topology connections (connections are global — not session-scoped)
     all_connections = db.query(TopologyConnection).all()
 
-    # Filter connections to only include those between DUTs in this session
-    dut_ids_in_session = {dut.id for dut in all_duts}
+    # Filter connections to those whose BOTH endpoints exist in this session's DUT set.
+    # IMPORTANT: filter against the FULL id set (pre-dedup) so a connection is never
+    # dropped just because another DUT happens to share the same name.
+    id_to_dut = {dut.id: dut for dut in all_duts}
+    session_dut_ids = set(id_to_dut.keys())
     session_connections = [
         conn for conn in all_connections
-        if conn.dut_a_id in dut_ids_in_session and conn.dut_b_id in dut_ids_in_session
+        if conn.dut_a_id in session_dut_ids and conn.dut_b_id in session_dut_ids
     ]
 
     if not session_connections:
+        if all_connections:
+            # Connections exist but point at devices outside this session — clearer guidance
+            raise HTTPException(status_code=400, detail=(
+                "Topology connections reference devices that are not available in your "
+                "current session. Re-create the connections in the Topology Canvas and try again."
+            ))
         raise HTTPException(status_code=400, detail="No connections found in Topology Canvas. Create connections first.")
 
     # Get DUT IDs that have at least one connection (only these are in Topology Canvas)
@@ -7371,8 +7435,27 @@ def generate_master_testbed(body: dict, request: Request, db: Session = Depends(
         connected_dut_ids.add(conn.dut_a_id)
         connected_dut_ids.add(conn.dut_b_id)
 
-    # Filter to only include DUTs that have connections (visible in Topology Canvas)
-    canvas_duts = [dut for dut in all_duts if dut.id in connected_dut_ids]
+    # Build the canvas DUT list from connected devices, de-duplicating by normalized
+    # name (prevents duplicate device blocks in the YAML). Every connected id — even
+    # duplicate-named ones — is later mapped to the canonical device name so no
+    # connection is lost during topology resolution.
+    seen_names = set()
+    canvas_duts = []
+    duplicate_count = 0
+    for cid in connected_dut_ids:
+        dut = id_to_dut.get(cid)
+        if not dut:
+            continue
+        normalized_name = dut.name.replace(" ", "_").replace("-", "_")
+        if normalized_name not in seen_names:
+            seen_names.add(normalized_name)
+            canvas_duts.append(dut)
+        else:
+            duplicate_count += 1
+            logger.warning(f"⚠ MASTER TESTBED: Skipping duplicate device '{dut.name}' (ID: {dut.id})")
+
+    if duplicate_count > 0:
+        logger.warning(f"⚠ MASTER TESTBED: Removed {duplicate_count} duplicate device(s) from generation")
 
     if not canvas_duts:
         raise HTTPException(status_code=400, detail="No devices with connections found in Topology Canvas")
@@ -7411,6 +7494,16 @@ def generate_master_testbed(body: dict, request: Request, db: Session = Depends(
                     "errors": "default"
                 }
             }
+
+        # Map EVERY connected DUT id (including duplicate-named ones that were folded
+        # into a canonical device above) to its device name, so topology resolution
+        # below never drops a connection whose endpoint was a duplicate.
+        for cid in connected_dut_ids:
+            if cid in dut_id_to_name:
+                continue
+            dut = id_to_dut.get(cid)
+            if dut:
+                dut_id_to_name[cid] = dut.name.replace(" ", "_").replace("-", "_")
 
         # Build topology section from canvas connections and topo dictionary for params
         topology_section = {}

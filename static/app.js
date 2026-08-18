@@ -33,13 +33,13 @@ let currentSession = null;
 let sessionKeepAliveTimer = null;
 
 // PTY Terminal (xterm.js) global variables
-let terminalInstance = null;  // xterm.js Terminal instance
-let terminalSocket = null;    // WebSocket connection for PTY
 let xtermLoaded = false;      // Track if xterm.js library is loaded
-let terminalOutputBuffer = []; // Store all terminal output for reconnection
-let terminalCurrentDutId = null; // Track which DUT is currently connected
-let terminalIsReconnecting = false; // Flag to prevent multiple reconnect attempts
-let terminalHeartbeatInterval = null; // Interval ID for heartbeat monitoring
+// Multi-session terminal: allow several devices connected at once, one tab each.
+// termSessions maps dutId (string) -> {
+//   dutId, name, term, socket, fitAddon, pane, outputBuffer,
+//   reconnecting, resizeObserver, generation }
+let termSessions = {};
+let termActiveDutId = null;   // dutId of the currently visible session tab
 let _termVisibilityListenerAdded = false; // Guard to prevent duplicate visibilitychange listeners
 
 // ============================================================
@@ -983,37 +983,16 @@ async function addDUT(e) {
 async function deleteDUT(id) {
     if (!confirm('Delete this device?')) return;
     try {
-        // Close terminal connection if this device is currently connected
-        if (terminalCurrentDutId === id && terminalSocket) {
-            console.log(`[PTY] Closing terminal connection for deleted device ${id}`);
-            terminalSocket.close();
-            terminalSocket = null;
-            terminalCurrentDutId = null;
-            if (terminalInstance) {
-                terminalInstance.dispose();
-                terminalInstance = null;
-            }
+        // Close any open terminal session for this device
+        if (termSessions[String(id)]) {
+            console.log(`[PTY] Closing terminal session for deleted device ${id}`);
+            termCloseSession(id);
         }
 
         const res = await fetch(`${API}/api/duts/${id}`, { method: 'DELETE', headers: getSessionHeaders() });
         if (!res.ok) throw new Error('Failed');
         toast('Device deleted', 'success');
         selectedDUTIds.delete(id);
-
-        // Clear terminal if it was showing this device
-        const termSelect = document.getElementById('term-dut');
-        if (termSelect && parseInt(termSelect.value) === id) {
-            termSelect.value = '';
-            const container = document.getElementById('term-container');
-            if (container) {
-                container.innerHTML = `
-                    <div class="log-placeholder">
-                        <span class="material-icons-round">terminal</span>
-                        <p>Select a device to open PTY terminal session.</p>
-                        <p style="font-size: 12px; color: #888;">Supports vi, nano, top, htop, screen, tmux</p>
-                    </div>`;
-            }
-        }
 
         loadDUTs();
         loadStats();
@@ -1545,6 +1524,7 @@ function _syncExecutionView(latestExec, jobScripts) {
         if (qPanel) qPanel.style.display = '';
         startQueuePolling(currentExecId);
         connectWS(currentExecId);
+        startExecLogPolling(currentExecId);   // reliable live logs via REST on reload
     } else if (latestExec) {
         // Completed/failed — restore per-script rows + job report buttons
         if (startBtn)    startBtn.style.display    = '';
@@ -1745,9 +1725,82 @@ async function checkDUTConflicts(dutIds) {
     } catch (_) {}
 }
 
-function downloadJobReport(type) {
-    if (!activeJobId) return;
-    window.open(`${API}/api/execution-jobs/${activeJobId}/report/${type}`);
+async function downloadJobReport(type) {
+    if (!activeJobId) {
+        toast('This run has no job — use the HTML/Excel buttons in Live Results instead', 'info');
+        return;
+    }
+    // Must use fetch (not window.open) so the X-Session-ID header is sent — the job
+    // report endpoint filters by session and returns "Job not found" without it.
+    try {
+        const res = await fetch(`${API}/api/execution-jobs/${activeJobId}/report/${type}`,
+            { headers: getSessionHeaders() });
+        if (!res.ok) {
+            let detail = res.status;
+            try { detail = (await res.json()).detail || detail; } catch (_) {}
+            toast(`Job report failed: ${detail}`, 'error');
+            return;
+        }
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `job_${activeJobId}_report.${type === 'excel' ? 'xlsx' : 'html'}`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(a.href);
+    } catch (e) {
+        toast(`Job report error: ${e.message}`, 'error');
+    }
+}
+
+// ── Rerun (full batch / failed-only) ─────────────────────────────────────────
+function _showRerunButtons() {
+    const allBtn = document.getElementById('btn-rerun-all');
+    const failBtn = document.getElementById('btn-rerun-failed');
+    if (allBtn) allBtn.style.display = (_lastRunScriptPaths && _lastRunScriptPaths.length) ? '' : 'none';
+    if (failBtn) {
+        const n = (_lastRunFailedPaths || []).length;
+        failBtn.style.display = n ? '' : 'none';
+        const lbl = document.getElementById('rerun-failed-count');
+        if (lbl) lbl.textContent = n ? ` (${n})` : '';
+    }
+}
+
+function _hideRerunButtons() {
+    const allBtn = document.getElementById('btn-rerun-all');
+    const failBtn = document.getElementById('btn-rerun-failed');
+    if (allBtn) allBtn.style.display = 'none';
+    if (failBtn) failBtn.style.display = 'none';
+}
+
+// Restore the given scripts + the last run's DUT selection, then start a new run.
+function _rerunWith(paths) {
+    if (!paths || !paths.length) { toast('Nothing to rerun', 'warning'); return; }
+    selectedScriptPaths = new Set(paths);
+    selectedDUTIds = new Set(_lastRunDUTIds || []);
+    try { if (typeof renderScriptsDropdown === 'function') renderScriptsDropdown(); } catch (_) {}
+    try { if (typeof renderDUTChecklist === 'function') renderDUTChecklist(); } catch (_) {}
+    try { if (typeof updateSelectedScriptsCount === 'function') updateSelectedScriptsCount(); } catch (_) {}
+    try { if (typeof updateSpyStartBtn === 'function') updateSpyStartBtn(); } catch (_) {}
+    _hideRerunButtons();
+    startExecution();
+}
+
+function rerunAll() {
+    if (!_lastRunScriptPaths || !_lastRunScriptPaths.length) {
+        toast('No previous batch to rerun', 'warning'); return;
+    }
+    toast(`Rerunning all ${_lastRunScriptPaths.length} script(s)…`, 'info');
+    _rerunWith(_lastRunScriptPaths);
+}
+
+function rerunFailed() {
+    if (!_lastRunFailedPaths || !_lastRunFailedPaths.length) {
+        toast('No failed scripts to rerun 🎉', 'success'); return;
+    }
+    toast(`Rerunning ${_lastRunFailedPaths.length} failed script(s)…`, 'info');
+    _rerunWith(_lastRunFailedPaths);
 }
 
 function _updateJobStatusBadge(status) {
@@ -2308,19 +2361,23 @@ function renderScriptsDropdown() {
         updateScriptMultiSelectText();
         return;
     }
-    let html = `<label class="multi-select-item select-all">
+    // Sticky search bar to filter scripts by name/path
+    let html = `<div class="script-search-wrap" style="position:sticky;top:0;z-index:2;padding:6px;background:var(--bg-secondary);border-bottom:1px solid var(--border)">
+        <input type="text" id="script-search-input" placeholder="🔍 Search scripts…"
+            oninput="filterScriptDropdown(this.value)" onclick="event.stopPropagation()"
+            style="width:100%;padding:6px 8px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-tertiary);color:var(--text-primary);box-sizing:border-box">
+    </div>
+    <label class="multi-select-item select-all">
         <input type="checkbox" onchange="toggleAllScripts(this)"> Select All
     </label>`;
 
     let checkedCount = 0;
     scriptsData.forEach(s => {
         const isChecked = selectedScriptPaths.has(s.path);
-        if (isChecked) {
-            checkedCount++;
-            console.log(`Script ${s.path} is checked`);
-        }
+        if (isChecked) checkedCount++;
         const checked = isChecked ? 'checked' : '';
-        html += `<label class="multi-select-item">
+        const hay = esc((s.name + ' ' + s.path).toLowerCase());
+        html += `<label class="multi-select-item" data-search="${hay}">
             <input type="checkbox" value="${esc(s.path)}" ${checked} onchange="onScriptCheckboxChange('${esc(s.path)}', this)">
             <div class="item-label">
                 <div class="item-name">${esc(s.name)}</div>
@@ -2334,6 +2391,34 @@ function renderScriptsDropdown() {
     updateScriptMultiSelectText();
 }
 
+// Live-filter the script dropdown by name/path. Also shows a "no match" hint.
+function filterScriptDropdown(query) {
+    const el = document.getElementById('script-dropdown-list');
+    if (!el) return;
+    const q = (query || '').trim().toLowerCase();
+    let shown = 0;
+    el.querySelectorAll('.multi-select-item:not(.select-all)').forEach(item => {
+        const hay = item.dataset.search || item.textContent.toLowerCase();
+        const match = !q || hay.includes(q);
+        item.style.display = match ? '' : 'none';
+        if (match) shown++;
+    });
+    // Manage a "no results" line
+    let empty = el.querySelector('.script-search-empty');
+    if (q && shown === 0) {
+        if (!empty) {
+            empty = document.createElement('p');
+            empty.className = 'script-search-empty muted';
+            empty.style.cssText = 'padding:8px;font-size:12px;margin:0';
+            el.appendChild(empty);
+        }
+        empty.textContent = `No scripts match “${query}”`;
+        empty.style.display = '';
+    } else if (empty) {
+        empty.style.display = 'none';
+    }
+}
+
 function onScriptCheckboxChange(scriptPath, cb) {
     // Enhancement 2: If deselecting during a LIVE execution, show cancel confirmation.
     // Gate on currentExecActive (not just currentExecId): currentExecId lingers after a run
@@ -2343,8 +2428,7 @@ function onScriptCheckboxChange(scriptPath, cb) {
         // User is trying to deselect a script during execution
         // Show confirmation dialog
         cb.checked = true;  // Re-check for now
-        const scriptName = scriptPath.split('/').pop();  // Get filename
-        showCancelConfirmation(scriptName);
+        showCancelConfirmation(scriptPath);   // pass full path so we can deselect it on confirm
         return;
     }
 
@@ -2369,8 +2453,13 @@ function onScriptCheckboxChange(scriptPath, cb) {
 }
 
 function toggleAllScripts(cb) {
+    // Only toggle items visible under the current search filter (a hidden item's
+    // parent label has display:none), so "Select All" while searching selects
+    // just the matches.
     const items = document.querySelectorAll('#script-dropdown-list .multi-select-item:not(.select-all) input[type=checkbox]');
     items.forEach(item => {
+        const label = item.closest('.multi-select-item');
+        if (label && label.style.display === 'none') return;   // skip filtered-out items
         item.checked = cb.checked;
         const path = item.value;
         if (cb.checked) selectedScriptPaths.add(path); else selectedScriptPaths.delete(path);
@@ -2432,7 +2521,62 @@ function stopQueuePolling() {
     if (_queuePollTimer) { clearInterval(_queuePollTimer); _queuePollTimer = null; }
 }
 
+// ── Live log polling (REST) ─────────────────────────────────────────────────
+// The /ws/execution WebSocket only reliably delivers the final drain at completion
+// (its long-lived read transaction can miss rows committed mid-run). Polling the
+// REST logs endpoint sidesteps that entirely — each request is a fresh transaction
+// that sees everything committed so far — so the Live Execution Logs panel streams
+// during the run. De-duped by id via _seenExecLogIds (shared with the WS path).
+let _execLogPollTimer = null;
+let _execLogMaxId = 0;
+
+async function _pollExecLogsOnce(execId) {
+    try {
+        const res = await fetch(`${API}/api/executions/${execId}/logs?after_id=${_execLogMaxId}&limit=3000`,
+            { headers: getSessionHeaders() });
+        if (!res.ok) return;
+        const logs = await res.json();
+        if (!Array.isArray(logs)) return;
+        for (const log of logs) {
+            if (log.id != null) {
+                if (log.id > _execLogMaxId) _execLogMaxId = log.id;
+                if (_seenExecLogIds.has(log.id)) continue;
+                _seenExecLogIds.add(log.id);
+            }
+            if (log.message && log.message.startsWith('[QUEUE]')) continue;
+            allLogs.push(log);
+            appendLogEntry(log);
+        }
+    } catch (_) { /* transient — next tick retries */ }
+}
+
+function startExecLogPolling(execId) {
+    stopExecLogPolling();
+    _execLogMaxId = 0;
+    _pollExecLogsOnce(execId);                 // immediate first fetch
+    _execLogPollTimer = setInterval(() => _pollExecLogsOnce(execId), 1500);
+}
+
+function stopExecLogPolling() {
+    if (_execLogPollTimer) { clearInterval(_execLogPollTimer); _execLogPollTimer = null; }
+}
+
 async function pollQueueStatus(execId) {
+    // Completion fallback: if the WebSocket never delivered `execution_complete`
+    // (flaky WS), detect the finished run here and finalize the UI (Stop→Start,
+    // Rerun buttons, enable downloads) instead of staying stuck in "running".
+    if (!_execCompleteHandled) {
+        try {
+            const sres = await fetch(`${API}/api/executions/${execId}`, { headers: getSessionHeaders() });
+            if (sres.ok) {
+                const ex = await sres.json();
+                if (['completed', 'failed', 'cancelled'].includes(ex.status)) {
+                    handleExecutionComplete(ex.status, ex.duration);
+                    return;
+                }
+            }
+        } catch (_) {}
+    }
     try {
         const res = await fetch(`${API}/api/execution-queue`);
         if (!res.ok) {
@@ -2449,6 +2593,8 @@ async function pollQueueStatus(execId) {
             return;
         }
         updateQueuePanel(state);
+        // Drive Live Results live from per-script aggregates the runner publishes
+        (state.script_results || []).forEach(r => updateLiveResults(r));
     } catch (_) { }
 }
 
@@ -2479,12 +2625,17 @@ function updateQueuePanel(state) {
 
     // Scripts
     const scripts = state.scripts || [];
+    // Track each script's live status and re-apply the "Show Only Running" filter,
+    // so waiting/queued panes are hidden (not just completed ones).
+    scripts.forEach(s => { if (s.name) scriptStatuses[s.name] = s.status; });
+    _applyRunningFilter();
     const statusMeta = {
         queued:  { icon: 'hourglass_empty', cls: 'pending',   label: 'Queued'  },
         waiting: { icon: 'schedule',        cls: 'pending',   label: 'Waiting' },
         running: { icon: 'play_circle',     cls: 'running',   label: 'Running' },
         done:    { icon: 'check_circle',    cls: 'completed', label: 'Done'    },
         failed:  { icon: 'error',           cls: 'failed',    label: 'Failed'  },
+        skipped: { icon: 'block',           cls: 'pending',   label: 'Skipped (topology)' },
     };
     scriptsEl.innerHTML = scripts.map(s => {
         const m = statusMeta[s.status] || statusMeta.queued;
@@ -2510,6 +2661,7 @@ function updateQueuePanel(state) {
  * Reset execution state after completion - unselect all scripts and DUTs
  */
 function resetExecutionState() {
+    stopExecLogPolling();   // safety net — ensure the live-log poller is stopped
     // Clear script selections
     selectedScriptPaths.clear();
     document.querySelectorAll('.script-item input[type="checkbox"]').forEach(cb => {
@@ -2534,6 +2686,7 @@ function resetExecutionState() {
 
     // Enhancement 1: Clear auto-hide state for completed scripts
     completedScripts.clear();
+    scriptStatuses = {};
     Object.keys(scriptHideTimers).forEach(key => clearTimeout(scriptHideTimers[key]));
     scriptHideTimers = {};
     // Default to "only running" — a completed script's log pane is hidden the moment it
@@ -2556,9 +2709,19 @@ function resetExecutionState() {
     console.log('Execution state reset: selections cleared');
 }
 
+// Remember the last batch so it can be re-run (all / failed-only) after completion.
+let _lastRunScriptPaths = [];
+let _lastRunDUTIds = [];
+let _lastRunFailedPaths = [];
+let _reportExecId = null;   // stable exec id for the Live Results report buttons
+
 async function startExecution() {
     const vmId = parseInt(document.getElementById('spy-vm-select').value);
     const scriptPaths = Array.from(selectedScriptPaths);
+    // Snapshot this batch (scripts + DUTs) — completion clears the live selections.
+    _lastRunScriptPaths = [...scriptPaths];
+    _lastRunDUTIds = Array.from(selectedDUTIds);
+    _lastRunFailedPaths = [];
     const logLevel = document.getElementById('spy-log-level')?.value || 'info';
     const skipInit = document.getElementById('spy-skip-init')?.checked || false;
     // Enhancement 3: Capture DUT reservation checkbox
@@ -2695,6 +2858,8 @@ async function startExecution() {
         const mode = window._gitConnected ? 'Git' : 'SPyTest';
         toast(`${mode} Execution #${currentExecId} started`, 'success');
         connectWS(currentExecId);
+        startExecLogPolling(currentExecId);   // reliable live logs via REST (WS is best-effort)
+        _hideRerunButtons();   // rerun buttons reappear only after this run completes
         // Initialize live results panel with queued scripts
         showLiveResultsPanel(scriptPaths);
         loadStats();
@@ -2737,9 +2902,120 @@ async function stopExecution() {
     }
 }
 
+// Execution WebSocket state — supports auto-reconnect + log de-duplication.
+let _execWsReconnectAttempts = 0;
+let _execWsIntentionalClose = false;
+let _seenExecLogIds = new Set();   // dedupe: backend replays logs from id 0 each connect
+let _execCompleteHandled = false;  // guards the completion UI so it fires exactly once
+
+// Finalize the run UI when the execution completes — called from the WebSocket
+// `execution_complete` event AND from polling (in case the WS never delivers it),
+// guarded so it runs only once per execution.
+async function handleExecutionComplete(status, duration) {
+    if (_execCompleteHandled) return;
+    _execCompleteHandled = true;
+    currentExecActive = false;  // run finished — unchecking scripts is now a plain deselect
+    stopQueuePolling();          // stop the interval; a final fetch happens below
+    const doneId = currentExecId;
+
+    // Flip the run controls IMMEDIATELY so the UI never lingers on "running".
+    const _startBtn = document.getElementById('btn-start-exec');
+    if (_startBtn) _startBtn.style.display = '';
+    const _stopBtn = document.getElementById('btn-stop-exec');
+    if (_stopBtn) _stopBtn.style.display = 'none';
+
+    // ── Final backend refresh so the LAST script shows pass/fail (not stuck at
+    //    running/queued) and the queue reflects completion, even when the WS died.
+    try {
+        const qr = await fetch(`${API}/api/execution-queue`);
+        if (qr.ok) {
+            const all = await qr.json();
+            const state = all[doneId] || all[String(doneId)];
+            if (state) {
+                updateQueuePanel(state);
+                (state.script_results || []).forEach(r => updateLiveResults(r));
+            }
+        }
+        // Authoritative per-script results from the executions list.
+        const lr = await fetch(`${API}/api/executions`, { headers: getSessionHeaders() });
+        if (lr.ok) {
+            const list = await lr.json();
+            const ex = Array.isArray(list) ? list.find(e => String(e.id) === String(doneId)) : null;
+            if (ex && Array.isArray(ex.script_results)) ex.script_results.forEach(r => updateLiveResults(r));
+        }
+    } catch (_) {}
+
+    toast(`Execution ${status} (${duration || 0}s)`,
+          status === 'completed' ? 'success' : 'error');
+    const startBtn = document.getElementById('btn-start-exec');
+    if (startBtn) startBtn.style.display = '';
+    const stopBtn = document.getElementById('btn-stop-exec');
+    if (stopBtn) stopBtn.style.display = 'none';
+    const addScriptsBtn = document.getElementById('btn-add-scripts-exec');
+    if (addScriptsBtn) addScriptsBtn.style.display = 'none';
+    const showOnlyBtn = document.getElementById('btn-show-only-running');
+    if (showOnlyBtn) showOnlyBtn.style.display = 'none';
+    // Final log fetch, then stop the live poller (catches any last lines)
+    if (doneId) _pollExecLogsOnce(doneId).finally(stopExecLogPolling);
+    else stopExecLogPolling();
+    const badge = document.getElementById('queue-exec-badge');
+    if (badge) {
+        badge.className = `badge ${status === 'completed' ? 'completed' : 'failed'}`;
+        badge.textContent = status;
+    }
+    // The queue panel is a live monitor — hide it now that the run is finished so it
+    // doesn't sit showing a stale "running" state (Live Results has the final status).
+    const qPanel = document.getElementById('queue-status-panel');
+    if (qPanel) qPanel.style.display = 'none';
+    loadStats();
+    loadExecutions();
+
+    // Enable download buttons in Live Results panel
+    const btnHtml = document.getElementById('btn-dl-html');
+    const btnXls = document.getElementById('btn-dl-excel');
+    if (btnHtml) btnHtml.disabled = false;
+    if (btnXls) btnXls.disabled = false;
+    const jobHtmlBtn = document.getElementById('btn-job-html');
+    const jobExcelBtn = document.getElementById('btn-job-excel');
+    if (activeJobId && jobHtmlBtn) jobHtmlBtn.style.display = '';
+    if (activeJobId && jobExcelBtn) jobExcelBtn.style.display = '';
+    _updateJobStatusBadge(status || 'completed');
+
+    // Remember this execution's id for the report buttons and reveal Rerun.
+    // (Failed set computed AFTER the final refresh so last-script failures count.)
+    _reportExecId = doneId;
+    _lastRunFailedPaths = (_lastRunScriptPaths || []).filter(p => {
+        const stem = p.split('/').pop().replace(/\.py$/, '');
+        const st = _liveScripts[stem];
+        return st && st.status === 'failed';
+    });
+    _showRerunButtons();
+
+    allLogs = [];
+    logStreams = {};
+    const logContainer = document.getElementById('exec-log-container');
+    if (logContainer) {
+        logContainer.innerHTML = '<div class="log-placeholder"><span class="material-icons-round">terminal</span><p>Logs will appear here when an execution starts...</p></div>';
+    }
+    const downloadBtn = document.getElementById('btn-download-logs');
+    if (downloadBtn) downloadBtn.style.display = 'none';
+
+    resetExecutionState();
+}
+
+// Fresh connection for a (possibly new) execution — resets dedupe + counters.
 function connectWS(execId) {
+    _seenExecLogIds = new Set();
+    _execWsReconnectAttempts = 0;
+    _execWsIntentionalClose = false;
+    _execCompleteHandled = false;   // arm completion handling for this run
+    _openExecWS(execId);
+}
+
+function _openExecWS(execId) {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws/execution/${execId}`);
+    ws.onopen = () => { _execWsReconnectAttempts = 0; };
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
 
@@ -2750,54 +3026,37 @@ function connectWS(execId) {
         }
 
         if (data.type === 'execution_complete') {
-            currentExecActive = false;  // run finished — unchecking scripts is now a plain deselect
-            toast(`Execution ${data.status} (${data.duration || 0}s)`,
-                  data.status === 'completed' ? 'success' : 'error');
-            document.getElementById('btn-start-exec').style.display = '';
-            document.getElementById('btn-stop-exec').style.display = 'none';
-            const addScriptsBtn = document.getElementById('btn-add-scripts-exec');
-            if (addScriptsBtn) addScriptsBtn.style.display = 'none';
-            const showOnlyBtn = document.getElementById('btn-show-only-running');
-            if (showOnlyBtn) showOnlyBtn.style.display = 'none';
-            stopQueuePolling();
-            const badge = document.getElementById('queue-exec-badge');
-            if (badge) {
-                badge.className = `badge ${data.status === 'completed' ? 'completed' : 'failed'}`;
-                badge.textContent = data.status;
-            }
-            loadStats();
-            loadExecutions();
-
-            // Enable download buttons in Live Results panel
-            const btnHtml = document.getElementById('btn-dl-html');
-            const btnXls = document.getElementById('btn-dl-excel');
-            if (btnHtml) btnHtml.disabled = false;
-            if (btnXls) btnXls.disabled = false;
-            const jobHtmlBtn = document.getElementById('btn-job-html');
-            const jobExcelBtn = document.getElementById('btn-job-excel');
-            if (activeJobId && jobHtmlBtn) jobHtmlBtn.style.display = '';
-            if (activeJobId && jobExcelBtn) jobExcelBtn.style.display = '';
-            _updateJobStatusBadge(data.status || 'completed');
-
-            allLogs = [];
-            logStreams = {};
-            const logContainer = document.getElementById('exec-log-container');
-            if (logContainer) {
-                logContainer.innerHTML = '<div class="log-placeholder"><span class="material-icons-round">terminal</span><p>Logs will appear here when an execution starts...</p></div>';
-            }
-            const downloadBtn = document.getElementById('btn-download-logs');
-            if (downloadBtn) downloadBtn.style.display = 'none';
-
-            resetExecutionState();
+            _execWsIntentionalClose = true;   // server closes after this — don't reconnect
+            handleExecutionComplete(data.status, data.duration);
             return;
         }
 
         if (data.message && data.message.startsWith('[QUEUE]')) return;
+        // De-dupe by log id so reconnects (which replay from id 0) don't double-print
+        if (data.id != null) {
+            if (_seenExecLogIds.has(data.id)) return;
+            _seenExecLogIds.add(data.id);
+        }
         allLogs.push(data);
         appendLogEntry(data);
     };
-    ws.onerror = () => toast('WebSocket connection error', 'error');
-    ws.onclose = () => { ws = null; };
+    // Quiet on error — let onclose drive reconnection instead of alarming the user
+    ws.onerror = () => { console.warn('[exec-ws] error; will attempt reconnect on close'); };
+    ws.onclose = () => {
+        ws = null;
+        if (_execWsIntentionalClose) { _execWsIntentionalClose = false; return; }
+        // Unexpected drop — reconnect while the execution is still running so live
+        // logs/results resume. Backend replays logs from the start; dedupe handles it.
+        if (!currentExecActive) return;
+        _execWsReconnectAttempts++;
+        if (_execWsReconnectAttempts <= 15) {
+            const delay = Math.min(1000 * _execWsReconnectAttempts, 5000);
+            console.log(`[exec-ws] reconnecting in ${delay}ms (attempt ${_execWsReconnectAttempts})`);
+            setTimeout(() => { if (currentExecActive) _openExecWS(execId); }, delay);
+        } else {
+            toast('Live log stream lost — execution continues; status still updating via polling', 'warning');
+        }
+    };
 }
 
 // ── Live Results Panel ─────────────────────────────────────────────────────
@@ -2864,7 +3123,9 @@ function _restoreLiveResultsPanel(latestExec, jobScripts) {
     // Replay each result row
     scriptResults.forEach(r => updateLiveResults(r));
 
-    // Enable download buttons (execution already completed)
+    // Enable download buttons (execution already completed) + remember the id so
+    // the report buttons work after a refresh.
+    _reportExecId = latestExec.id;
     const btnHtml = document.getElementById('btn-dl-html');
     const btnXls  = document.getElementById('btn-dl-excel');
     if (btnHtml) btnHtml.disabled = false;
@@ -2880,7 +3141,17 @@ function updateLiveResults(data) {
     state.failed = data.failed || 0;
     state.skipped = data.skipped || 0;
     state.duration_s = data.duration_s || 0;
-    state.status = data.status || 'unknown';
+    // Trust the counts for the status so a failed script is never shown as passed
+    // (fixes "all passed" after a refresh): any failed testcase → failed.
+    let st = (data.status || '').toLowerCase();
+    if ((data.failed || 0) > 0) {
+        st = 'failed';
+    } else if (!st || st === 'unknown' || st === 'running' || st === 'queued' || st === 'waiting') {
+        if ((data.passed || 0) > 0) st = 'passed';
+        else if ((data.skipped || 0) > 0) st = 'skipped';
+        else st = st || 'unknown';
+    }
+    state.status = st;
     _liveScripts[stem] = state;
     _liveDoneScripts = Object.values(_liveScripts).filter(s => s.status !== 'queued').length;
 
@@ -2925,13 +3196,20 @@ function _updateLiveProgressBar() {
 }
 
 async function downloadReport(execId, format) {
-    if (!execId) { toast('No execution selected', 'warning'); return; }
+    // Fall back to the last completed execution if the live id was cleared
+    execId = execId || _reportExecId || currentExecId;
+    if (!execId) { toast('No execution to download a report for', 'warning'); return; }
     const endpoint = format === 'excel'
         ? `${API}/api/executions/${execId}/excel`
         : `${API}/api/executions/${execId}/dashboard`;
     try {
         const res = await fetch(endpoint, { headers: getSessionHeaders() });
-        if (!res.ok) { toast(`Download failed: ${(await res.json()).detail}`, 'error'); return; }
+        if (!res.ok) {
+            let detail = res.status;
+            try { detail = (await res.json()).detail || detail; } catch (_) {}
+            toast(`Download failed: ${detail}`, 'error');
+            return;
+        }
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -2971,13 +3249,8 @@ function renderLogs() {
     wrapper.className = 'log-panes-wrapper';
     container.appendChild(wrapper);
     allLogs.forEach(appendLogEntry);
-    // Re-apply "only running" filter after a full rebuild — appendLogEntry only hides a pane
-    // on the tick it first completes, so already-completed scripts must be re-hidden here.
-    if (showOnlyRunning) {
-        wrapper.querySelectorAll('.script-log-pane').forEach(pane => {
-            if (completedScripts.has(pane.dataset.scriptName)) pane.classList.add('log-pane-hidden');
-        });
-    }
+    // Re-apply "only running" filter after a full rebuild (waiting + completed hidden).
+    _applyRunningFilter();
 }
 
 function _ensurePaneWrapper() {
@@ -3017,7 +3290,10 @@ function appendLogEntry(log) {
             <div class="script-pane-header" onclick="openLogPopup('${esc(source)}')" title="Click to expand">
                 <span class="material-icons-round" style="font-size:15px;opacity:.7">description</span>
                 <span class="script-pane-title">${esc(source)}</span>
-                <span class="material-icons-round" style="font-size:14px;opacity:.5;margin-left:auto">open_in_new</span>
+                <span class="material-icons-round script-pane-dl" style="font-size:15px;opacity:.6;margin-left:auto;cursor:pointer"
+                    onclick="event.stopPropagation();downloadScriptLog('${esc(source)}')"
+                    title="Download this script's log">download</span>
+                <span class="material-icons-round" style="font-size:14px;opacity:.5;margin-left:6px">open_in_new</span>
             </div>
             <div id="${safeId}" class="script-pane-body"></div>
         `;
@@ -3033,17 +3309,24 @@ function appendLogEntry(log) {
         target.scrollTop = target.scrollHeight;
     }
 
-    // In "only running" mode, hide this script's pane as soon as it completes so the
-    // Live Execution Logs section shows only scripts that are still running.
-    if (justCompleted && showOnlyRunning && target) {
+    // In "only running" mode, show this pane only while its script is actually
+    // running — hide it while queued/waiting and once it completes.
+    if (showOnlyRunning && target && source !== 'SYSTEM') {
         const pane = target.closest('.script-log-pane');
-        if (pane) pane.classList.add('log-pane-hidden');
+        if (pane) {
+            const isRunning = scriptStatuses[source] === 'running';
+            pane.classList.toggle('log-pane-hidden', !isRunning);
+        }
     }
 }
 
 function openLogPopup(source) {
     const logs = allLogs.filter(l => (l.dut_name || 'SYSTEM') === source);
-    const html = '<div class="log-popup-body">' + (logs.length ? logs.map(logHTML).join('') : '<p class="muted" style="padding:8px">No logs yet.</p>') + '</div>';
+    const dl = `<div style="text-align:right;margin-bottom:8px">
+        <button class="btn outline small" onclick="downloadScriptLog('${esc(source)}')">
+            <span class="material-icons-round" style="font-size:15px;vertical-align:middle">download</span> Download log
+        </button></div>`;
+    const html = dl + '<div class="log-popup-body">' + (logs.length ? logs.map(logHTML).join('') : '<p class="muted" style="padding:8px">No logs yet.</p>') + '</div>';
     openModal(`Logs — ${source}`, html);
 }
 
@@ -3066,28 +3349,53 @@ function downloadLogs() {
     a.click();
 }
 
+// Download the log for a single script pane (Live Execution Logs)
+function downloadScriptLog(source) {
+    const logs = allLogs.filter(l => (l.dut_name || 'SYSTEM') === source);
+    if (!logs.length) { toast('No logs for this script yet', 'info'); return; }
+    const text = logs.map(l => `[${l.timestamp || ''}] [${l.level || ''}] ${l.message || ''}`).join('\n');
+    const blob = new Blob([text], { type: 'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const safe = source.replace(/[^a-zA-Z0-9._-]/g, '_');
+    a.download = `exec${currentExecId || ''}_${safe}.log`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+}
+
+// Per-script queue status (name -> queued/waiting/running/done/failed), from the
+// queue poll — the source of truth for the "Show Only Running" filter.
+let scriptStatuses = {};
+
+// Apply the "Show Only Running" filter: when active, only panes whose script is
+// currently RUNNING are shown (waiting/queued AND completed panes are hidden).
+// SYSTEM/general logs always stay visible.
+function _applyRunningFilter() {
+    document.querySelectorAll('.script-log-pane').forEach(pane => {
+        const name = pane.dataset.scriptName;
+        let show;
+        if (!showOnlyRunning) show = true;
+        else if (name === 'SYSTEM') show = true;
+        else show = scriptStatuses[name] === 'running';
+        pane.classList.toggle('log-pane-hidden', !show);
+    });
+}
+
 // Toggle "Show Only Running" filter for log panes
 function toggleShowOnlyRunning() {
     showOnlyRunning = !showOnlyRunning;
     const btn = document.getElementById('btn-show-only-running');
     if (btn) {
         btn.classList.toggle('active', showOnlyRunning);
-        btn.title = showOnlyRunning ? 'Show all scripts (including completed)' : 'Show only running scripts';
+        btn.title = showOnlyRunning ? 'Show all scripts (including completed/waiting)' : 'Show only running scripts';
         const icon = btn.querySelector('.material-icons-round');
         if (icon) icon.textContent = showOnlyRunning ? 'visibility' : 'visibility_off';
         const lbl = document.getElementById('show-only-running-label');
         if (lbl) lbl.textContent = showOnlyRunning ? 'Show All' : 'Show Only Running';
     }
-
-    // Update all log panes visibility
-    document.querySelectorAll('.script-log-pane').forEach(pane => {
-        const scriptName = pane.dataset.scriptName;
-        if (showOnlyRunning && completedScripts.has(scriptName)) {
-            pane.classList.add('log-pane-hidden');
-        } else {
-            pane.classList.remove('log-pane-hidden');
-        }
-    });
+    _applyRunningFilter();
 }
 
 // Auto-hide a completed script's logs after delay (in milliseconds)
@@ -3113,15 +3421,17 @@ function setAutoHideScriptLog(scriptName, delay) {
 // ENHANCEMENT 2: DYNAMIC BATCH ADDITION & SCRIPT CANCELLATION
 // ============================================================
 
-let pendingCancelScript = null;  // Track which script user is trying to cancel
+let pendingCancelScript = null;      // script NAME (for the cancel API)
+let pendingCancelScriptPath = null;  // script PATH (for deselecting the checkbox)
 
-function showCancelConfirmation(scriptName) {
+function showCancelConfirmation(scriptPath) {
     // Show cancel confirmation dialog for a script
-    pendingCancelScript = scriptName;
+    pendingCancelScriptPath = scriptPath;
+    pendingCancelScript = scriptPath.split('/').pop();   // filename for the API + display
     const modal = document.getElementById('cancel-script-confirmation-modal');
     const nameDisplay = document.getElementById('cancel-script-name-display');
     if (modal && nameDisplay) {
-        nameDisplay.textContent = scriptName;
+        nameDisplay.textContent = pendingCancelScript;
         modal.style.display = 'flex';
         // Focus the NO button (default)
         const noBtn = document.getElementById('btn-cancel-no');
@@ -3134,6 +3444,7 @@ function closeCancelConfirmation() {
     const modal = document.getElementById('cancel-script-confirmation-modal');
     if (modal) modal.style.display = 'none';
     pendingCancelScript = null;
+    pendingCancelScriptPath = null;
 }
 
 async function confirmCancelScript() {
@@ -3158,15 +3469,26 @@ async function confirmCancelScript() {
             return;
         }
 
-        // Remove checkbox for cancelled script
-        const checkbox = document.querySelector(`.script-item input[data-script-name="${pendingCancelScript}"]`);
-        if (checkbox) checkbox.checked = false;
+        // Actually deselect the script: remove from the selection set AND uncheck its
+        // checkbox in the Test Scripts dropdown (checkboxes are keyed by full path).
+        const path = pendingCancelScriptPath;
+        const name = pendingCancelScript;
+        if (path) {
+            selectedScriptPaths.delete(path);
+            document.querySelectorAll('#script-dropdown-list .multi-select-item input[type=checkbox]')
+                .forEach(cb => { if (cb.value === path) cb.checked = false; });
+            const selectAllCb = document.querySelector('#script-dropdown-list .select-all input');
+            if (selectAllCb) selectAllCb.checked = false;
+            updateScriptMultiSelectText();
+            try { if (typeof updateSpyStartBtn === 'function') updateSpyStartBtn(); } catch (_) {}
+            try { if (typeof saveJobState === 'function') saveJobState(); } catch (_) {}
+        }
 
-        // Hide the log pane for cancelled script
-        const logPane = document.querySelector(`.script-log-pane[data-script-name="${pendingCancelScript}"]`);
+        // Hide the log pane for the cancelled script (pane is keyed by filename)
+        const logPane = document.querySelector(`.script-log-pane[data-script-name="${name}"]`);
         if (logPane) logPane.classList.add('log-pane-hidden');
 
-        toast(`Script "${pendingCancelScript}" cancelled`, 'success');
+        toast(`Script "${name}" cancelled`, 'success');
         closeCancelConfirmation();
     } catch (e) {
         toast(`Error cancelling script: ${e.message}`, 'error');
@@ -3352,18 +3674,19 @@ async function checkAndShowReservedDuts() {
 // ============================================================
 
 async function loadExecutions() {
+    let execs = [];
     try {
         const res = await fetch(`${API}/api/executions`, {
             headers: getSessionHeaders()
         });
-        const execs = await res.json();
+        const allExecs = await res.json();
+        execs = Array.isArray(allExecs)
+            ? allExecs.filter(ex => !ex.type || ex.type === 'script' || ex.type === 'spytest')
+            : [];
         const tbody = document.getElementById('exec-history-tbody');
-        if (!execs.length) {
-            tbody.innerHTML = '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">No executions yet.</td></tr>';
-            return;
-        }
-
-        tbody.innerHTML = execs.map(ex => {
+        if (tbody && !execs.length) {
+            tbody.innerHTML = '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">No script executions yet.</td></tr>';
+        } else if (tbody) tbody.innerHTML = execs.map(ex => {
             const totalP = ex.passed || 0;
             const totalF = ex.failed || 0;
             const totalS = ex.skipped || 0;
@@ -3375,6 +3698,7 @@ async function loadExecutions() {
                   </span>`
                 : '<span class="muted" style="font-size:11px">–</span>';
             const checked = _compareSelected.has(ex.id) ? 'checked' : '';
+            const isScript = ex.type === 'script' || ex.type === 'spytest';
             return `<tr>
                 <td style="text-align:center"><input type="checkbox" class="cmp-chk"
                     data-id="${ex.id}" onchange="onCompareCheck(this)" ${checked}></td>
@@ -3389,171 +3713,392 @@ async function loadExecutions() {
                 <td style="display:flex;gap:4px;align-items:center">
                     <button class="btn outline small" onclick="viewExecLogs(${ex.id})"
                         title="View logs">
-                        <span class="material-icons-round" style="font-size:16px">visibility</span>
+                        <span class="material-icons-round" style="font-size:15px">visibility</span>
                     </button>
+                    ${isScript ? `
                     <button class="btn outline small" onclick="downloadReport(${ex.id},'html')"
-                        title="Download HTML dashboard">
+                        title="HTML report">
                         <span class="material-icons-round" style="font-size:14px">download</span>
                     </button>
                     <button class="btn outline small" onclick="downloadReport(${ex.id},'excel')"
-                        title="Download Excel">
+                        title="Excel report">
                         <span class="material-icons-round" style="font-size:14px">table_chart</span>
+                    </button>` : ''}
+                    <button class="btn outline small" onclick="deleteExecution(${ex.id})"
+                        title="Delete" style="color:var(--red)">
+                        <span class="material-icons-round" style="font-size:15px">delete</span>
                     </button>
                 </td>
             </tr>`;
         }).join('');
 
-        // Dashboard execution summary panel
-        renderDashExecSummary(execs);
-
     } catch (e) { console.error('loadExecutions error', e); }
+
+    // Always render the dashboard summary — in its OWN try so a chart error can't
+    // silently blank the panel. renderDashExecSummary handles the empty case itself.
+    try {
+        renderDashExecSummary(execs);
+    } catch (e) {
+        console.error('renderDashExecSummary error', e);
+        const el = document.getElementById('dash-exec-summary');
+        if (el) el.innerHTML = `<div style="padding:24px;color:var(--text-muted);font-size:12px">
+            Chart failed to render: ${esc(e && e.message || e)}</div>`;
+    }
 }
 
 function renderDashExecSummary(execs) {
     const el = document.getElementById('dash-exec-summary');
     if (!el) return;
 
-    // Show only script executions (exclude VS/hardware image loads)
     const scriptExecs = (execs || []).filter(ex => !ex.type || ex.type === 'script' || ex.type === 'spytest');
     if (!scriptExecs.length) {
-        el.innerHTML = '<p class="muted" style="text-align:center;padding:20px">No script executions yet.</p>';
+        el.style.display = '';
+        el.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px;gap:8px">
+            <span class="material-icons-round" style="font-size:48px;opacity:0.15">bar_chart</span>
+            <p class="muted" style="margin:0">No script executions yet.</p>
+        </div>`;
         return;
     }
 
-    const recent = scriptExecs.slice(0, 12);
+    // ── Aggregates ──────────────────────────────────────────────────────────
+    const totalRuns = scriptExecs.length;
+    let sumP = 0, sumF = 0, sumS = 0;
+    scriptExecs.forEach(ex => { sumP += ex.passed||0; sumF += ex.failed||0; sumS += ex.skipped||0; });
+    const sumTests  = sumP + sumF + sumS;
+    const passRate  = sumTests ? +((sumP / sumTests) * 100).toFixed(1) : null;
+    const lastEx    = scriptExecs[0];
+    const withDur   = scriptExecs.filter(ex => (ex.duration||0) > 0);
+    const avgDur    = withDur.length ? Math.round(withDur.reduce((a,b) => a+(b.duration||0), 0) / withDur.length) : null;
+    const passColor = passRate == null ? '#94a3b8' : passRate >= 80 ? '#22c55e' : passRate >= 50 ? '#f59e0b' : '#ef4444';
 
-    // Build per-execution stats
-    const data = recent.map(ex => {
-        const p = ex.passed || 0;
-        const f = ex.failed || 0;
-        const s = ex.skipped || 0;
-        return { id: ex.id, name: ex.name, status: ex.status, p, f, s, total: p + f + s };
+    // ── Failure categorisation (heuristic) ──────────────────────────────────
+    let catProd = 0, catAuto = 0, catSys = 0, catInv = 0;
+    scriptExecs.forEach(ex => {
+        const tot = (ex.passed||0)+(ex.failed||0)+(ex.skipped||0);
+        const f   = ex.failed||0;
+        if (!tot && ex.status === 'failed') { catSys++; return; }
+        if (!f) return;
+        const r = f / tot;
+        if (r >= 0.5) catProd++;
+        else if (r <= 0.15) catAuto++;
+        else catInv++;
+    });
+    const catTotal = catProd + catAuto + catSys + catInv;
+
+    // ── Chart data — ALWAYS per BATCH (one bar per execution) ─────────────────
+    // Each bar shows how many SCRIPTS passed / failed / skipped in that batch,
+    // with the batch's duration in the tooltip.
+    const LIMIT = 40;
+    const recent = [...scriptExecs].reverse().slice(-LIMIT);   // oldest→newest, last N
+    const modeLabel = `per batch — last ${recent.length}`;
+    const chartData = recent.map(ex => {
+        const sr = ex.script_results || [];
+        let sp = 0, sf = 0, ss = 0;
+        sr.forEach(r => {
+            const st = (r.status || '').toLowerCase();
+            if (st === 'passed') sp++;
+            else if (st === 'failed') sf++;
+            else ss++;
+        });
+        const hasScripts = sr.length > 0;
+        const testTime = sr.reduce((a, x) => a + (x.duration_s || 0), 0);
+        return {
+            label: `#${ex.id}`, tooltip: `#${ex.id}: ${ex.name}`,
+            // Bar segments: per-script counts (fall back to testcase counts for old data)
+            p: hasScripts ? sp : (ex.passed || 0),
+            f: hasScripts ? sf : (ex.failed || 0),
+            s: hasScripts ? ss : (ex.skipped || 0),
+            dur: ex.duration || 0, testTime,
+            scriptsPassed: sp, scriptsFailed: sf, scriptsSkipped: ss,
+            tcP: ex.passed || 0, tcF: ex.failed || 0, tcS: ex.skipped || 0,
+        };
     });
 
-    const maxTotal = Math.max(...data.map(d => d.total), 1);
-
-    // Chart dimensions
-    const W = 560, H = 200, padL = 38, padR = 10, padT = 14, padB = 44;
-    const chartW = W - padL - padR;
-    const chartH = H - padT - padB;
-    const barGroup = chartW / data.length;
-    const barW = Math.max(Math.min(barGroup * 0.65, 40), 8);
-
-    // Y-axis grid lines & labels
-    const ySteps = 4;
-    let gridLines = '';
-    for (let i = 0; i <= ySteps; i++) {
-        const val = Math.round(maxTotal * i / ySteps);
-        const y = padT + chartH - (chartH * i / ySteps);
-        gridLines += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"
-            stroke="var(--border,#334155)" stroke-width="1" stroke-dasharray="${i === 0 ? '' : '3,3'}"/>
-            <text x="${padL - 5}" y="${y + 4}" text-anchor="end" font-size="9"
-            fill="var(--text-secondary,#94a3b8)">${val}</text>`;
-    }
-
-    // Bars
-    let bars = '';
-    let xLabels = '';
-    data.forEach((d, i) => {
-        const cx = padL + barGroup * i + barGroup / 2;
-        const x0 = cx - barW / 2;
-
-        const hP = d.total ? (d.p / maxTotal) * chartH : 0;
-        const hF = d.total ? (d.f / maxTotal) * chartH : 0;
-        const hS = d.total ? (d.s / maxTotal) * chartH : 0;
-        const baseY = padT + chartH;
-
-        const tooltip = `#${d.id} ${d.name} | ✓${d.p} ✗${d.f} ↷${d.s}`;
-
-        if (d.total === 0) {
-            bars += `<rect x="${x0}" y="${baseY - 2}" width="${barW}" height="2"
-                fill="var(--border,#334155)" rx="1"><title>${tooltip}</title></rect>`;
-        } else {
-            // stacked: skipped bottom, failed middle, passed top
-            let curY = baseY;
-            if (hS > 0) {
-                curY -= hS;
-                bars += `<rect x="${x0}" y="${curY}" width="${barW}" height="${hS}"
-                    fill="#94a3b8" rx="1"><title>${tooltip}</title></rect>`;
-            }
-            if (hF > 0) {
-                curY -= hF;
-                bars += `<rect x="${x0}" y="${curY}" width="${barW}" height="${hF}"
-                    fill="#ef4444"><title>${tooltip}</title></rect>`;
-            }
-            if (hP > 0) {
-                curY -= hP;
-                bars += `<rect x="${x0}" y="${curY}" width="${barW}" height="${hP}"
-                    fill="#22c55e" ${hS === 0 && hF === 0 ? 'rx="2"' : ''}><title>${tooltip}</title></rect>`;
-            }
-        }
-
-        // X-axis label
-        const label = `#${d.id}`;
-        xLabels += `<text x="${cx}" y="${padT + chartH + 14}" text-anchor="middle"
-            font-size="9" fill="var(--text-secondary,#94a3b8)">${label}</text>`;
-    });
-
-    // Legend
-    const legend = `<div style="display:flex;gap:16px;justify-content:center;margin-top:6px;font-size:11px">
-        <span style="display:flex;align-items:center;gap:4px">
-            <span style="width:10px;height:10px;background:#22c55e;border-radius:2px;display:inline-block"></span>
-            <span style="color:var(--text-secondary)">Passed</span>
-        </span>
-        <span style="display:flex;align-items:center;gap:4px">
-            <span style="width:10px;height:10px;background:#ef4444;border-radius:2px;display:inline-block"></span>
-            <span style="color:var(--text-secondary)">Failed</span>
-        </span>
-        <span style="display:flex;align-items:center;gap:4px">
-            <span style="width:10px;height:10px;background:#94a3b8;border-radius:2px;display:inline-block"></span>
-            <span style="color:var(--text-secondary)">Skipped</span>
-        </span>
+    // ── KPI cards ──────────────────────────────────────────────────────────
+    const _kpiCard = (label, value, sub, bg, border, accent) =>
+        `<div style="background:${bg};border:1px solid ${border};border-left:3px solid ${accent};border-radius:6px;padding:5px 9px">
+            <div style="font-size:8px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);line-height:1.6">${label}</div>
+            <div style="font-size:15px;font-weight:700;color:${accent};line-height:1.25">${value}</div>
+            <div style="font-size:8px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${sub}</div>
+        </div>`;
+    const kpi = `<div style="display:grid;grid-template-columns:repeat(4,minmax(0,118px));gap:6px;margin-bottom:10px;justify-content:start">
+        ${_kpiCard('Total Launches', totalRuns.toLocaleString(), sumTests.toLocaleString()+' cases', 'rgba(59,130,246,0.08)', 'rgba(59,130,246,0.22)', '#3b82f6')}
+        ${_kpiCard('Pass Rate', passRate != null ? passRate+'%' : '—', `✓${sumP.toLocaleString()} ✗${sumF.toLocaleString()} ↷${sumS.toLocaleString()}`, `rgba(${passRate==null?'148,163,184':passRate>=80?'34,197,94':passRate>=50?'245,158,11':'239,68,68'},0.08)`, `rgba(${passRate==null?'148,163,184':passRate>=80?'34,197,94':passRate>=50?'245,158,11':'239,68,68'},0.22)`, passColor)}
+        ${_kpiCard('Total Failures', sumF.toLocaleString(), 'across all launches', 'rgba(239,68,68,0.08)', 'rgba(239,68,68,0.22)', '#ef4444')}
+        ${_kpiCard('Avg Duration', avgDur ? _fmtDurShort(avgDur) : '—', 'per launch', 'rgba(139,92,246,0.08)', 'rgba(139,92,246,0.22)', '#8b5cf6')}
     </div>`;
 
-    el.innerHTML = `
-        <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
-            ${gridLines}
-            ${bars}
-            ${xLabels}
-            <!-- Y-axis line -->
-            <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + chartH}"
-                stroke="var(--border,#334155)" stroke-width="1"/>
-        </svg>
-        ${legend}`;
+    // ── Main stacked bar ────────────────────────────────────────────────────
+    const W = 560, H = 150;
+    const maxValBar = Math.max(...chartData.map(d => d.p+d.f+d.s), 1);
+    const { ticks: bt, niceMax: bNM } = _niceAxisTicks(maxValBar);
+    const yLW = bt[bt.length-1] >= 10000 ? 44 : bt[bt.length-1] >= 1000 ? 38 : bt[bt.length-1] >= 100 ? 30 : 24;
+    const bpL = yLW+4, bpR = 8, bpT = 8, bpB = 28;
+    const bcW = W-bpL-bpR, bcH = H-bpT-bpB;
+    const bn = chartData.length, bgrp = bcW/bn;
+    const bw = Math.max(Math.min(bgrp*0.72, 38), 3);
+    // Gradient defs for colourful bars
+    const svgDefs = `<defs>
+        <linearGradient id="dg-p" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#4ade80"/><stop offset="100%" stop-color="#15803d"/></linearGradient>
+        <linearGradient id="dg-f" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#f87171"/><stop offset="100%" stop-color="#b91c1c"/></linearGradient>
+        <linearGradient id="dg-s" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#94a3b8"/><stop offset="100%" stop-color="#475569"/></linearGradient>
+    </defs>`;
+    let bGrid = '', bBars = '', bX = '';
+    bt.forEach(val => {
+        const y = bpT+bcH-(val/bNM)*bcH;
+        const lbl = val >= 1000 ? (val/1000)+'k' : String(val);
+        bGrid += `<line x1="${bpL}" y1="${y}" x2="${W-bpR}" y2="${y}" stroke="rgba(148,163,184,${val===0?'.2':'.08'})" stroke-width="1" ${val>0?'stroke-dasharray="4,3"':''}/>
+            <text x="${bpL-5}" y="${y+3.5}" text-anchor="end" font-size="9" fill="rgba(148,163,184,.65)">${lbl}</text>`;
+    });
+    const bls = bn > 24 ? Math.ceil(bn/16) : 1;
+    // Rich tooltip: launch, breakdown, pass-rate AND duration — merged into one graph
+    const _tip = d => {
+        const st = (d.scriptsPassed || 0) + (d.scriptsFailed || 0) + (d.scriptsSkipped || 0);
+        const srate = st ? ((d.scriptsPassed / st) * 100).toFixed(0) + '%' : '—';
+        const elapsed = d.dur ? _fmtDurShort(d.dur) : '—';
+        const testT = d.testTime ? _fmtDurShort(d.testTime) : '—';
+        return `${d.tooltip}\n──────────────\n`
+            + `Scripts:   ✓${d.scriptsPassed || 0}  ✗${d.scriptsFailed || 0}  ↷${d.scriptsSkipped || 0}  (${srate} pass)\n`
+            + `Testcases: ✓${d.tcP || 0}  ✗${d.tcF || 0}  ↷${d.tcS || 0}\n`
+            + `⏱ Duration: ${elapsed}   ⧗ Test time: ${testT}`;
+    };
+    // Full-width invisible hover zone per launch so the tooltip shows anywhere over the column
+    chartData.forEach((d, i) => {
+        const cx = bpL+bgrp*i+bgrp/2, x0 = cx-bw/2, tot = d.p+d.f+d.s;
+        const tip = _tip(d);
+        if (!tot) { bBars += `<rect x="${x0}" y="${bpT+bcH-2}" width="${bw}" height="2" fill="rgba(148,163,184,.15)" rx="1"><title>${tip}</title></rect>`; }
+        else {
+            let cy = bpT+bcH;
+            const hS=(d.s/bNM)*bcH, hF=(d.f/bNM)*bcH, hP=(d.p/bNM)*bcH;
+            if(hS>0.5){cy-=hS;bBars+=`<rect x="${x0}" y="${cy}" width="${bw}" height="${hS}" fill="url(#dg-s)"><title>${tip}</title></rect>`;}
+            if(hF>0.5){cy-=hF;bBars+=`<rect x="${x0}" y="${cy}" width="${bw}" height="${hF}" fill="url(#dg-f)"><title>${tip}</title></rect>`;}
+            if(hP>0.5){cy-=hP;bBars+=`<rect x="${x0}" y="${cy}" width="${bw}" height="${hP}" fill="url(#dg-p)" rx="${hS<0.5&&hF<0.5?2:0}"><title>${tip}</title></rect>`;}
+        }
+        // transparent overlay covering the whole column height for easy hovering
+        bBars += `<rect x="${bpL+bgrp*i}" y="${bpT}" width="${bgrp}" height="${bcH}" fill="transparent"><title>${tip}</title></rect>`;
+        if(i%bls===0||i===bn-1) bX+=`<text x="${cx}" y="${bpT+bcH+13}" text-anchor="middle" font-size="${bn>20?7.5:9}" fill="rgba(148,163,184,.7)">${d.label}</text>`;
+    });
+    const bAxes = `<line x1="${bpL}" y1="${bpT}" x2="${bpL}" y2="${bpT+bcH}" stroke="rgba(148,163,184,.25)" stroke-width="1"/>
+        <line x1="${bpL}" y1="${bpT+bcH}" x2="${W-bpR}" y2="${bpT+bcH}" stroke="rgba(148,163,184,.25)" stroke-width="1"/>`;
+    const mainBarSvg = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;overflow:visible">${svgDefs}${bGrid}${bAxes}${bBars}${bX}</svg>`;
+
+    const legend = `<div style="display:flex;align-items:center;gap:12px;justify-content:center;margin-top:4px;flex-wrap:wrap">
+        <span style="display:flex;align-items:center;gap:3px;font-size:9px;color:var(--text-secondary)"><span style="width:8px;height:8px;background:linear-gradient(#4ade80,#15803d);border-radius:2px;display:inline-block"></span>Passed</span>
+        <span style="display:flex;align-items:center;gap:3px;font-size:9px;color:var(--text-secondary)"><span style="width:8px;height:8px;background:linear-gradient(#f87171,#b91c1c);border-radius:2px;display:inline-block"></span>Failed</span>
+        <span style="display:flex;align-items:center;gap:3px;font-size:9px;color:var(--text-secondary)"><span style="width:8px;height:8px;background:linear-gradient(#94a3b8,#475569);border-radius:2px;display:inline-block"></span>Skipped</span>
+        <span style="font-size:9px;color:var(--text-muted)">${modeLabel}</span>
+    </div>`;
+
+    // ── Trend charts ─────────────────────────────────────────────────────────
+    const rateData = chartData.map(d => {
+        const tot = d.p+d.f+d.s;
+        return { label: d.label, v: tot ? +((d.p/tot)*100).toFixed(1) : null };
+    });
+    const failData = chartData.map(d => ({ label: d.label, v: d.f }));
+
+    const rateSvg = _svgLine(rateData, 560, 100, { yMax: 100, suffix: '%', color: '#22c55e', fill: 'rgba(34,197,94,0.22)' });
+    const failSvg = _svgLine(failData, 560, 100, { color: '#ef4444', fill: 'rgba(239,68,68,0.22)' });
+
+    // ── Assemble ─────────────────────────────────────────────────────────────
+    const secH = lbl => `<div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);margin-bottom:4px">${lbl}</div>`;
+
+    const _panel = (accent, r, g, b, content) =>
+        `<div style="background:rgba(${r},${g},${b},0.05);border:1px solid rgba(${r},${g},${b},0.18);border-top:2px solid rgba(${r},${g},${b},0.55);border-radius:8px;padding:8px">${content}</div>`;
+
+    const secHhint = (lbl, hint) => `<div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px">
+        <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted)">${lbl}</span>
+        <span style="font-size:8px;color:var(--text-muted);font-style:italic">${hint}</span>
+    </div>`;
+
+    el.style.display = 'block';
+    el.innerHTML = kpi
+        + _panel('blue',59,130,246,
+            secHhint('Scripts Passed / Failed per Batch','hover a bar for scripts, testcases &amp; duration')
+            + mainBarSvg + legend)
+        + `<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+            ${_panel('green',34,197,94,secH('Pass Rate Trend')+rateSvg)}
+            ${_panel('red',239,68,68,secH('Failed Cases Trend')+failSvg)}
+        </div>`;
+}
+
+function _niceAxisTicks(maxVal, target = 5) {
+    if (maxVal <= 0) return { ticks: [0], niceMax: 1 };
+    // For small integers keep every integer tick to avoid duplicates
+    if (maxVal < target) {
+        const ticks = Array.from({ length: maxVal + 1 }, (_, i) => i);
+        return { ticks, niceMax: maxVal };
+    }
+    const roughStep = maxVal / target;
+    const mag = Math.pow(10, Math.floor(Math.log10(roughStep)));
+    const step = [1, 2, 5, 10].map(n => n * mag).find(s => s >= roughStep) || mag * 10;
+    const niceMax = Math.ceil(maxVal / step) * step;
+    const ticks = [];
+    for (let v = 0; v <= niceMax + step * 0.01; v += step) {
+        const t = Math.round(v);
+        if (!ticks.length || ticks[ticks.length - 1] !== t) ticks.push(t);
+        if (ticks.length > 12) break;
+    }
+    return { ticks, niceMax };
+}
+
+function _fmtDayLabel(isoDate) {
+    if (!isoDate || isoDate === 'unknown') return '?';
+    try {
+        const [y, m, d] = isoDate.split('-').map(Number);
+        return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    } catch { return isoDate.slice(5); }
+}
+
+function _fmtDurShort(seconds) {
+    if (!seconds) return '—';
+    if (seconds < 60)   return `${Math.round(seconds)}s`;
+    if (seconds < 3600) return `${Math.floor(seconds/60)}m${seconds%60?(seconds%60)+'s':''}`;
+    return `${Math.floor(seconds/3600)}h${Math.floor((seconds%3600)/60)?Math.floor((seconds%3600)/60)+'m':''}`;
+}
+
+function _svgDonut(slices) {
+    const W = 156, H = 140;
+    const cx = 78, cy = 65, R = 50, SW = 15;
+    const C = 2 * Math.PI * R;
+    const total = slices.reduce((a, b) => a + b.v, 0);
+    if (!total) return `<svg viewBox="0 0 ${W} ${H}" style="display:block;width:100%">
+        <circle cx="${cx}" cy="${cy}" r="${R}" fill="none" stroke="rgba(148,163,184,.07)" stroke-width="${SW}"/>
+        <text x="${cx}" y="${cy+4}" text-anchor="middle" font-size="9" fill="rgba(148,163,184,.35)">No data</text>
+    </svg>`;
+    const pass = slices.find(s => s.label === 'Passed');
+    const passPct = pass ? Math.round((pass.v/total)*100) : 0;
+    const passColor = pass ? pass.color : '#22c55e';
+    let cumDash = 0;
+    const rings = slices.filter(s => s.v > 0).map(s => {
+        const dash = (s.v/total)*C;
+        const offset = -cumDash;
+        cumDash += dash;
+        return `<circle cx="${cx}" cy="${cy}" r="${R}" fill="none" stroke="${s.color}" stroke-width="${SW}" opacity="0.88"
+            stroke-dasharray="${dash.toFixed(2)} ${(C-dash+0.01).toFixed(2)}"
+            stroke-dashoffset="${offset.toFixed(2)}">
+            <title>${s.label}: ${s.v.toLocaleString()} (${((s.v/total)*100).toFixed(1)}%)</title>
+        </circle>`;
+    }).join('');
+    const legItems = slices.map((s, i) => {
+        const x = 6 + i * 50;
+        return `<rect x="${x}" y="${H-13}" width="7" height="7" fill="${s.color}" rx="1" opacity="0.85"/>
+            <text x="${x+10}" y="${H-6}" font-size="7.5" fill="rgba(148,163,184,.7)">${s.label}</text>`;
+    }).join('');
+    return `<svg viewBox="0 0 ${W} ${H}" style="display:block;width:100%">
+        <circle cx="${cx}" cy="${cy}" r="${R}" fill="none" stroke="rgba(148,163,184,.06)" stroke-width="${SW}"/>
+        <g transform="rotate(-90 ${cx} ${cy})">${rings}</g>
+        <text x="${cx}" y="${cy-4}" text-anchor="middle" font-size="18" font-weight="700" fill="${passColor}">${passPct}%</text>
+        <text x="${cx}" y="${cy+10}" text-anchor="middle" font-size="7.5" fill="rgba(148,163,184,.55)">PASS RATE</text>
+        ${legItems}
+    </svg>`;
+}
+
+function _svgLine(data, W, H, opts = {}) {
+    const { color = '#3b82f6', fill = 'rgba(59,130,246,0.1)', yMax, suffix = '' } = opts;
+    const pL = 32, pR = 6, pT = 6, pB = 20;
+    const cW = W-pL-pR, cH = H-pT-pB, n = data.length;
+    if (!n) return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block"></svg>`;
+    const vals = data.map(d => d.v).filter(v => v !== null && v !== undefined);
+    const raw = vals.length ? Math.max(...vals) : 1;
+    const usedMax = yMax !== undefined ? yMax : raw || 1;
+    const { ticks: lt, niceMax: drawMax } = yMax !== undefined
+        ? { ticks: [0,25,50,75,100], niceMax: 100 }
+        : _niceAxisTicks(usedMax);
+    let grid = '';
+    lt.forEach(v => {
+        const y = pT+cH-(v/drawMax)*cH;
+        const lbl = yMax !== undefined ? `${v}${suffix}` : (v>=1000?(v/1000)+'k':String(v));
+        grid += `<line x1="${pL}" y1="${y}" x2="${W-pR}" y2="${y}" stroke="rgba(148,163,184,.07)" stroke-width="1"/>
+            <text x="${pL-3}" y="${y+3}" text-anchor="end" font-size="7.5" fill="rgba(148,163,184,.55)">${lbl}</text>`;
+    });
+    const xOf = i => pL + (n > 1 ? (i/(n-1))*cW : cW/2);
+    const yOf = v => pT + cH - (v/drawMax)*cH;
+    const pts = data.map((d, i) => ({ x: xOf(i), y: (d.v !== null && d.v !== undefined) ? yOf(d.v) : null, d }));
+    const vp = pts.filter(p => p.y !== null);
+    let pathD = '', areaD = '';
+    vp.forEach((p, i) => { pathD += i===0 ? `M${p.x} ${p.y}` : ` L${p.x} ${p.y}`; });
+    if (vp.length > 1) areaD = pathD + ` L${vp[vp.length-1].x} ${pT+cH} L${vp[0].x} ${pT+cH}Z`;
+    const dots = vp.map(p =>
+        `<circle cx="${p.x}" cy="${p.y}" r="2.2" fill="${color}"><title>${p.d.label}: ${p.d.v!==null?(p.d.v.toFixed?p.d.v.toFixed(1):p.d.v):'—'}${suffix}</title></circle>`
+    ).join('');
+    const ls = n>18?Math.ceil(n/10):n>8?2:1;
+    let xSvg='';
+    data.forEach((d,i)=>{
+        if(i%ls===0||i===n-1) xSvg+=`<text x="${xOf(i)}" y="${pT+cH+13}" text-anchor="middle" font-size="7" fill="rgba(148,163,184,.55)">${d.label}</text>`;
+    });
+    const axes = `<line x1="${pL}" y1="${pT}" x2="${pL}" y2="${pT+cH}" stroke="rgba(148,163,184,.18)" stroke-width="1"/>
+        <line x1="${pL}" y1="${pT+cH}" x2="${W-pR}" y2="${pT+cH}" stroke="rgba(148,163,184,.18)" stroke-width="1"/>`;
+    return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;overflow:visible">
+        ${grid}${axes}
+        ${areaD?`<path d="${areaD}" fill="${fill}" stroke="none"/>`:''}
+        ${pathD?`<path d="${pathD}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round"/>`:''}
+        ${dots}${xSvg}
+    </svg>`;
+}
+
+function _svgSimpleBar(data, W, H, opts = {}) {
+    const { color = '#8b5cf6', color2 = null, yFmt = v => String(v) } = opts;
+    const pL = 40, pR = 6, pT = 6, pB = 20;
+    const cW = W-pL-pR, cH = H-pT-pB, n = data.length;
+    if (!n) return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block"></svg>`;
+    const maxV = Math.max(...data.map(d=>d.v||0), 1);
+    const { ticks, niceMax } = _niceAxisTicks(maxV);
+    const gradDef = color2 ? `<defs><linearGradient id="dg-sb" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${color}"/><stop offset="100%" stop-color="${color2}"/></linearGradient></defs>` : '';
+    const fillRef = color2 ? 'url(#dg-sb)' : color;
+    let grid='';
+    ticks.forEach(v => {
+        const y = pT+cH-(v/niceMax)*cH;
+        grid += `<line x1="${pL}" y1="${y}" x2="${W-pR}" y2="${y}" stroke="rgba(148,163,184,.07)" stroke-width="1"/>
+            <text x="${pL-3}" y="${y+3}" text-anchor="end" font-size="7.5" fill="rgba(148,163,184,.55)">${yFmt(v)}</text>`;
+    });
+    const bg=cW/n, bw=Math.max(Math.min(bg*0.7,32),2);
+    const ls=n>18?Math.ceil(n/10):n>8?2:1;
+    let bars='', xSvg='';
+    data.forEach((d,i)=>{
+        const cx=pL+bg*i+bg/2, h=((d.v||0)/niceMax)*cH;
+        bars += h>0.5
+            ? `<rect x="${cx-bw/2}" y="${pT+cH-h}" width="${bw}" height="${h}" fill="${fillRef}" rx="2"><title>${d.label}: ${yFmt(d.v)}</title></rect>`
+            : `<rect x="${cx-bw/2}" y="${pT+cH-2}" width="${bw}" height="2" fill="rgba(148,163,184,.12)" rx="1"/>`;
+        if(i%ls===0||i===n-1) xSvg+=`<text x="${cx}" y="${pT+cH+13}" text-anchor="middle" font-size="7" fill="rgba(148,163,184,.55)">${d.label}</text>`;
+    });
+    const axes = `<line x1="${pL}" y1="${pT}" x2="${pL}" y2="${pT+cH}" stroke="rgba(148,163,184,.18)" stroke-width="1"/>
+        <line x1="${pL}" y1="${pT+cH}" x2="${W-pR}" y2="${pT+cH}" stroke="rgba(148,163,184,.18)" stroke-width="1"/>`;
+    return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;overflow:visible">
+        ${gradDef}${grid}${axes}${bars}${xSvg}
+    </svg>`;
 }
 
 // ── Compare ────────────────────────────────────────────────────────────────
 
 function onCompareCheck(checkbox) {
     const id = parseInt(checkbox.dataset.id);
-    if (checkbox.checked) {
-        if (_compareSelected.size >= 2) {
-            // Deselect oldest
-            const oldest = [..._compareSelected][0];
-            _compareSelected.delete(oldest);
-            const oldChk = document.querySelector(`.cmp-chk[data-id="${oldest}"]`);
-            if (oldChk) oldChk.checked = false;
-        }
-        _compareSelected.add(id);
-    } else {
-        _compareSelected.delete(id);
-    }
-    const btn = document.getElementById('btn-compare-selected');
-    if (btn) btn.style.display = _compareSelected.size === 2 ? '' : 'none';
+    if (checkbox.checked) _compareSelected.add(id);
+    else _compareSelected.delete(id);
+    _syncLogsHeaderBtns();
 }
 
 function toggleAllCompare(masterChk) {
-    const chks = document.querySelectorAll('.cmp-chk');
     _compareSelected.clear();
-    chks.forEach(c => { c.checked = false; });
-    if (masterChk.checked) {
-        let count = 0;
-        chks.forEach(c => {
-            if (count < 2) { c.checked = true; _compareSelected.add(parseInt(c.dataset.id)); count++; }
-        });
+    document.querySelectorAll('.cmp-chk').forEach(c => {
+        c.checked = masterChk.checked;
+        if (masterChk.checked) _compareSelected.add(parseInt(c.dataset.id));
+    });
+    _syncLogsHeaderBtns();
+}
+
+function _syncLogsHeaderBtns() {
+    const n = _compareSelected.size;
+    const compareBtn = document.getElementById('btn-compare-selected');
+    const deleteBtn  = document.getElementById('btn-delete-selected');
+    const countSpan  = document.getElementById('del-selected-count');
+    if (compareBtn) compareBtn.style.display = n === 2 ? '' : 'none';
+    if (deleteBtn) {
+        const active = n >= 1;
+        deleteBtn.style.opacity       = active ? '1' : '0.35';
+        deleteBtn.style.pointerEvents = active ? '' : 'none';
+        deleteBtn.style.cursor        = active ? '' : 'not-allowed';
     }
-    const btn = document.getElementById('btn-compare-selected');
-    if (btn) btn.style.display = _compareSelected.size === 2 ? '' : 'none';
+    if (countSpan) countSpan.textContent = n >= 1 ? ` (${n})` : '';
 }
 
 async function runComparison() {
@@ -3575,6 +4120,7 @@ function renderComparePanel(data) {
     if (!panel || !body) return;
     title.textContent = `Run #${data.run_a.id} vs Run #${data.run_b.id}`;
     panel.style.display = '';
+    setTimeout(() => panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 80);
 
     const section = (label, color, icon, items) => {
         if (!items.length) return '';
@@ -3615,8 +4161,6 @@ function renderComparePanel(data) {
         ((!data.regressed.length && !data.new_failures.length && !data.fixed.length)
             ? '<p class="muted" style="text-align:center;padding:20px">No regressions or fixes found between these two runs.</p>'
             : '');
-
-    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function closeComparePanel() {
@@ -3735,28 +4279,92 @@ function showTcPopover(row, encoded) {
     }, 10);
 }
 
+// ── Execution delete helpers ──────────────────────────────────────────────────
+
+async function deleteExecution(id) {
+    if (!confirm(`Delete execution #${id}?\nThis permanently removes the record and all its logs.`)) return;
+    try {
+        const res = await fetch(`${API}/api/executions/${id}/logs`, {
+            method: 'DELETE',
+            headers: { ...getSessionHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scope: 'all' }),
+        });
+        if (res.ok) {
+            toast(`Execution #${id} deleted`, 'success');
+            if (currentExecId && Number(currentExecId) === Number(id)) {
+                currentExecId = null; currentExecActive = false;
+            }
+            _compareSelected.delete(id);
+            _syncLogsHeaderBtns();
+            loadExecutions();
+        } else {
+            const err = await res.json().catch(() => ({}));
+            toast(err.detail || 'Delete failed', 'error');
+        }
+    } catch (e) { toast(`Delete error: ${e.message}`, 'error'); }
+}
+
+async function deleteSelectedExecutions() {
+    const ids = [..._compareSelected];
+    if (!ids.length) { toast('Select at least one execution', 'warning'); return; }
+    if (!confirm(`Delete ${ids.length} execution(s)?\nThis permanently removes all selected records and logs.`)) return;
+
+    let ok = 0, fail = 0;
+    for (const id of ids) {
+        try {
+            const res = await fetch(`${API}/api/executions/${id}/logs`, {
+                method: 'DELETE',
+                headers: { ...getSessionHeaders(), 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scope: 'all' }),
+            });
+            res.ok ? ok++ : fail++;
+        } catch { fail++; }
+    }
+
+    if (fail) toast(`${ok} deleted, ${fail} failed`, 'error');
+    else toast(`${ok} execution(s) deleted`, 'success');
+
+    _compareSelected.clear();
+    _syncLogsHeaderBtns();
+    loadExecutions();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Store current viewing execution ID for delete operations
 let currentViewingExecId = null;
 
 async function viewExecLogs(execId) {
     try {
         currentViewingExecId = execId;
-        const res = await fetch(`${API}/api/executions/${execId}/logs?limit=500`, {
-            headers: getSessionHeaders()
-        });
-        const logs = await res.json();
-
         // Show modal instead of inline card
         const overlay = document.getElementById('log-detail-modal-overlay');
         overlay.classList.add('active');
-
         document.getElementById('log-detail-title').textContent = `#${execId}`;
         const container = document.getElementById('log-detail-container');
-        if (!logs.length) {
+        container.innerHTML = '<p class="muted" style="padding:20px;">Loading logs…</p>';
+
+        // Fetch ALL logs (every script), paging by id — the endpoint caps each page,
+        // so a single limited request only showed the first script's lines.
+        const all = [];
+        let after = 0;
+        for (let page = 0; page < 500; page++) {   // hard guard: up to 500 pages
+            const res = await fetch(`${API}/api/executions/${execId}/logs?after_id=${after}&limit=2000`, {
+                headers: getSessionHeaders()
+            });
+            if (!res.ok) break;
+            const rows = await res.json();
+            if (!Array.isArray(rows) || rows.length === 0) break;
+            all.push(...rows);
+            after = rows[rows.length - 1].id;
+            if (rows.length < 2000) break;   // last page reached
+        }
+
+        if (!all.length) {
             container.innerHTML = '<p class="muted" style="padding:20px;">No logs for this execution.</p>';
             return;
         }
-        container.innerHTML = logs.map(logHTML).join('');
+        container.innerHTML = all.map(logHTML).join('');
     } catch (e) {
         toast('Failed to load logs', 'error');
         console.error('Error loading logs:', e);
@@ -3772,122 +4380,26 @@ function closeLogViewer() {
     currentViewingExecId = null;
 }
 
-/**
- * Delete logs with confirmation dialog asking what to delete
- */
 async function deleteLogs() {
-    if (!currentViewingExecId) {
-        toast('No logs selected', 'warning');
-        return;
-    }
-
-    // First confirmation: confirm delete action
-    const confirmDelete = confirm(`⚠️ Delete all logs for execution #${currentViewingExecId}?\n\nThis cannot be undone.`);
-    if (!confirmDelete) return;
-
-    // Second confirmation: ask what to delete (all or specific logs)
-    const options = {
-        'all': 'Delete ALL logs for this execution',
-        'current_session': 'Delete logs from current session only',
-        'cancel': 'Cancel (do not delete)'
-    };
-
-    // Create choice dialog
-    const choice = await showDeleteChoiceDialog(
-        `What logs do you want to delete for execution #${currentViewingExecId}?`,
-        options
-    );
-
-    if (choice === 'cancel' || !choice) {
-        toast('Delete cancelled', 'info');
-        return;
-    }
-
-    // Proceed with deletion
+    if (!currentViewingExecId) return;
     try {
         const res = await fetch(`${API}/api/executions/${currentViewingExecId}/logs`, {
             method: 'DELETE',
-            headers: getSessionHeaders(),
-            body: JSON.stringify({ scope: choice })
+            headers: { ...getSessionHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scope: 'all' }),
         });
-
         if (res.ok) {
-            toast(`✓ Logs deleted (scope: ${choice})`, 'success');
-            // If the Execute tab is still tracking the execution we just deleted, drop the
-            // stale pointer so a later script uncheck won't fire cancel against a dead id
-            // (Session 14 — "Failed to cancel: Execution not found").
+            toast(`Execution #${currentViewingExecId} deleted`, 'success');
             if (currentExecId && Number(currentExecId) === Number(currentViewingExecId)) {
-                currentExecId = null;
-                currentExecActive = false;
+                currentExecId = null; currentExecActive = false;
             }
             closeLogViewer();
-            // Refresh execution history
             loadExecutions();
         } else {
-            const err = await res.json();
-            toast(`Failed to delete logs: ${err.detail}`, 'error');
+            const err = await res.json().catch(() => ({}));
+            toast(err.detail || 'Delete failed', 'error');
         }
-    } catch (e) {
-        toast(`Error deleting logs: ${e.message}`, 'error');
-        console.error('Delete logs error:', e);
-    }
-}
-
-/**
- * Show custom delete choice dialog
- * Returns: 'all', 'current_session', or null if cancelled
- */
-async function showDeleteChoiceDialog(message, options) {
-    return new Promise((resolve) => {
-        // Create modal overlay
-        const overlay = document.createElement('div');
-        overlay.className = 'modal-overlay active';
-        overlay.id = 'delete-choice-overlay';
-
-        const modal = document.createElement('div');
-        modal.className = 'modal';
-        modal.style.maxWidth = '500px';
-
-        modal.innerHTML = `
-            <div class="modal-header">
-                <h3><span class="material-icons-round">delete_forever</span> Delete Logs</h3>
-                <button class="btn icon" onclick="document.getElementById('delete-choice-overlay').remove()" title="Close">
-                    <span class="material-icons-round">close</span>
-                </button>
-            </div>
-            <div class="modal-body">
-                <p style="margin-bottom: 16px; color: var(--text-secondary);">${message}</p>
-                <div style="display: flex; flex-direction: column; gap: 8px;">
-                    <button class="btn outline" onclick="deleteChoiceClick('all')" style="justify-content: flex-start;">
-                        <span class="material-icons-round">delete_sweep</span> ${options['all']}
-                    </button>
-                    <button class="btn outline" onclick="deleteChoiceClick('current_session')" style="justify-content: flex-start;">
-                        <span class="material-icons-round">filter_alt</span> ${options['current_session']}
-                    </button>
-                    <button class="btn outline" onclick="deleteChoiceClick('cancel')" style="justify-content: flex-start;">
-                        <span class="material-icons-round">close</span> ${options['cancel']}
-                    </button>
-                </div>
-            </div>
-        `;
-
-        overlay.appendChild(modal);
-        document.body.appendChild(overlay);
-
-        // Close on backdrop click
-        overlay.addEventListener('click', (e) => {
-            if (e.target === overlay) {
-                overlay.remove();
-                resolve(null);
-            }
-        });
-
-        // Store resolve function globally to be called from buttons
-        window.deleteChoiceClick = (choice) => {
-            document.getElementById('delete-choice-overlay')?.remove();
-            resolve(choice);
-        };
-    });
+    } catch (e) { toast(`Delete error: ${e.message}`, 'error'); }
 }
 
 // ============================================================
@@ -3896,19 +4408,19 @@ async function showDeleteChoiceDialog(message, options) {
 
 function renderTermDUTList() {
     const sel = document.getElementById('term-dut');
-    const current = sel.value;
+    if (!sel) return;
     // Terminal tab: only show online SSH devices — offline or telnet devices
     // cannot open a PTY session.
     const allSsh = dutsData.filter(d => d.connection_type !== 'telnet');
     const onlineSsh = allSsh.filter(d => d.status === 'online');
     const offlineCount = allSsh.length - onlineSsh.length;
 
-    sel.innerHTML = '<option value="">-- Select Device --</option>';
+    sel.innerHTML = '<option value="">+ Connect Device…</option>';
     onlineSsh.forEach(d => {
         const opt = document.createElement('option');
         opt.value = d.id;
-        opt.textContent = `\u{1F7E2} ${d.name} (${d.ip_address})`;
-        opt.selected = d.id == current;
+        const isOpen = !!termSessions[String(d.id)];
+        opt.textContent = `\u{1F7E2} ${d.name} (${d.ip_address})${isOpen ? ' — connected' : ''}`;
         sel.appendChild(opt);
     });
     if (offlineCount > 0) {
@@ -3917,10 +4429,84 @@ function renderTermDUTList() {
         divider.textContent = `\u2014 ${offlineCount} offline device${offlineCount > 1 ? 's' : ''} hidden \u2014`;
         sel.appendChild(divider);
     }
-    // If the previously selected device is now offline, clear it
-    if (current && !onlineSsh.find(d => d.id == current)) {
-        sel.value = '';
+    sel.value = '';  // stay a pure "add" control
+}
+
+// ── Multi-session terminal: tab bar ──────────────────────────────────────────
+function renderTermTabs() {
+    const bar = document.getElementById('term-tabs');
+    const empty = document.getElementById('term-empty');
+    if (!bar) return;
+    const ids = Object.keys(termSessions);
+    if (ids.length === 0) {
+        bar.style.display = 'none';
+        bar.innerHTML = '';
+        if (empty) empty.style.display = '';
+        return;
     }
+    bar.style.display = 'flex';
+    if (empty) empty.style.display = 'none';
+    bar.innerHTML = ids.map(id => {
+        const s = termSessions[id];
+        const active = id === termActiveDutId ? ' active' : '';
+        const dot = s.connected ? '#0dbc79' : (s.reconnecting ? '#e5e510' : '#f14c4c');
+        return `<div class="term-tab${active}" onclick="termActivate('${id}')" title="${esc(s.name)}">
+            <span class="term-tab-dot" style="background:${dot}"></span>
+            <span class="term-tab-label">${esc(s.name)}</span>
+            <span class="term-tab-close" onclick="event.stopPropagation();termCloseSession('${id}')" title="Close session">&times;</span>
+        </div>`;
+    }).join('');
+}
+
+// Show one session's pane, hide the rest; fit + focus the active terminal.
+function termActivate(dutId) {
+    dutId = String(dutId);
+    const s = termSessions[dutId];
+    if (!s) return;
+    termActiveDutId = dutId;
+    Object.keys(termSessions).forEach(id => {
+        const sess = termSessions[id];
+        if (sess.pane) sess.pane.style.display = (id === dutId) ? 'block' : 'none';
+    });
+    renderTermTabs();
+    setTimeout(() => {
+        try { s.fitAddon && s.fitAddon.fit(); } catch (_) {}
+        try { s.term && s.term.focus(); } catch (_) {}
+    }, 30);
+}
+
+// Called by the dropdown: open a new session for the chosen device (or focus it
+// if already open). The dropdown then resets to the "add" placeholder.
+async function termAddDevice() {
+    const sel = document.getElementById('term-dut');
+    const dutId = sel ? String(sel.value) : '';
+    if (sel) sel.value = '';
+    if (!dutId) return;
+
+    if (termSessions[dutId]) { termActivate(dutId); return; }
+
+    const dev = dutsData.find(d => String(d.id) === dutId);
+    const name = dev ? `${dev.name}` : `DUT ${dutId}`;
+
+    const panes = document.getElementById('term-panes');
+    const empty = document.getElementById('term-empty');
+    if (empty) empty.style.display = 'none';
+    const pane = document.createElement('div');
+    pane.className = 'term-pane';
+    pane.id = `term-pane-${dutId}`;
+    pane.style.cssText = 'height:100%;width:100%;padding:10px;box-sizing:border-box;background:#1e1e1e;';
+    panes.appendChild(pane);
+
+    const session = {
+        dutId, name, term: null, socket: null, fitAddon: null,
+        pane, outputBuffer: [], reconnecting: false, resizeObserver: null,
+        generation: 0, connected: false,
+    };
+    termSessions[dutId] = session;
+    renderTermDUTList();
+    termActivate(dutId);
+
+    await initPTYSession(session);
 }
 
 /**
@@ -3964,13 +4550,10 @@ async function loadXtermLibrary() {
 }
 
 /**
- * Initialize PTY terminal with xterm.js for a specific device
- * Creates WebSocket connection for bidirectional terminal streaming
+ * Initialize a PTY xterm session for ONE device (multi-session aware).
+ * All state lives on the `session` object so many devices run concurrently.
  */
-async function initPTYTerminal(dutId) {
-    console.log(`[PTY] Initializing terminal for DUT ${dutId}`);
-
-    // Ensure xterm.js library is loaded
+async function initPTYSession(session) {
     try {
         await loadXtermLibrary();
     } catch (e) {
@@ -3978,299 +4561,169 @@ async function initPTYTerminal(dutId) {
         toast('Failed to load terminal library', 'error');
         return;
     }
+    if (!termSessions[session.dutId]) return;  // closed while loading
 
-    // ── Snapshot the dutId we are connecting to ─────────────────────────────
-    const thisDutId = dutId;
+    const dutId = session.dutId;
+    const gen = ++session.generation;  // invalidates stale reconnects
 
-    // ── Reset reconnect state for the new session ────────────────────────────
-    terminalIsReconnecting = false;
-
-    // ── Null out current DUT while we switch ────────────────────────────────
-    terminalCurrentDutId = null;
-
-    // Clean up existing terminal and connection
-    if (terminalSocket) {
-        console.log('[PTY] Closing existing WebSocket connection');
-        terminalSocket.onclose = null; // detach handler before close to avoid stale reconnect
-        terminalSocket.close();
-        terminalSocket = null;
+    if (session.socket) {
+        session.socket.onclose = null;
+        try { session.socket.close(); } catch (_) {}
+        session.socket = null;
     }
-    if (terminalInstance) {
-        console.log('[PTY] Disposing existing terminal instance');
-        terminalInstance.dispose();
-        terminalInstance = null;
-    }
+    if (session.term) { try { session.term.dispose(); } catch (_) {} session.term = null; }
 
-    // Now set the authoritative current DUT
-    terminalCurrentDutId = thisDutId;
-    terminalOutputBuffer = [];
+    const container = session.pane;
+    if (!container) return;
 
-    // Get container element
-    const container = document.getElementById('term-container');
-    if (!container) {
-        console.error('[PTY] Terminal container not found');
-        toast('Terminal container not found', 'error');
-        return;
-    }
-
-    // Create xterm.js Terminal instance
     const term = new Terminal({
         cursorBlink: true,
         fontSize: 14,
         fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", Menlo, Monaco, "Courier New", monospace',
         theme: {
-            background: '#1e1e1e',
-            foreground: '#d4d4d4',
-            cursor: '#ffffff',
-            cursorAccent: '#000000',
-            selection: '#264f78',
-            black: '#000000',
-            red: '#cd3131',
-            green: '#0dbc79',
-            yellow: '#e5e510',
-            blue: '#2472c8',
-            magenta: '#bc3fbc',
-            cyan: '#11a8cd',
-            white: '#e5e5e5',
-            brightBlack: '#666666',
-            brightRed: '#f14c4c',
-            brightGreen: '#23d18b',
-            brightYellow: '#f5f543',
-            brightBlue: '#3b8eea',
-            brightMagenta: '#d670d6',
-            brightCyan: '#29b8db',
-            brightWhite: '#e5e5e5'
+            background: '#1e1e1e', foreground: '#d4d4d4', cursor: '#ffffff', cursorAccent: '#000000',
+            selection: '#264f78', black: '#000000', red: '#cd3131', green: '#0dbc79', yellow: '#e5e510',
+            blue: '#2472c8', magenta: '#bc3fbc', cyan: '#11a8cd', white: '#e5e5e5', brightBlack: '#666666',
+            brightRed: '#f14c4c', brightGreen: '#23d18b', brightYellow: '#f5f543', brightBlue: '#3b8eea',
+            brightMagenta: '#d670d6', brightCyan: '#29b8db', brightWhite: '#e5e5e5'
         },
-        cols: 80,
-        rows: 24,
-        scrollback: 10000,  // Keep last 10,000 lines
-        scrollOnUserInput: true,  // Auto-scroll to cursor when typing
-        allowTransparency: false
+        cols: 80, rows: 24, scrollback: 10000, scrollOnUserInput: true, allowTransparency: false
     });
-
-    // Add fit addon for auto-resize
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
 
-    // Mount terminal to DOM
-    container.innerHTML = '<div class="term-info" style="padding: 10px;">Connecting to device...</div>';
-    setTimeout(() => {
-        container.innerHTML = '';  // Clear loading message
-        term.open(container);
-        fitAddon.fit();
-        console.log(`[PTY] Terminal mounted - size: ${term.cols}x${term.rows}`);
+    container.innerHTML = '';
+    term.open(container);
+    setTimeout(() => { try { fitAddon.fit(); } catch (_) {} }, 60);
 
-        // Prevent terminal from scrolling the page
-        const xtermViewport = container.querySelector('.xterm-viewport');
-        if (xtermViewport) {
-            xtermViewport.addEventListener('scroll', (e) => {
-                e.stopPropagation();
-            }, { passive: true });
-        }
+    const xtermViewport = container.querySelector('.xterm-viewport');
+    if (xtermViewport) xtermViewport.addEventListener('scroll', e => e.stopPropagation(), { passive: true });
+    container.addEventListener('wheel', e => e.stopPropagation(), { passive: true });
 
-        // Prevent wheel events from bubbling to page
-        container.addEventListener('wheel', (e) => {
-            e.stopPropagation();
-        }, { passive: true });
-    }, 100);
+    session.term = term;
+    session.fitAddon = fitAddon;
 
-    // Establish WebSocket connection with session authentication
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const sessionId = localStorage.getItem('eka-session-id');
-    const wsUrl = `${wsProtocol}//${window.location.host}/api/terminal/ws/${thisDutId}?session_id=${sessionId}`;
-    console.log(`[PTY] Connecting to ${wsUrl}`);
-
+    const wsUrl = `${wsProtocol}//${window.location.host}/api/terminal/ws/${dutId}?session_id=${sessionId}`;
     const ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
+    session.socket = ws;
 
-    // WebSocket event handlers
     ws.onopen = () => {
-        console.log('[PTY] WebSocket connected');
-        terminalIsReconnecting = false;
-        term.focus();
+        session.reconnecting = false;
+        session.connected = true;
+        renderTermTabs();
+        if (termActiveDutId === dutId) term.focus();
         term.write('\x1b[32m✓ Connected to PTY terminal\x1b[0m\r\n');
         term.write('\x1b[33mSupports: vi, nano, top, htop, screen, tmux, and all interactive applications\x1b[0m\r\n\r\n');
     };
 
     ws.onmessage = (event) => {
-        // Receive binary data from SSH PTY and render in terminal
         if (event.data instanceof ArrayBuffer) {
             const data = new Uint8Array(event.data);
             term.write(data);
-            // Store output in buffer for reconnection
-            terminalOutputBuffer.push(data);
-            // Auto-scroll to show cursor/prompt
-            const viewport = container.querySelector('.xterm-viewport');
-            if (viewport) {
-                viewport.scrollTop = viewport.scrollHeight;
-            }
+            session.outputBuffer.push(data);
+            const vp = container.querySelector('.xterm-viewport');
+            if (vp) vp.scrollTop = vp.scrollHeight;
         } else if (typeof event.data === 'string') {
-            // Handle JSON messages (status updates, errors, heartbeat, etc.)
             try {
                 const msg = JSON.parse(event.data);
-                if (msg.type === 'heartbeat') {
-                    // Silently handle heartbeat - keep connection alive
-                    console.debug('[PTY] Heartbeat received');
-                } else if (msg.error) {
-                    term.write(`\r\n\x1b[31mError: ${msg.error}\x1b[0m\r\n`);
-                    const viewport = container.querySelector('.xterm-viewport');
-                    if (viewport) {
-                        viewport.scrollTop = viewport.scrollHeight;
-                    }
-                } else if (msg.status === 'connecting') {
-                    // Show connection status message
-                    term.write(`\x1b[33m${msg.message}\x1b[0m\r\n`);
-                    const viewport = container.querySelector('.xterm-viewport');
-                    if (viewport) {
-                        viewport.scrollTop = viewport.scrollHeight;
-                    }
-                }
-            } catch (e) {
-                // Not JSON, write as text
-                term.write(event.data);
-                const viewport = container.querySelector('.xterm-viewport');
-                if (viewport) {
-                    viewport.scrollTop = viewport.scrollHeight;
-                }
-            }
+                if (msg.type === 'heartbeat') { /* keepalive */ }
+                else if (msg.error) { term.write(`\r\n\x1b[31mError: ${msg.error}\x1b[0m\r\n`); }
+                else if (msg.status === 'connecting') { term.write(`\x1b[33m${msg.message}\x1b[0m\r\n`); }
+            } catch (e) { term.write(event.data); }
+            const vp = container.querySelector('.xterm-viewport');
+            if (vp) vp.scrollTop = vp.scrollHeight;
         }
     };
 
-    ws.onerror = (error) => {
-        console.error('[PTY] WebSocket error:', error);
-        // Only write to the terminal if it still belongs to this session
-        if (terminalCurrentDutId === thisDutId) {
+    ws.onerror = () => {
+        session.connected = false;
+        renderTermTabs();
+        if (termSessions[dutId] && session.generation === gen) {
             term.write('\r\n\x1b[31m✗ Connection error\x1b[0m\r\n');
-            toast('Terminal connection error', 'error');
         }
     };
 
-    ws.onclose = (event) => {
-        console.log('[PTY] WebSocket closed:', event.code, event.reason);
-
-        // ── Stale-socket guard ────────────────────────────────────────────────
-        if (terminalCurrentDutId !== thisDutId) {
-            console.log(`[PTY] Ignoring onclose for stale DUT ${thisDutId} (current: ${terminalCurrentDutId})`);
-            return;
-        }
-
+    ws.onclose = () => {
+        session.connected = false;
+        if (!termSessions[dutId] || session.generation !== gen) return;  // stale/closed
+        renderTermTabs();
         term.write('\r\n\x1b[33m[Terminal session ended - attempting to reconnect...]\x1b[0m\r\n');
-
-        // Auto-reconnect if user is actively viewing Terminal tab
-        if (!document.hidden && terminalCurrentDutId && !terminalIsReconnecting) {
-            terminalIsReconnecting = true;
+        if (!document.hidden && !session.reconnecting) {
+            session.reconnecting = true;
+            renderTermTabs();
             setTimeout(() => {
-                // Re-check guard after the delay — user may have switched device
-                if (terminalCurrentDutId !== thisDutId) {
-                    console.log(`[PTY] Reconnect cancelled: device changed from ${thisDutId} to ${terminalCurrentDutId}`);
-                    terminalIsReconnecting = false;
-                    return;
-                }
-                console.log(`[PTY] Auto-reconnecting to DUT ${thisDutId}...`);
-                initPTYTerminal(thisDutId).catch(e => {
+                if (!termSessions[dutId] || session.generation !== gen) { session.reconnecting = false; return; }
+                initPTYSession(session).catch(e => {
                     console.error('[PTY] Auto-reconnect failed:', e);
-                    if (terminalCurrentDutId === thisDutId && terminalInstance) {
-                        terminalInstance.writeln('\x1b[31mReconnection failed. Select device to try again.\x1b[0m');
+                    if (termSessions[dutId] && session.term) {
+                        session.term.writeln('\x1b[31mReconnection failed. Close and re-open the tab to retry.\x1b[0m');
                     }
                 });
-            }, 1000);  // Wait 1 second before attempting reconnect
+            }, 1000);
         }
     };
 
-    // Send keyboard input from terminal to SSH via WebSocket
     term.onData((data) => {
-        if (ws.readyState === WebSocket.OPEN) {
-            // Convert string to Uint8Array and send as binary
-            const encoder = new TextEncoder();
-            ws.send(encoder.encode(data));
-        }
+        if (ws.readyState === WebSocket.OPEN) ws.send(new TextEncoder().encode(data));
     });
-
-    // Handle terminal resize events
     term.onResize(({ cols, rows }) => {
-        console.log(`[PTY] Terminal resized to ${cols}x${rows}`);
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-                type: 'resize',
-                cols: cols,
-                rows: rows
-            }));
-        }
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows }));
     });
 
-    // Auto-resize terminal when window size changes
     const resizeObserver = new ResizeObserver(() => {
-        if (terminalInstance) {
-            try {
-                fitAddon.fit();
-            } catch (e) {
-                // Ignore resize errors during cleanup
-            }
+        if (termActiveDutId === dutId && session.fitAddon) {
+            try { session.fitAddon.fit(); } catch (_) {}
         }
     });
     resizeObserver.observe(container);
+    session.resizeObserver = resizeObserver;
 
-    // Store globally for cleanup
-    terminalInstance = term;
-    terminalSocket = ws;
-
-    // Add Page Visibility API detection for tab focus (one-time setup only)
+    // One-time: refit/reconnect the active session when the tab regains visibility
     if (!_termVisibilityListenerAdded) {
         _termVisibilityListenerAdded = true;
         document.addEventListener('visibilitychange', () => {
-            if (!document.hidden && terminalCurrentDutId && terminalIsReconnecting &&
-                terminalSocket?.readyState !== WebSocket.OPEN) {
-                // Tab became visible and connection was lost - try to reconnect
-                console.log('[PTY] Tab became visible - checking connection...');
-                initPTYTerminal(terminalCurrentDutId).catch(e => {
-                    console.error('[PTY] Visibility-triggered reconnect failed:', e);
-                });
+            if (document.hidden || !termActiveDutId) return;
+            const s = termSessions[termActiveDutId];
+            if (!s) return;
+            if (s.socket && s.socket.readyState !== WebSocket.OPEN && !s.reconnecting) {
+                initPTYSession(s).catch(e => console.error('[PTY] Visibility reconnect failed:', e));
+            } else if (s.fitAddon) {
+                try { s.fitAddon.fit(); } catch (_) {}
             }
         });
     }
+}
 
-    console.log('[PTY] Terminal initialization complete');
+// Close a single session: tear down socket/term/observer and drop its tab.
+function termCloseSession(dutId) {
+    dutId = String(dutId);
+    const s = termSessions[dutId];
+    if (!s) return;
+    s.generation++;  // invalidate any pending reconnect
+    if (s.socket) { s.socket.onclose = null; try { s.socket.close(); } catch (_) {} }
+    if (s.resizeObserver) { try { s.resizeObserver.disconnect(); } catch (_) {} }
+    if (s.term) { try { s.term.dispose(); } catch (_) {} }
+    if (s.pane && s.pane.parentNode) s.pane.parentNode.removeChild(s.pane);
+    delete termSessions[dutId];
+
+    const remaining = Object.keys(termSessions);
+    if (termActiveDutId === dutId) termActiveDutId = null;
+    if (remaining.length) {
+        termActivate(termActiveDutId && termSessions[termActiveDutId] ? termActiveDutId : remaining[remaining.length - 1]);
+    } else {
+        renderTermTabs();
+    }
+    renderTermDUTList();
 }
 
 /**
- * Called when device selection changes in terminal dropdown
+ * Backwards-compatible entry point for older callers — opens/focuses a session.
  */
 async function termDeviceChanged() {
-    const dutSelect = document.getElementById('term-dut');
-    const dutId = dutSelect ? dutSelect.value : null;
-    const container = document.getElementById('term-container');
-
-    console.log('[PTY] Device changed - DUT ID:', dutId);
-
-    if (!dutId) {
-        // No device selected - clear state flags FIRST so any in-flight
-        // onclose from the closing socket sees null and skips reconnect.
-        terminalCurrentDutId = null;
-        terminalIsReconnecting = false;
-
-        if (terminalSocket) {
-            terminalSocket.onclose = null; // detach before close
-            terminalSocket.close();
-            terminalSocket = null;
-        }
-        if (terminalInstance) {
-            terminalInstance.dispose();
-            terminalInstance = null;
-        }
-
-        if (container) {
-            container.innerHTML = `
-                <div class="log-placeholder">
-                    <span class="material-icons-round">terminal</span>
-                    <p>Select a device to open PTY terminal session.</p>
-                    <p style="font-size: 12px; color: #888;">Supports vi, nano, top, htop, screen, tmux</p>
-                </div>`;
-        }
-        return;
-    }
-
-    // Initialize PTY terminal for selected device
-    await initPTYTerminal(dutId);
+    return termAddDevice();
 }
 
 // ============================================================
@@ -4821,13 +5274,22 @@ async function generateMasterTestbed(silent = false) {
     }
 
     try {
+        // Persist the CURRENT canvas connections to the server first (awaited) so the
+        // backend generation reads a consistent, up-to-date topology. Connection saves
+        // are otherwise fire-and-forget and could lag behind the click, producing a
+        // spurious "No connections found in Topology Canvas" error.
+        await _saveConnectionsToServer();
+
         const res = await fetch(`${API}/api/topology/generate-master-testbed`, {
             method: 'POST',
             headers: getSessionHeaders(),
             body: JSON.stringify({
                 host_id: parseInt(vmId),
                 master_filename: 'master_testbed.yaml',
-                base_path: activeBasePath || ''
+                base_path: activeBasePath || '',
+                // Send the canvas connections directly so generation always reflects
+                // exactly what's on the canvas (independent of the async save above).
+                connections: dutConnections
             })
         });
 
@@ -5881,7 +6343,8 @@ async function spinVS() {
 
     const progressTitle = document.getElementById('vs-progress-title');
     if (progressTitle) progressTitle.textContent = `Spin VS — ${vsName}`;
-    _initVSProgress(['Validate + Clone XML', 'Define VS', 'Start VS']);
+    // Labels aligned to the backend spin steps (1/3 Validate, 2/3 Clone, 3/3 Define+Start)
+    _initVSProgress(['Validate XML', 'Clone XML', 'Define + Start VS']);
 
     const logEl = document.getElementById('vs-log-container');
     logEl.innerHTML = `<div class="log-placeholder"><span class="material-icons-round spin">sync</span><p>Spinning up ${vsName}…</p></div>`;
@@ -5903,10 +6366,16 @@ async function spinVS() {
         const data = await res.json();
         toast(`Spin started for ${vsName}`, 'success');
         await waitForVSCompletion(data.execution_id, vsName, logEl);
+        // Clear the spinner if completion arrived with no streamed logs (WS/poll fallback)
+        clearVSLogPlaceholder(logEl, `<div style="padding:8px;color:var(--text-secondary)"><span class="material-icons-round" style="font-size:14px;vertical-align:middle">check_circle</span> ${esc(vsName)}: running.</div>`);
         toast(`✓ ${vsName} is running`, 'success');
         setTimeout(() => loadVSList(dutId), 2000);
     } catch (e) {
         toast(`Spin failed: ${e.message}`, 'error');
+        clearVSLogPlaceholder(logEl, '');
+        logEl.innerHTML += `<div style="color:#ff5252;padding:8px;margin-top:8px;border:1px solid #ff5252;border-radius:4px;">
+            <strong>ERROR:</strong> ${escapeHTML(e.message)}
+        </div>`;
     } finally {
         btnSpin.disabled = false;
         btnSpin.innerHTML = '<span class="material-icons-round">play_circle</span> Spin VS';
@@ -5996,12 +6465,18 @@ async function removeSelectedVS() {
         const data = await res.json();
         toast(`Removal started for ${vsName}`, 'info');
         await waitForVSCompletion(data.execution_id, vsName, logEl);
+        // Clear the spinner if completion arrived with no streamed logs (WS/poll fallback)
+        clearVSLogPlaceholder(logEl, `<div style="padding:8px;color:var(--text-secondary)"><span class="material-icons-round" style="font-size:14px;vertical-align:middle">check_circle</span> ${esc(vsName)}: removed.</div>`);
         toast(`✓ ${vsName} removed`, 'success');
         selectedVSNames.clear();
         updateVSSelectionCount();
         setTimeout(() => loadVSList(dutId), 2000);
     } catch (e) {
         toast(`Remove failed: ${e.message}`, 'error');
+        clearVSLogPlaceholder(logEl, '');
+        logEl.innerHTML += `<div style="color:#ff5252;padding:8px;margin-top:8px;border:1px solid #ff5252;border-radius:4px;">
+            <strong>ERROR:</strong> ${escapeHTML(e.message)}
+        </div>`;
     } finally {
         btnRemove.disabled = selectedVSNames.size === 0;
         btnRemove.innerHTML = '<span class="material-icons-round">delete_forever</span> Remove Selected VS';
@@ -6274,11 +6749,15 @@ async function execVSUpdate() {
             console.log('[VS Update] Connecting WebSocket for execution:', data.execution_id);
             await waitForVSCompletion(data.execution_id, vmLabel, logEl);
             console.log(`[VS Update] ✓ VM ${i + 1}/${vsEntries.length} COMPLETED: ${entry.vs_name}`);
+            // Clear placeholder spinner if WebSocket fallback was used and no logs were rendered
+            clearVSLogPlaceholder(logEl, `<div style="padding:8px;color:var(--text-secondary)"><span class="material-icons-round" style="font-size:14px;vertical-align:middle">check_circle</span> ${esc(vmLabel)}: completed.</div>`);
             console.log(`[VS Update] Moving to next VM...`);
 
         } catch (e) {
             console.error(`[VS Update] Error updating ${entry.vs_name}:`, e);
             toast(`${vmLabel}: FAILED — ${e.message}`, 'error');
+            // Replace spinner with error message (handles WebSocket fallback case)
+            clearVSLogPlaceholder(logEl, '');
             logEl.innerHTML += `<div style="color:#ff5252;padding:8px;margin-top:8px;border:1px solid #ff5252;border-radius:4px;">
                 <strong>ERROR:</strong> ${escapeHTML(e.message)}<br>
                 <small>Continuing with remaining VMs...</small>
@@ -6446,28 +6925,56 @@ async function waitForVSCompletion(execId, label, logEl) {
     });
 }
 
-// Fallback polling if WebSocket fails
+// Fallback polling if WebSocket fails.
+// Renders logs too (not just status) so the VS Progress panel isn't empty when
+// the WebSocket cannot connect — the previous behaviour that left the panel blank.
+let _pollLogCursor = {};  // execId -> last rendered log id
+
+// Fetch any logs newer than the cursor and render them via the shared log path.
+async function _pollFetchVSLogs(execId) {
+    try {
+        const after = _pollLogCursor[execId] || 0;
+        const res = await fetch(`${API}/api/vs/executions/${execId}/logs?after_id=${after}`);
+        if (!res.ok) return;
+        const logs = await res.json();
+        if (Array.isArray(logs)) {
+            for (const log of logs) {
+                if (log.message) { vsLogs.push(log); appendVSLogEntry(log); updateVSProgress(log); }
+                if (log.id) _pollLogCursor[execId] = log.id;
+            }
+        }
+    } catch (e) {
+        console.error(`[pollForCompletion] Error fetching logs for exec ${execId}:`, e);
+    }
+}
+
 async function pollForCompletion(execId, label, timeout, resolve, reject, markSettled) {
+    _pollLogCursor[execId] = 0;
     // Poll the VS service executions endpoint (same DB, so exec ID is valid)
     const pollInterval = setInterval(async () => {
         try {
+            // Pull any new logs first so the panel streams even without a WebSocket
+            await _pollFetchVSLogs(execId);
+
             const res = await fetch(`${API}/api/vs/executions/${execId}`);
             if (res.ok) {
                 const exec = await res.json();
                 console.log(`[pollForCompletion] Exec ${execId} status: ${exec.status}`);
 
-                if (exec.status === 'completed') {
+                if (exec.status === 'completed' || exec.status === 'failed') {
                     clearInterval(pollInterval);
                     clearTimeout(timeout);
-                    console.log(`[pollForCompletion] ✓ Exec ${execId} completed`);
+                    // Final log drain so the last lines (incl. the success/fail banner) render
+                    await _pollFetchVSLogs(execId);
+                    delete _pollLogCursor[execId];
                     if (markSettled) markSettled();
-                    resolve();
-                } else if (exec.status === 'failed') {
-                    clearInterval(pollInterval);
-                    clearTimeout(timeout);
-                    console.log(`[pollForCompletion] ✗ Exec ${execId} failed`);
-                    if (markSettled) markSettled();
-                    reject(new Error('Update failed'));
+                    if (exec.status === 'completed') {
+                        console.log(`[pollForCompletion] ✓ Exec ${execId} completed`);
+                        resolve();
+                    } else {
+                        console.log(`[pollForCompletion] ✗ Exec ${execId} failed`);
+                        reject(new Error('Update failed'));
+                    }
                 }
             }
         } catch (e) {
@@ -6476,10 +6983,74 @@ async function pollForCompletion(execId, label, timeout, resolve, reject, markSe
     }, 3000); // Poll every 3 seconds
 }
 
+// Clear the "…ing" spinner placeholder if it's still showing (i.e. no logs
+// streamed). Called after waitForVSCompletion resolves/rejects regardless of
+// whether the WebSocket or the poll fallback completed it, so the spinner never
+// hangs. htmlOrText is the replacement markup.
+function clearVSLogPlaceholder(logEl, htmlOrText) {
+    if (logEl && logEl.querySelector('.log-placeholder')) {
+        logEl.innerHTML = htmlOrText;
+    }
+}
+
 function appendVSLogEntry(log) {
     const el = document.getElementById('vs-log-container');
+    if (!el) return;
     if (el.querySelector('.log-placeholder')) el.innerHTML = '';
-    el.insertAdjacentHTML('beforeend', logHTML(log));
+
+    const raw = log.message || '';
+    const msg = raw.trim();
+    if (!msg) return;
+
+    let html = '';
+
+    // ── Numbered step header: "▶ Step X/Y: Name" ─────────────────
+    const stepMatch = msg.match(/^▶ (Step \d+\/\d+):\s*(.+)$/);
+    if (stepMatch) {
+        html = `<div class="vs-step-log-hdr">
+            <span class="vs-step-log-badge">${esc(stepMatch[1])}</span>
+            <span class="vs-step-log-title">${esc(stepMatch[2])}</span>
+        </div>`;
+    }
+    // ── Non-numbered "▶" section header ──────────────────────────
+    else if (msg.startsWith('▶')) {
+        html = `<div class="vs-step-log-hdr section">
+            <span class="vs-step-log-title">${esc(msg.slice(1).trim())}</span>
+        </div>`;
+    }
+    // ── Command line: "  $ ..." ───────────────────────────────────
+    else if (/^ {2}\$ /.test(raw)) {
+        html = `<div class="vs-log-cmd">$ ${esc(msg.replace(/^\$\s*/, ''))}</div>`;
+    }
+    // ── Final success banner: "✓ VS ... completed / is running" ──
+    else if (msg.startsWith('✓') && (msg.includes('completed') || msg.includes('is running'))) {
+        html = `<div class="vs-log-final ok">
+            <span class="material-icons-round" style="font-size:15px">task_alt</span>
+            ${esc(msg.replace(/^✓\s*/, ''))}
+        </div>`;
+    }
+    // ── Step success: "  ✓ ..." ───────────────────────────────────
+    else if (/^ {2}✓/.test(raw)) {
+        html = `<div class="vs-log-ok">✓ ${esc(msg.replace(/^✓\s*/, ''))}</div>`;
+    }
+    // ── Step error: "  ✗ ..." ────────────────────────────────────
+    else if (/^ {2}✗/.test(raw) || (msg.includes('FAILED') && !msg.includes('sudo'))) {
+        html = `<div class="vs-log-err">✗ ${esc(msg.replace(/^✗\s*/, ''))}</div>`;
+    }
+    // ── Warning / retry: "  ⚠ …" or "  ↻ …" ─────────────────────
+    else if (/^ {2}[⚠↻]/.test(raw) || log.level === 'WARNING') {
+        html = `<div class="vs-log-warn">${esc(msg)}</div>`;
+    }
+    // ── Command output (4-space indent) ───────────────────────────
+    else if (/^ {4}/.test(raw)) {
+        html = `<div class="vs-log-out">${esc(msg)}</div>`;
+    }
+    // ── Regular info line ─────────────────────────────────────────
+    else {
+        html = `<div class="vs-log-info">${esc(msg)}</div>`;
+    }
+
+    el.insertAdjacentHTML('beforeend', html);
     el.scrollTop = el.scrollHeight;
 }
 

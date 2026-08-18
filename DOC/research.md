@@ -1,6 +1,6 @@
 # Eka Platform — Research & Findings
 
-> Last Updated: 2026-06-18 (Session 9)
+> Last Updated: 2026-06-26 (Session 20)
 
 ---
 
@@ -1202,3 +1202,161 @@ immediately by the endpoint's SSH kill.
 | `static/app.js` | ~3000 | `confirmCancelScript()` — POSTs cancel-script, shows the error toast |
 | `static/app.js` | ~3017 | `Failed to cancel: ${err.detail}` toast |
 | `main.py` | ~5405–5432 | `cancel_script_from_execution()` — raises 404 when execution row is gone |
+
+---
+
+## Session 18 — 2026-06-26 — Docker Microservices Split (version-3.1.3)
+
+### Context
+The monolithic `main.py` (port 8000) was split into 5 independent Docker containers:
+
+| Container | Port | Service |
+|-----------|------|---------|
+| `eka-core` | 8000 | Core API, auth, sessions, topology, testbed generation |
+| `eka-execute` | 8002 | Script execution, APScheduler jobs, live WebSocket logs |
+| `eka-vs` | 8003 | Virtual switch management (virsh over SSH) |
+| `eka-hardware` | 8005 | Hardware image load jobs |
+| `eka-nginx` | 80 | Reverse proxy / gateway |
+
+### docker-compose v1.29.2 Bug — ContainerConfig
+`docker-compose up -d --build` fails with `ContainerConfig` KeyError when images are built with a newer Docker daemon. Workaround:
+```bash
+docker-compose down --remove-orphans
+docker ps -a --filter "name=eka" --format "{{.Names}}" | xargs -r docker rm -f
+docker-compose up -d --build      # builds images
+docker-compose create             # creates containers
+docker-compose start              # starts them
+```
+After this session the workaround was confirmed unnecessary — `docker-compose up -d --build` followed by `docker-compose create && docker-compose start` works reliably.
+
+### Missing Endpoints in execute-service
+11 API endpoints and 2 nginx routing blocks were never ported from `main.py` into `execute-service`:
+
+| # | Endpoint | Fix |
+|---|----------|-----|
+| 1 | `GET /api/execution-queue` | Added to execute-service |
+| 2–6 | `POST/GET/GET/{id}/PUT/DELETE /api/execution-jobs` | Added to execute-service |
+| 7 | `GET /api/execution-jobs/{id}/conflicts` | Added |
+| 8 | `GET /api/execution-jobs/{id}/report/html` | Added |
+| 9 | `GET /api/execution-jobs/{id}/report/excel` | Added |
+| 10–11 | `PUT/GET /api/execution-jobs/{id}/schedule` | Added |
+
+Also added to `services/execute-service/requirements.txt`:
+- `APScheduler==3.11.2`
+- `openpyxl==3.1.5`
+
+### Nginx Routing Fix
+Added two `location` blocks **before** the `/api/executions` prefix block (more-specific routes must appear first):
+```nginx
+location /api/execution-jobs { proxy_pass http://execute_svc; proxy_read_timeout 300s; }
+location /api/execution-queue { proxy_pass http://execute_svc; }
+```
+
+### VS Update Progress — Step Naming Mismatch
+Frontend `updateVSProgress()` `stepMap` expected `Step 1/6` through `Step 6/6`. The vs-service was emitting `Step 1/4` through `Step 4/4`.
+Fixed `_run_vs_update` and `_run_vs_batch_update` in `services/vs-service/main.py` to emit the correct 6-step labels:
+1. Destroying VM
+2. Removing old image
+3. Copying image (local or SCP)
+4. Undefining VM
+5. Defining VM from XML
+6. Starting VM
+
+### Key file locations (Session 18)
+| File | Purpose |
+|------|---------|
+| `services/execute-service/main.py` | 11 missing endpoints + APScheduler scheduler init + `_build_html_dashboard`, `_build_excel`, `_register_job_schedule`, helpers |
+| `services/execute-service/requirements.txt` | Added APScheduler + openpyxl |
+| `nginx/nginx.conf` | Added `/api/execution-jobs` and `/api/execution-queue` location blocks |
+| `services/vs-service/main.py` | 6-step `_run_vs_update` + `_run_vs_batch_update` |
+
+---
+
+## Session 19 — 2026-06-26 — SSH Retry/Reconnect Across All Services
+
+### Problem
+Direct `SSHConnectionManager` usage in `execute-service` and `vs-service` had **zero retry** on connect failure and no auto-reconnect on command failure. Terminal WebSocket in `main.py` would stall silently on SSH drop with no recovery.
+
+### Fix 1 — `SSHManager` class in `services/vs-service/main.py`
+New class with exponential backoff:
+- `connect()`: 4 attempts, backoff `[0, 3, 8, 20]` seconds, `set_keepalive(15)` on success
+- `execute_command()`: 3 retries, backoff `[0, 2, 5]` seconds, auto-calls `reconnect()` on `transport.is_active() == False`
+- `reconnect()`: closes old client, calls `connect()` again
+
+### Fix 2 — `SSHConnectionManager` in `services/execute-service/main.py`
+Same pattern:
+- `MAX_CONNECT_RETRIES = 4`, `CONNECT_BACKOFF = [0, 3, 8, 20]`
+- `MAX_CMD_RETRIES = 3`, `CMD_BACKOFF = [0, 2, 5]`
+- `_is_alive()` via `transport.send_ignore()`
+- `execute_command()` auto-reconnects on dead transport
+
+### Fix 3 — Terminal WebSocket auto-reconnect (`main.py`)
+`/api/terminal/ws/{dut_id}` PTY stream now recovers from SSH drop:
+```python
+_pty_channel = [channel]        # mutable cell shared between coroutines
+_reconnecting = asyncio.Event()
+_terminal_dead = asyncio.Event()
+
+async def _reconnect_pty(reason):
+    # 5 attempts, backoff 1→2→4→8→16→30s
+    # sends {"type":"reconnecting"} then {"type":"reconnected"} to browser
+
+async def read_from_ssh():
+    # triggers _reconnect_pty() on channel.closed or EOF
+
+async def send_heartbeat():
+    # every 30s, also probes transport.is_active()
+```
+
+### Key file locations (Session 19)
+| File | Lines | Purpose |
+|------|-------|---------|
+| `services/vs-service/main.py` | `SSHManager` class | vs-service SSH with retry + keepalive |
+| `services/execute-service/main.py` | `SSHConnectionManager` class | execute-service SSH with retry |
+| `main.py` | `/api/terminal/ws/{dut_id}` | Terminal PTY auto-reconnect with backoff |
+
+---
+
+## Session 20 — 2026-06-26 — VS Image Update Logic Fix + Stats Bar
+
+### Fix 1 — VS Source Image Path (Critical Correction)
+A prior edit incorrectly changed the VS image update to a "directory approach" — it derived the source filename from the XML and appended it to the user input treating it as a directory. This was wrong.
+
+**Correct behavior** (restored):
+- User provides: **full source file path** — e.g., `/home/hp/anuradha_build_imgs/target/sonic-vs.img`
+- Backend reads VM XML → gets **full target path** — e.g., `/var/lib/libvirt/images/training-vs2.img`
+- Step 2/6: `rm -f /var/lib/libvirt/images/training-vs2.img`
+- Step 3/6: `cp /home/hp/.../sonic-vs.img /var/lib/libvirt/images/training-vs2.img`
+
+The source keeps its own filename; it is renamed to the XML-defined target name at the destination. Both `_run_vs_update` and `_run_vs_batch_update` were fixed.
+
+**Files changed:**
+- `services/vs-service/main.py`: removed `image_filename`/`source_full` derivation, reverted to `cp {source_image} {target_image_path}`
+- `static/index.html`: label reverted from "Source Images Directory" → **"Source Image Path (full path to the new image file — shared for all selected VMs)"**, placeholder updated to show a `.img` file path
+- `static/app.js`: confirmation dialog updated ("Source Image:" label, note about target from XML)
+
+### Fix 2 — VS Stats Bar (T / R / D / P)
+Added VM state counts to the **Virtual Machines** card header, right side opposite the title:
+
+```
+Virtual Machines          Image name read from VM XML   T:48  R:36  D:12
+```
+
+- **T** = total VMs
+- **R** = running (green)
+- **D** = down / shut off (grey)
+- **P** = paused (yellow, only shown when > 0)
+
+Implementation:
+- `static/index.html`: added `<span id="vs-xml-label">` + `<span id="vs-stats-bar">` inside the `card-header` right-side `<div>`, replacing the old separate bar below the header
+- `static/app.js` `loadVSList()`: computes counts from `data.vms`, populates `vs-stats-bar`, shows/hides both `vs-xml-label` and `vs-stats-bar` togther
+- The `<th>Image name read from VM XML</th>` table column header was removed (label now lives in the card header)
+- Both elements hidden on host-change / no VMs found
+
+### Key file locations (Session 20)
+| File | Lines | Purpose |
+|------|-------|---------|
+| `services/vs-service/main.py` | `_run_vs_update`, `_run_vs_batch_update` | Correct `cp {source_image} {target_image_path}` |
+| `static/index.html` | VS card-header | `vs-xml-label` + `vs-stats-bar` spans in header right side |
+| `static/app.js` | `loadVSList()` | Count T/R/D/P, update stats bar, show/hide label |
+| `static/app.js` | Source image label | Confirmation dialog shows "Source Image:" |

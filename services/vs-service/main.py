@@ -198,12 +198,26 @@ def log_exec(db, execution_id, dut_name, level, message):
     db.commit()
 
 def _sudocmd(password: str, cmd: str) -> str:
+    if not password:
+        return f"sudo {cmd}"
     safe = password.replace("'", "'\\''")
     return f"echo '{safe}' | sudo -S {cmd}"
 
-def _extract_image_path_from_xml(ssh: SSHManager, xml_full_path: str) -> str:
+def _exec_sudo_fallback(ssh: SSHManager, password: str, cmd: str, timeout=300):
+    """Run a command trying without sudo first; retry with sudo if it fails.
+
+    Same pattern as the VS list fetch: plain command → on non-zero exit,
+    re-run wrapped with sudo (using the device password via sudo -S).
+    Returns (output, error, exit_code) of the last attempt.
+    """
+    output, error, exit_code = ssh.execute_command(cmd, timeout=timeout)
+    if exit_code != 0:
+        output, error, exit_code = ssh.execute_command(_sudocmd(password, cmd), timeout=timeout)
+    return output, error, exit_code
+
+def _extract_image_path_from_xml(ssh: SSHManager, xml_full_path: str, password: str = "") -> str:
     """Read the VS XML on the remote host and return the disk image path."""
-    extract_cmd = _sudocmd_static(
+    extract_cmd = (
         f"python3 -c \""
         f"import xml.etree.ElementTree as ET; "
         f"root = ET.parse('{xml_full_path}').getroot(); "
@@ -211,11 +225,8 @@ def _extract_image_path_from_xml(ssh: SSHManager, xml_full_path: str) -> str:
         f"if d.get('device')=='disk' and d.find('source') is not None]; "
         f"print(matches[0] if matches else '')\""
     )
-    out, err, rc = ssh.execute_command(extract_cmd, timeout=15)
+    out, err, rc = _exec_sudo_fallback(ssh, password, extract_cmd, timeout=15)
     return out.strip()
-
-def _sudocmd_static(cmd: str) -> str:
-    return f"sudo {cmd}"
 
 # ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -316,13 +327,9 @@ def vs_action(dut_id: int, body: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail=f"Cannot connect to {dut.name}")
 
     try:
-        if dut.password:
-            safe_pass = dut.password.replace("'", "'\\''")
-            command = f"echo '{safe_pass}' | sudo -S virsh -c qemu:///system {action} {vs_name}"
-        else:
-            command = f"sudo virsh -c qemu:///system {action} {vs_name}"
-
-        output, error, exit_code = ssh.execute_command(command, timeout=30)
+        # Try without sudo first; fall back to sudo if it fails (same as VS list fetch).
+        command = f"virsh -c qemu:///system {action} {vs_name}"
+        output, error, exit_code = _exec_sudo_fallback(ssh, dut.password, command, timeout=30)
         if exit_code != 0:
             return {"status": "error", "vs_name": vs_name, "action": action,
                     "message": error.strip() or f"Command failed (exit {exit_code})"}
@@ -433,14 +440,16 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image,
                      f"SSH connection FAILED to {dut.ip_address}:{dut.port}")
             execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
-        def sudocmd(cmd):
-            safe = dut.password.replace("'", "'\\''")
-            return f"echo '{safe}' | sudo -S {cmd}"
-
         def run_step(step_name, command, allow_fail=False, timeout=120):
             log_exec(db, execution_id, dut.name, "INFO", f"▶ {step_name}")
             log_exec(db, execution_id, dut.name, "INFO", f"  $ {command}")
+            # Try without sudo first; retry with sudo on failure (same as VS list fetch)
             output, error, exit_code = ssh.execute_command(command, timeout=timeout)
+            if exit_code != 0:
+                log_exec(db, execution_id, dut.name, "INFO",
+                         f"  ↻ Failed without sudo — retrying with sudo")
+                output, error, exit_code = ssh.execute_command(
+                    _sudocmd(dut.password, command), timeout=timeout)
             if output.strip():
                 for line in output.strip().split("\n")[:20]:
                     log_exec(db, execution_id, dut.name, "INFO", f"    {line}")
@@ -459,7 +468,7 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image,
             # Resolve target image path from XML
             log_exec(db, execution_id, dut.name, "INFO",
                      f"▶ Resolving image path from XML: {xml_full_path}")
-            extract_cmd = sudocmd(
+            extract_cmd = (
                 f"python3 -c \""
                 f"import xml.etree.ElementTree as ET; "
                 f"root = ET.parse('{xml_full_path}').getroot(); "
@@ -467,7 +476,7 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image,
                 f"if d.get('device')=='disk' and d.find('source') is not None]; "
                 f"print(matches[0] if matches else '')\""
             )
-            xml_out, xml_err, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+            xml_out, xml_err, xml_rc = _exec_sudo_fallback(ssh, dut.password, extract_cmd, timeout=15)
             target_image_path = xml_out.strip()
             if xml_rc != 0 or not target_image_path:
                 log_exec(db, execution_id, dut.name, "ERROR",
@@ -479,11 +488,11 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image,
                      f"  Will copy: {source_image} → {target_image_path}")
 
             # Step 1/6 — Destroy VM
-            if not run_step("Step 1/6: Destroying VM", sudocmd(f"virsh -c qemu:///system destroy {vs_name}"), allow_fail=True):
+            if not run_step("Step 1/6: Destroying VM", f"virsh -c qemu:///system destroy {vs_name}", allow_fail=True):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Step 2/6 — Remove old image (path comes from XML)
-            if not run_step("Step 2/6: Removing old image", sudocmd(f"rm -f {target_image_path}")):
+            if not run_step("Step 2/6: Removing old image", f"rm -f {target_image_path}"):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Step 3/6 — Copy source image to XML-defined target path (cp src → target renames to XML name)
@@ -504,28 +513,29 @@ def _run_vs_update(execution_id, dut_id, vs_name, xml_full_path, source_image,
                 else:
                     log_exec(db, execution_id, dut.name, "INFO", f"  ✓ Downloaded to {dest_temp}")
                     if not run_step("Step 3/6: Moving image to destination",
-                                    sudocmd(f"mv {dest_temp} {target_image_path}")):
+                                    f"mv {dest_temp} {target_image_path}"):
                         all_ok = False
             else:
                 all_ok = run_step("Step 3/6: Copying image (local)",
-                                  sudocmd(f"cp {source_image} {target_image_path}"), timeout=300)
+                                  f"cp {source_image} {target_image_path}", timeout=300)
 
             if not all_ok:
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Step 4/6 — Undefine VM
-            run_step("Step 4/6: Undefining VM", sudocmd(f"virsh -c qemu:///system undefine {vs_name}"), allow_fail=True)
+            run_step("Step 4/6: Undefining VM", f"virsh -c qemu:///system undefine {vs_name}", allow_fail=True)
 
             # Step 5/6 — Define VM from XML
-            if not run_step("Step 5/6: Defining VM from XML", sudocmd(f"virsh -c qemu:///system define {xml_full_path}")):
+            if not run_step("Step 5/6: Defining VM from XML", f"virsh -c qemu:///system define {xml_full_path}"):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Step 6/6 — Start VM
-            if not run_step("Step 6/6: Starting VM", sudocmd(f"virsh -c qemu:///system start {vs_name}")):
+            if not run_step("Step 6/6: Starting VM", f"virsh -c qemu:///system start {vs_name}"):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Verify
-            out, _, _ = ssh.execute_command(sudocmd(f"virsh -c qemu:///system domstate {vs_name}"), timeout=10)
+            out, _, _ = _exec_sudo_fallback(ssh, dut.password,
+                                            f"virsh -c qemu:///system domstate {vs_name}", timeout=10)
             state = out.strip()
             log_exec(db, execution_id, dut.name, "INFO", f"  VM '{vs_name}' state: {state}")
             if "running" in state.lower():
@@ -576,13 +586,15 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image, source_ser
             log_exec(db, execution_id, dut.name, "ERROR", "SSH connection FAILED")
             execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
-        def sudocmd(cmd):
-            safe = dut.password.replace("'", "'\\''")
-            return f"echo '{safe}' | sudo -S {cmd}"
-
         def run_step(step_name, command, allow_fail=False, timeout=120):
             log_exec(db, execution_id, dut.name, "INFO", f"▶ {step_name}")
+            # Try without sudo first; retry with sudo on failure (same as VS list fetch)
             output, error, exit_code = ssh.execute_command(command, timeout=timeout)
+            if exit_code != 0:
+                log_exec(db, execution_id, dut.name, "INFO",
+                         f"  ↻ Failed without sudo — retrying with sudo")
+                output, error, exit_code = ssh.execute_command(
+                    _sudocmd(dut.password, command), timeout=timeout)
             if output.strip():
                 for line in output.strip().split("\n")[:20]:
                     log_exec(db, execution_id, dut.name, "INFO", f"    {line}")
@@ -611,7 +623,7 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image, source_ser
                 xml_full_path = f"{xml_path}/{vs_name}.xml"
                 log_exec(db, execution_id, dut.name, "INFO",
                          f"  Resolving image path from XML: {xml_full_path}")
-                extract_cmd = sudocmd(
+                extract_cmd = (
                     f"python3 -c \""
                     f"import xml.etree.ElementTree as ET; "
                     f"root = ET.parse('{xml_full_path}').getroot(); "
@@ -619,7 +631,7 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image, source_ser
                     f"if d.get('device')=='disk' and d.find('source') is not None]; "
                     f"print(matches[0] if matches else '')\""
                 )
-                xml_out, xml_err, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+                xml_out, xml_err, xml_rc = _exec_sudo_fallback(ssh, dut.password, extract_cmd, timeout=15)
                 dest_image_path = xml_out.strip()
                 if xml_rc != 0 or not dest_image_path:
                     log_exec(db, execution_id, dut.name, "ERROR",
@@ -632,9 +644,9 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image, source_ser
 
                 vm_ok = True
                 vm_ok = vm_ok and run_step("Step 1/6: Destroying VM",
-                                           sudocmd(f"virsh -c qemu:///system destroy {vs_name}"), allow_fail=True)
+                                           f"virsh -c qemu:///system destroy {vs_name}", allow_fail=True)
                 vm_ok = vm_ok and run_step("Step 2/6: Removing old image",
-                                           sudocmd(f"rm -f {dest_image_path}"))
+                                           f"rm -f {dest_image_path}")
 
                 if vm_ok:
                     if source_server:
@@ -652,22 +664,23 @@ def _run_vs_batch_update(execution_id, dut, vs_entries, source_image, source_ser
                             vm_ok = False
                         else:
                             vm_ok = run_step("Step 3/6: Moving to destination",
-                                             sudocmd(f"mv {dest_temp} {dest_image_path}"))
+                                             f"mv {dest_temp} {dest_image_path}")
                     else:
                         vm_ok = run_step("Step 3/6: Copying image (local)",
-                                         sudocmd(f"cp {source_image} {dest_image_path}"), timeout=300)
+                                         f"cp {source_image} {dest_image_path}", timeout=300)
 
                 if vm_ok:
                     run_step("Step 4/6: Undefining VM",
-                             sudocmd(f"virsh -c qemu:///system undefine {vs_name}"), allow_fail=True)
+                             f"virsh -c qemu:///system undefine {vs_name}", allow_fail=True)
                     vm_ok = run_step("Step 5/6: Defining VM from XML",
-                                     sudocmd(f"virsh -c qemu:///system define {xml_full_path}"))
+                                     f"virsh -c qemu:///system define {xml_full_path}")
                 if vm_ok:
                     vm_ok = run_step("Step 6/6: Starting VM",
-                                     sudocmd(f"virsh -c qemu:///system start {vs_name}"))
+                                     f"virsh -c qemu:///system start {vs_name}")
 
                 if vm_ok:
-                    out, _, _ = ssh.execute_command(sudocmd(f"virsh -c qemu:///system domstate {vs_name}"), timeout=10)
+                    out, _, _ = _exec_sudo_fallback(ssh, dut.password,
+                                                    f"virsh -c qemu:///system domstate {vs_name}", timeout=10)
                     log_exec(db, execution_id, dut.name, "INFO",
                              f"✓ '{vs_name}' updated — state: {out.strip()}")
                 else:
@@ -832,13 +845,15 @@ def _run_vs_spin(execution_id, dut_id, vs_name, src_xml, new_xml):
                      f"SSH connection FAILED to {dut.ip_address}:{dut.port}")
             execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
-        def sudocmd(cmd):
-            safe = dut.password.replace("'", "'\\''")
-            return f"echo '{safe}' | sudo -S {cmd}"
-
         def run_step(step_name, command, allow_fail=False, timeout=300):
             log_exec(db, execution_id, dut.name, "INFO", f"▶ {step_name}")
+            # Try without sudo first; retry with sudo on failure (same as VS list fetch)
             output, error, exit_code = ssh.execute_command(command, timeout=timeout)
+            if exit_code != 0:
+                log_exec(db, execution_id, dut.name, "INFO",
+                         f"  ↻ Failed without sudo — retrying with sudo")
+                output, error, exit_code = ssh.execute_command(
+                    _sudocmd(dut.password, command), timeout=timeout)
             if output.strip():
                 for line in output.strip().split("\n")[:20]:
                     log_exec(db, execution_id, dut.name, "INFO", f"    {line}")
@@ -855,7 +870,7 @@ def _run_vs_spin(execution_id, dut_id, vs_name, src_xml, new_xml):
         try:
             # Step 1/3 — Validate source XML exists
             if not run_step("Step 1/3: Validate source XML",
-                            sudocmd(f"test -f {src_xml}"), timeout=15):
+                            f"test -f {src_xml}", timeout=15):
                 log_exec(db, execution_id, dut.name, "ERROR", f"  XML not found: {src_xml}")
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
@@ -868,16 +883,17 @@ def _run_vs_spin(execution_id, dut_id, vs_name, src_xml, new_xml):
                 f"n=r.find('name'); n.text='{vs_name}' if n is not None else None; "
                 f"t.write('{new_xml}', xml_declaration=True, encoding='utf-8')\""
             )
-            if not run_step("Step 2/3: Clone XML with new name", sudocmd(clone_cmd)):
+            if not run_step("Step 2/3: Clone XML with new name", clone_cmd):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Step 3/3 — Define and start
-            if not run_step("Step 3/3: Define VS from XML", sudocmd(f"virsh -c qemu:///system define {new_xml}")):
+            if not run_step("Step 3/3: Define VS from XML", f"virsh -c qemu:///system define {new_xml}"):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
-            if not run_step("Step 3/3: Start VS", sudocmd(f"virsh -c qemu:///system start {vs_name}")):
+            if not run_step("Step 3/3: Start VS", f"virsh -c qemu:///system start {vs_name}"):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
-            out, _, _ = ssh.execute_command(sudocmd(f"virsh -c qemu:///system domstate {vs_name}"), timeout=10)
+            out, _, _ = _exec_sudo_fallback(ssh, dut.password,
+                                            f"virsh -c qemu:///system domstate {vs_name}", timeout=10)
             log_exec(db, execution_id, dut.name, "INFO",
                      f"✓ VS '{vs_name}' is running — state: {out.strip()}")
             execution.status = "completed"
@@ -925,14 +941,16 @@ def _run_vs_remove(execution_id, dut_id, vs_name, xml_full_path):
                      f"SSH connection FAILED to {dut.ip_address}:{dut.port}")
             execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
-        def sudocmd(cmd):
-            safe = dut.password.replace("'", "'\\''")
-            return f"echo '{safe}' | sudo -S {cmd}"
-
         def run_step(step_name, command, allow_fail=False, timeout=60):
             log_exec(db, execution_id, dut.name, "INFO", f"▶ {step_name}")
             log_exec(db, execution_id, dut.name, "INFO", f"  $ {command}")
+            # Try without sudo first; retry with sudo on failure (same as VS list fetch)
             output, error, exit_code = ssh.execute_command(command, timeout=timeout)
+            if exit_code != 0:
+                log_exec(db, execution_id, dut.name, "INFO",
+                         f"  ↻ Failed without sudo — retrying with sudo")
+                output, error, exit_code = ssh.execute_command(
+                    _sudocmd(dut.password, command), timeout=timeout)
             if output.strip():
                 for line in output.strip().split("\n")[:20]:
                     log_exec(db, execution_id, dut.name, "INFO", f"    {line}")
@@ -951,7 +969,7 @@ def _run_vs_remove(execution_id, dut_id, vs_name, xml_full_path):
             # Read image path from XML before destroying
             log_exec(db, execution_id, dut.name, "INFO",
                      f"▶ Resolving image path from XML before removal")
-            extract_cmd = sudocmd(
+            extract_cmd = (
                 f"python3 -c \""
                 f"import xml.etree.ElementTree as ET; "
                 f"root = ET.parse('{xml_full_path}').getroot(); "
@@ -959,7 +977,7 @@ def _run_vs_remove(execution_id, dut_id, vs_name, xml_full_path):
                 f"if d.get('device')=='disk' and d.find('source') is not None]; "
                 f"print(matches[0] if matches else '')\""
             )
-            xml_out, _, xml_rc = ssh.execute_command(extract_cmd, timeout=15)
+            xml_out, _, xml_rc = _exec_sudo_fallback(ssh, dut.password, extract_cmd, timeout=15)
             image_path = xml_out.strip()
             if image_path:
                 log_exec(db, execution_id, dut.name, "INFO",
@@ -970,12 +988,12 @@ def _run_vs_remove(execution_id, dut_id, vs_name, xml_full_path):
 
             # Step 1/3 — Destroy VS (allow_fail: OK if already stopped)
             run_step("Step 1/3: Destroy VS (stop if running)",
-                     sudocmd(f"virsh -c qemu:///system destroy {vs_name}"), allow_fail=True)
+                     f"virsh -c qemu:///system destroy {vs_name}", allow_fail=True)
             # Still part of step 1 — undefine removes it from libvirt registry
             log_exec(db, execution_id, dut.name, "INFO",
-                     f"  $ {sudocmd(f'virsh undefine {vs_name}')}")
-            out_ud, err_ud, rc_ud = ssh.execute_command(
-                sudocmd(f"virsh -c qemu:///system undefine {vs_name}"), timeout=30)
+                     f"  $ virsh undefine {vs_name}")
+            out_ud, err_ud, rc_ud = _exec_sudo_fallback(
+                ssh, dut.password, f"virsh -c qemu:///system undefine {vs_name}", timeout=30)
             if rc_ud != 0:
                 log_exec(db, execution_id, dut.name, "ERROR",
                          f"  ✗ Step 1/3: Undefine VS FAILED: {err_ud.strip() or 'Exit ' + str(rc_ud)}")
@@ -984,13 +1002,13 @@ def _run_vs_remove(execution_id, dut_id, vs_name, xml_full_path):
                      f"  ✓ Step 1/3: Destroy + Undefine VS completed successfully")
 
             # Step 2/3 — Remove XML file
-            if not run_step("Step 2/3: Remove XML file", sudocmd(f"rm -f {xml_full_path}")):
+            if not run_step("Step 2/3: Remove XML file", f"rm -f {xml_full_path}"):
                 execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
 
             # Step 3/3 — Remove image file (only if resolved)
             if image_path:
                 if not run_step("Step 3/3: Remove image file",
-                                sudocmd(f"rm -f {image_path}")):
+                                f"rm -f {image_path}"):
                     execution.status = "failed"; execution.end_time = datetime.utcnow(); db.commit(); return
             else:
                 log_exec(db, execution_id, dut.name, "WARNING",
@@ -1033,7 +1051,46 @@ def get_vs_execution(execution_id: int, db: Session = Depends(get_db)):
     }
 
 
+# ── GET /api/vs/executions/{id}/logs — logs for the polling fallback ──────────
+# When the WebSocket cannot connect, the frontend falls back to polling. That
+# path previously fetched status only, so the VS Progress panel showed no logs.
+# This returns ExecutionLog rows (optionally only those newer than after_id) using
+# the SAME payload shape as the WS handler so appendVSLogEntry can render them.
+@app.get("/api/vs/executions/{execution_id}/logs")
+def get_vs_execution_logs(execution_id: int, after_id: int = 0, db: Session = Depends(get_db)):
+    logs = db.query(ExecutionLog).filter(
+        ExecutionLog.execution_id == execution_id,
+        ExecutionLog.id > after_id
+    ).order_by(ExecutionLog.timestamp.asc()).all()
+    return [{
+        "id": log.id, "dut_name": log.dut_name, "level": log.log_level,
+        "message": log.message,
+        "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+    } for log in logs]
+
+
 # ── WebSocket: VS Update Log Streaming ────────────────────────────────────────
+async def _drain_vs_logs(db, websocket, execution_id: int, last_log_id: int) -> int:
+    """Send any ExecutionLog rows newer than last_log_id over the WS.
+
+    Ends the current read transaction first (db.rollback) so freshly-committed
+    rows become visible, then returns the updated last_log_id. The
+    `id > last_log_id` guard prevents re-sending rows already streamed.
+    """
+    db.rollback()  # end the read transaction so this query sees newly committed logs
+    new_logs = db.query(ExecutionLog).filter(
+        ExecutionLog.execution_id == execution_id,
+        ExecutionLog.id > last_log_id
+    ).order_by(ExecutionLog.timestamp.asc()).all()
+    for log in new_logs:
+        await websocket.send_json({
+            "id": log.id, "dut_name": log.dut_name, "level": log.log_level,
+            "message": log.message,
+            "timestamp": log.timestamp.isoformat() if log.timestamp else None})
+        last_log_id = log.id
+    return last_log_id
+
+
 @app.websocket("/ws/vs/execution/{execution_id}")
 async def ws_vs_logs(websocket: WebSocket, execution_id: int):
     await websocket.accept()
@@ -1041,24 +1098,18 @@ async def ws_vs_logs(websocket: WebSocket, execution_id: int):
     last_log_id = 0
     try:
         while True:
-            new_logs = db.query(ExecutionLog).filter(
-                ExecutionLog.execution_id == execution_id,
-                ExecutionLog.id > last_log_id
-            ).order_by(ExecutionLog.timestamp.asc()).all()
-            for log in new_logs:
-                await websocket.send_json({
-                    "id": log.id, "dut_name": log.dut_name, "level": log.log_level,
-                    "message": log.message,
-                    "timestamp": log.timestamp.isoformat() if log.timestamp else None})
-                last_log_id = log.id
+            last_log_id = await _drain_vs_logs(db, websocket, execution_id, last_log_id)
 
             execution = db.query(Execution).filter(Execution.id == execution_id).first()
             if execution and execution.status in ["completed", "failed"]:
+                # Final drain: fast ops (e.g. Spin VS) can commit their last logs and
+                # flip to completed/failed within one poll window — grab any stragglers
+                # before signalling completion so no log lines are lost.
+                last_log_id = await _drain_vs_logs(db, websocket, execution_id, last_log_id)
                 await websocket.send_json({"type": "execution_complete",
                                            "status": execution.status,
                                            "duration": execution.duration_seconds})
                 break
-            db.expire_all()
             await asyncio.sleep(0.2)
     except WebSocketDisconnect:
         pass

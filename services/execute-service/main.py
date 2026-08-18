@@ -466,11 +466,26 @@ def list_executions(request: Request, db: Session = Depends(get_db)):
     executions = db.query(Execution).filter(
                        or_(Execution.session_id == session_id, Execution.session_id.is_(None))
                    ).order_by(Execution.created_at.desc()).limit(100).all()
-    return [{"id": ex.id, "name": ex.name, "type": ex.execution_type,
-             "status": ex.status, "dut_count": len(json.loads(ex.dut_ids)) if ex.dut_ids else 0,
-             "duration": ex.duration_seconds,
-             "created_at": ex.created_at.isoformat() if ex.created_at else None}
-            for ex in executions]
+    result = []
+    for ex in executions:
+        # Aggregate per-script results (persisted live to Execution.test_results)
+        try:
+            script_results = json.loads(ex.test_results) if ex.test_results else []
+        except Exception:
+            script_results = []
+        p = sum(r.get("passed", 0)  for r in script_results)
+        f = sum(r.get("failed", 0)  for r in script_results)
+        s = sum(r.get("skipped", 0) for r in script_results)
+        result.append({
+            "id": ex.id, "name": ex.name, "type": ex.execution_type,
+            "status": ex.status,
+            "dut_count": len(json.loads(ex.dut_ids)) if ex.dut_ids else 0,
+            "duration": ex.duration_seconds,
+            "passed": p, "failed": f, "skipped": s,      # feed dashboard chart + table badges
+            "script_results": script_results,             # feed Live Results panel
+            "created_at": ex.created_at.isoformat() if ex.created_at else None,
+        })
+    return result
 
 # ── POST /api/executions ──────────────────────────────────────────────────────
 @app.post("/api/executions")
@@ -540,7 +555,7 @@ def get_execution(execution_id: int, request: Request, db: Session = Depends(get
 # ── GET /api/executions/{id}/logs ─────────────────────────────────────────────
 @app.get("/api/executions/{execution_id}/logs")
 def get_execution_logs(execution_id: int, request: Request,
-                       limit: int = 200, offset: int = 0,
+                       limit: int = 200, offset: int = 0, after_id: int = 0,
                        db: Session = Depends(get_db)):
     session_id = get_session_id(request)
     execution = db.query(Execution).filter(Execution.id == execution_id).first()
@@ -548,8 +563,14 @@ def get_execution_logs(execution_id: int, request: Request,
         raise HTTPException(status_code=404, detail="Execution not found")
     if not verify_access(execution.session_id, session_id):
         raise HTTPException(status_code=403, detail="Access denied")
-    logs = db.query(ExecutionLog).filter(ExecutionLog.execution_id == execution_id)\
-             .order_by(ExecutionLog.timestamp.asc()).offset(offset).limit(limit).all()
+    # after_id enables efficient incremental polling for the live-log panel:
+    # each call is a fresh transaction, so it always sees rows committed so far.
+    q = db.query(ExecutionLog).filter(ExecutionLog.execution_id == execution_id)
+    if after_id:
+        q = q.filter(ExecutionLog.id > after_id)
+        logs = q.order_by(ExecutionLog.id.asc()).limit(limit).all()
+    else:
+        logs = q.order_by(ExecutionLog.timestamp.asc()).offset(offset).limit(limit).all()
     return [{"id": l.id, "dut_name": l.dut_name, "level": l.log_level,
              "message": l.message,
              "timestamp": l.timestamp.isoformat() if l.timestamp else None} for l in logs]
@@ -1283,11 +1304,38 @@ def get_testbed_info(host_id: int, testbed: str, db: Session = Depends(get_db)):
 def get_topology(request: Request, db: Session = Depends(get_db)):
     session_id = get_session_id(request)
     conns = db.query(TopologyConnection).all()
-    return [{"id": c.id, "dut_a_id": c.dut_a_id, "intf_a": c.intf_a,
-             "dut_b_id": c.dut_b_id, "intf_b": c.intf_b} for c in conns]
+    # Return both `dut_a`/`dut_b` (string, what the canvas frontend reads) and
+    # `dut_a_id`/`dut_b_id` (int) so either consumer works.
+    return [{"id": c.id,
+             "dut_a": str(c.dut_a_id), "dut_a_id": c.dut_a_id, "intf_a": c.intf_a,
+             "dut_b": str(c.dut_b_id), "dut_b_id": c.dut_b_id, "intf_b": c.intf_b}
+            for c in conns]
 
 @app.post("/api/topology/connections")
 def create_topology_connection(body: dict, db: Session = Depends(get_db)):
+    # Supports TWO payloads:
+    #  1) Bulk replace-all (what the canvas frontend sends):
+    #     { "connections": [{dut_a, intf_a, dut_b, intf_b}, ...] }
+    #  2) Single connection: { dut_a_id, intf_a, dut_b_id, intf_b }
+    conns = body.get("connections")
+    if isinstance(conns, list):
+        db.query(TopologyConnection).delete()
+        saved = 0
+        for c in conns:
+            a = c.get("dut_a") if c.get("dut_a") not in (None, "") else c.get("dut_a_id")
+            b = c.get("dut_b") if c.get("dut_b") not in (None, "") else c.get("dut_b_id")
+            if a in (None, "") or b in (None, ""):
+                continue
+            try:
+                db.add(TopologyConnection(
+                    dut_a_id=int(a), intf_a=c.get("intf_a", "Ethernet0"),
+                    dut_b_id=int(b), intf_b=c.get("intf_b", "Ethernet0")))
+                saved += 1
+            except (ValueError, TypeError):
+                continue
+        db.commit()
+        return {"status": "saved", "saved": saved}
+
     conn = TopologyConnection(
         dut_a_id=body["dut_a_id"], intf_a=body.get("intf_a", "Ethernet0"),
         dut_b_id=body["dut_b_id"], intf_b=body.get("intf_b", "Ethernet0"))
@@ -1335,40 +1383,60 @@ def generate_master_testbed(body: dict, request: Request, db: Session = Depends(
     if not vm:
         raise HTTPException(status_code=404, detail="VM host not found")
 
+    # ROBUSTNESS: if the caller sends the canvas connections in the request body,
+    # persist them here (replace-all) so generation always reflects EXACTLY what is
+    # on the user's canvas. The separate save endpoints use a different payload
+    # contract than the frontend sends, so connections may never have persisted.
+    body_connections = body.get("connections")
+    if isinstance(body_connections, list):
+        db.query(TopologyConnection).delete()
+        persisted = 0
+        for c in body_connections:
+            a = c.get("dut_a") if c.get("dut_a") not in (None, "") else c.get("dut_a_id")
+            b = c.get("dut_b") if c.get("dut_b") not in (None, "") else c.get("dut_b_id")
+            if a in (None, "") or b in (None, ""):
+                continue
+            try:
+                db.add(TopologyConnection(
+                    dut_a_id=int(a), intf_a=c.get("intf_a", "Ethernet0"),
+                    dut_b_id=int(b), intf_b=c.get("intf_b", "Ethernet0"),
+                ))
+                persisted += 1
+            except (ValueError, TypeError):
+                logger.warning(f"MASTER TESTBED: skipping malformed connection {c}")
+        db.commit()
+        logger.info(f"MASTER TESTBED: persisted {persisted} connection(s) from request body")
+
+    # Include this session's DUTs AND legacy NULL/empty-session DUTs (backward compat)
     query = db.query(DUT).filter(DUT.device_type != "VM")
     if session_id:
-        query = query.filter(DUT.session_id == session_id)
+        query = query.filter(or_(
+            DUT.session_id == session_id,
+            DUT.session_id == None,   # noqa: E711 — legacy rows
+            DUT.session_id == "",
+        ))
     all_duts = query.all()
 
     if not all_duts:
         raise HTTPException(status_code=400, detail="No DUT devices found in session")
 
-    seen_names = set()
-    unique_duts = []
-    duplicate_count = 0
-    for dut in all_duts:
-        normalized_name = dut.name.replace(" ", "_").replace("-", "_")
-        if normalized_name not in seen_names:
-            seen_names.add(normalized_name)
-            unique_duts.append(dut)
-        else:
-            duplicate_count += 1
-            logger.warning(f"MASTER TESTBED: Skipping duplicate device '{dut.name}' (ID: {dut.id})")
-
-    if duplicate_count > 0:
-        logger.warning(f"MASTER TESTBED: Removed {duplicate_count} duplicate device(s) from generation")
-
-    all_duts = unique_duts
+    # Filter connections against the FULL session id set (pre-dedup) so a connection
+    # is never dropped just because another DUT shares the same name.
+    id_to_dut = {dut.id: dut for dut in all_duts}
+    session_dut_ids = set(id_to_dut.keys())
 
     all_connections = db.query(TopologyConnection).all()
-
-    dut_ids_in_session = {dut.id for dut in all_duts}
     session_connections = [
         conn for conn in all_connections
-        if conn.dut_a_id in dut_ids_in_session and conn.dut_b_id in dut_ids_in_session
+        if conn.dut_a_id in session_dut_ids and conn.dut_b_id in session_dut_ids
     ]
 
     if not session_connections:
+        if all_connections:
+            raise HTTPException(status_code=400, detail=(
+                "Topology connections reference devices that are not available in your "
+                "current session. Re-create the connections in the Topology Canvas and try again."
+            ))
         raise HTTPException(status_code=400, detail="No connections found in Topology Canvas. Create connections first.")
 
     connected_dut_ids = set()
@@ -1376,7 +1444,25 @@ def generate_master_testbed(body: dict, request: Request, db: Session = Depends(
         connected_dut_ids.add(conn.dut_a_id)
         connected_dut_ids.add(conn.dut_b_id)
 
-    canvas_duts = [dut for dut in all_duts if dut.id in connected_dut_ids]
+    # De-duplicate devices by normalized name AFTER filtering; every connected id
+    # (even duplicate-named) is later mapped to its canonical device name.
+    seen_names = set()
+    canvas_duts = []
+    duplicate_count = 0
+    for cid in connected_dut_ids:
+        dut = id_to_dut.get(cid)
+        if not dut:
+            continue
+        normalized_name = dut.name.replace(" ", "_").replace("-", "_")
+        if normalized_name not in seen_names:
+            seen_names.add(normalized_name)
+            canvas_duts.append(dut)
+        else:
+            duplicate_count += 1
+            logger.warning(f"MASTER TESTBED: Skipping duplicate device '{dut.name}' (ID: {dut.id})")
+
+    if duplicate_count > 0:
+        logger.warning(f"MASTER TESTBED: Removed {duplicate_count} duplicate device(s) from generation")
 
     if not canvas_duts:
         raise HTTPException(status_code=400, detail="No devices with connections found in Topology Canvas")
@@ -1412,6 +1498,16 @@ def generate_master_testbed(body: dict, request: Request, db: Session = Depends(
                     "errors": "default"
                 }
             }
+
+        # Map EVERY connected DUT id (including duplicate-named ones folded into a
+        # canonical device above) to its device name so topology resolution below
+        # never drops a connection whose endpoint was a duplicate.
+        for cid in connected_dut_ids:
+            if cid in dut_id_to_name:
+                continue
+            dut = id_to_dut.get(cid)
+            if dut:
+                dut_id_to_name[cid] = dut.name.replace(" ", "_").replace("-", "_")
 
         topology_section = {}
         connection_count = 0
@@ -2283,6 +2379,10 @@ async def ws_execution_logs(websocket: WebSocket, execution_id: int):
     try:
         last_log_id = 0
         while True:
+            # end any open read transaction so this query sees rows the execution
+            # thread just committed (db.expire_all only clears the ORM cache, it does
+            # NOT start a fresh transaction — new logs could stay invisible)
+            db.rollback()
             new_logs = db.query(ExecutionLog).filter(
                 ExecutionLog.execution_id == execution_id,
                 ExecutionLog.id > last_log_id
@@ -2296,7 +2396,7 @@ async def ws_execution_logs(websocket: WebSocket, execution_id: int):
                 last_log_id = log.id
             execution = db.query(Execution).filter(Execution.id == execution_id).first()
             if execution and execution.status in ["completed", "failed", "cancelled"]:
-                db.expire_all()
+                db.rollback()
                 remaining = db.query(ExecutionLog).filter(
                     ExecutionLog.execution_id == execution_id,
                     ExecutionLog.id > last_log_id).all()
@@ -2309,12 +2409,16 @@ async def ws_execution_logs(websocket: WebSocket, execution_id: int):
                                            "status": execution.status,
                                            "duration": execution.duration_seconds})
                 break
-            db.expire_all()
             await asyncio.sleep(0.1)
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error (exec {execution_id}): {e}")
+        # Surface the failure to the client so the panel shows *why* instead of staying blank
+        try:
+            await websocket.send_json({"error": f"log stream error: {e}"})
+        except Exception:
+            pass
     finally:
         db.close()
 
@@ -2359,6 +2463,23 @@ def _parse_spytest_script(content: str) -> dict:
         result["dut_count"] = max_duts
         if not result["min_topology"] and re.search(r'st\.ensure_min_topology\(\*\w+\)', content):
             result["uses_vars_file"] = True
+
+    # Fallback: many scripts don't pass a literal to ensure_min_topology — the
+    # topology comes from a *var loaded from a YAML/vars file, a base class, or the
+    # @pytest.mark.topology marker. e.g.:
+    #     @pytest.mark.topology("any")
+    #     min_topology = defaults.get("min_topology") or ["D1D2:1"]
+    #     st.ensure_min_topology(*min_topology)
+    # In these cases scan the whole script (and the marker) for link tokens like
+    # "D1D2:1" — their presence still declares the node/link requirement.
+    if not result["min_topology"]:
+        scan = content + " " + (result["topology_marker"] or "")
+        link_tokens = list(dict.fromkeys(re.findall(r'D\d+D\d+:\d+', scan)))
+        if link_tokens:
+            result["min_topology"] = link_tokens
+            dut_refs = re.findall(r'D(\d+)', " ".join(link_tokens))
+            if dut_refs:
+                result["dut_count"] = max(result["dut_count"], max(int(d) for d in dut_refs))
 
     if result["dut_count"] == 1:
         result["topology_type"] = "standalone"
@@ -2493,12 +2614,40 @@ def _parse_results_csv(csv_data: str) -> list:
                 except Exception:
                     pass
             tc_id = func.split('.')[-1] if '.' in func else func
+            # Skip SpyTest framework hooks (module prolog/epilog, session hooks) —
+            # these are not real testcases and shouldn't appear in the report/results.
+            _probe = f"{func} {tc_id} {module}".lower()
+            if any(k in _probe for k in ("prolog", "epilog", "module_hook",
+                                          "session_prolog", "session_epilog")):
+                continue
             rows.append({'module': module, 'test_function': func, 'testcase_id': tc_id,
                          'result': result, 'time_taken': time_taken, 'time_seconds': time_s,
                          'description': doc[:200] if doc else ''})
     except Exception as e:
         logger.warning(f"[results] CSV parse error: {e}")
     return rows
+
+
+def _record_skipped_script(db, execution_id: int, script_path: str, reason: str):
+    """Record a script skipped due to unsatisfiable topology as a 'skipped' result,
+    so it shows in Live Results + the report (and doesn't hang the run)."""
+    stem = os.path.basename(script_path).replace('.py', '')
+    agg = {'script': script_path, 'script_stem': stem, 'status': 'skipped',
+           'passed': 0, 'failed': 0, 'skipped': 1, 'duration_s': 0, 'skip_reason': reason}
+    try:
+        with _test_results_lock:
+            ex = db.query(Execution).filter(Execution.id == execution_id).first()
+            if ex:
+                existing = json.loads(ex.test_results or '[]')
+                existing.append(agg)
+                ex.test_results = json.dumps(existing)
+            db.commit()
+        with _exec_queue_lock:
+            st = _exec_queue_state.get(execution_id)
+            if st is not None:
+                st.setdefault("script_results", []).append(agg)
+    except Exception as e:
+        logger.warning(f"[skip] record failed for {stem}: {e}")
 
 
 def _collect_and_save_results(ssh, execution, execution_id: int, script_path: str,
@@ -2554,6 +2703,12 @@ def _collect_and_save_results(ssh, execution, execution_id: int, script_path: st
                 existing.append(agg)
                 inner_exec.test_results = json.dumps(existing)
             db.commit()
+        # Expose the per-script result in the live queue state so the 3s queue poll
+        # can drive the Live Results panel during the run (not just at completion).
+        with _exec_queue_lock:
+            st = _exec_queue_state.get(execution_id)
+            if st is not None:
+                st.setdefault("script_results", []).append(agg)
         logger.info(f"[results] #{execution_id} {script_stem}: pass={passed} fail={failed} skip={skipped}")
     except Exception as e:
         logger.warning(f"[results] Collection failed for {script_stem}: {e}")
@@ -2793,12 +2948,16 @@ def _run_spytest_execution(
             pool_lock = Lock()
             available_pool: list = list(all_duts)
 
-            def acquire_duts(needed: int, link_requirements: dict = None) -> list:
-                """Block until `needed` DUTs are available, then atomically grab them."""
+            def acquire_duts(needed: int, link_requirements: dict = None,
+                             label: str = "", logdb=None) -> list:
+                """Block until `needed` DUTs (matching topology) are free, then grab them.
+                Logs *why* it's still queued periodically so a stuck script explains itself."""
+                waited = 0
                 while True:
                     if _is_exec_cancelled(execution_id):
                         raise ExecutionCancelled()
                     with pool_lock:
+                        free_now = list(available_pool)
                         if len(available_pool) >= needed:
                             if topology_connections and (link_requirements or needed == 1):
                                 matched = _find_duts_matching_topology(
@@ -2821,7 +2980,16 @@ def _run_spytest_execution(
                                 del available_pool[:needed]
                                 _q_set_free(execution_id, list(available_pool))
                                 return allocated
-                    _time.sleep(5)
+                    # Couldn't satisfy yet — explain why (~every 16s) so it's visible.
+                    waited += 2
+                    if logdb is not None and waited % 16 == 0:
+                        links = ", ".join(f"{a}-{b}×{c}" for (a, b), c in (link_requirements or {}).items())
+                        why = (f"needs {needed} DUT(s)"
+                               + (f" with links [{links}]" if links else " (any free DUT)")
+                               + f"; free now: {free_now or 'none'}")
+                        log_execution(logdb, execution_id, label or "SYSTEM", "INFO",
+                                      f"[QUEUE] {label or 'script'} still waiting — {why}")
+                    _time.sleep(2)
 
             def release_duts(duts_to_free: list):
                 with pool_lock:
@@ -2851,17 +3019,46 @@ def _run_spytest_execution(
                         log_execution(sdb, execution_id, sname, "INFO",
                                       f"[TOPO] Link requirements: {link_requirements}")
 
+                    # ── Topology sufficiency pre-check ─────────────────────────────
+                    # If the master topology can NEVER satisfy this script's node/link
+                    # needs, skip it (with a warning) instead of blocking forever in
+                    # acquire_duts. e.g. script needs 3 nodes + 2 links but the master
+                    # topology has only 2 devices.
+                    skip_reason = None
+                    if dut_count > total_testbed_duts:
+                        skip_reason = (f"requires {dut_count} device(s) but the master topology "
+                                       f"has only {total_testbed_duts}")
+                    elif link_requirements:
+                        need = ", ".join(f"{a}-{b}×{c}" for (a, b), c in link_requirements.items())
+                        if not topology_connections:
+                            skip_reason = (f"requires connections ({need}) but the master topology "
+                                           f"has no connections defined")
+                        elif not _find_duts_matching_topology(
+                                list(all_duts), dut_count, link_requirements,
+                                topology_connections, b2b_dut_names):
+                            skip_reason = (f"required topology ({dut_count} nodes; links {need}) "
+                                           f"cannot be satisfied by the master topology")
+
+                    if skip_reason:
+                        log_execution(sdb, execution_id, sname, "WARNING",
+                                      f"⚠ SKIPPED {sname} — {skip_reason}. "
+                                      f"Add the missing devices/connections in the Topology Canvas.")
+                        _q_update_script(execution_id, sname, "skipped")
+                        _record_skipped_script(sdb, execution_id, script_path, skip_reason)
+                        return
+
                     _q_update_script(execution_id, sname, "waiting")
                     log_execution(sdb, execution_id, sname, "INFO",
                                   f"[QUEUE] Waiting for {dut_count} DUT(s)… "
                                   f"(pool has {len(available_pool)})")
 
-                    assigned = acquire_duts(dut_count, link_requirements)
+                    assigned = acquire_duts(dut_count, link_requirements, sname, sdb)
                     _q_update_script(execution_id, sname, "running", duts=assigned)
 
                     topo_mode = "topology-matched" if (topology_connections and link_requirements) else "FIFO"
                     log_execution(sdb, execution_id, sname, "INFO",
-                                  f"[ALLOC] {topo_mode} → DUT(s): {', '.join(assigned)}")
+                                  f"[ALLOC] {sname}: {len(assigned)} device(s) allocated "
+                                  f"({topo_mode}) → {', '.join(assigned)}")
 
                     temp_tb_path = f"/tmp/temp_exec{execution_id}_s{slot_idx}.yaml"
                     temp_cfg = _create_subset_testbed(testbed_config, assigned)

@@ -1,0 +1,50 @@
+# ── Docker build context excludes ──────────────────────────────────────────
+# Keeps the image small: the Dockerfile does `COPY . .`, so anything not
+# excluded here is sent to the daemon and baked into the image.
+
+# Version control / history (154M+)
+.git
+.gitignore
+.github
+
+# Logs (uvicorn.log alone is ~1.3G; app.log ~169M)
+*.log
+uvicorn.log
+data/logs/
+logs/
+
+# Local Python envs & caches (not needed — deps come from requirements.txt)
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data / DBs (mounted or recreated at runtime, not part of the image)
+data/
+postgres_data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Large vendored test framework (clone/mount separately if the container needs it)
+sonic-mgmt/
+
+# Docs, mockups, presentations — not needed at runtime
+DOC/
+*.png
+*.pptx
+generate_presentations_*.py
+generate_eka_presentation.py
+
+# Editor / OS cruft
+.claude/
+.vscode/
+.idea/
+.DS_Store
+*.swp

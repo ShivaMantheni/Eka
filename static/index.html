@@ -13,7 +13,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap">
     <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons+Round">
-    <link rel="stylesheet" href="/static/style.css?v=40">
+    <link rel="stylesheet" href="/static/style.css?v=41">
     <link rel="stylesheet" href="/static/responsive.css?v=2">
 </head>
 
@@ -85,7 +85,7 @@
 
         <!-- ============ DASHBOARD TAB ============ -->
         <section id="tab-dashboard" class="tab-content active">
-            <div class="grid-2" style="margin-top:0;">
+            <div style="display:grid;grid-template-columns:340px 1fr;gap:16px;margin-top:0;">
                 <!-- Left: Devices -->
                 <div class="card glass">
                     <div class="card-header">
@@ -96,14 +96,14 @@
                     </div>
                 </div>
                 <!-- Right: Execution Dashboard -->
-                <div class="card glass">
+                <div class="card glass" style="display:flex;flex-direction:column;">
                     <div class="card-header">
                         <h3><span class="material-icons-round">bar_chart</span> Script Execution Graph</h3>
                         <button class="btn outline small" onclick="loadExecutions()" title="Refresh">
                             <span class="material-icons-round">refresh</span>
                         </button>
                     </div>
-                    <div class="card-body" id="dash-exec-summary">
+                    <div class="card-body" id="dash-exec-summary" style="flex:1;display:flex;flex-direction:column;min-height:0;">
                         <p class="muted">Loading...</p>
                     </div>
                 </div>
@@ -157,6 +157,7 @@
                             <option value="DUT">DUT</option>
                             <option value="Switch">Switch</option>
                             <option value="Router">Router</option>
+                            <option value="Linux">Linux</option>
                         </select>
                         <select id="dut-connection-type" class="form-input form-input-narrow-select">
                             <option value="ssh">SSH</option>
@@ -199,6 +200,7 @@
                                         <option value="DUT">DUT</option>
                                         <option value="Switch">Switch</option>
                                         <option value="Router">Router</option>
+                                        <option value="Linux">Linux</option>
                                     </select>
                                 </div>
                                 <div>
@@ -223,15 +225,15 @@
                 </div>
             </div>
 
-            <div class="card glass" style="margin-top:16px;">
-                <div class="card-header">
+            <div class="card glass" style="margin-top:16px;display:flex;flex-direction:column;max-height:calc(100vh - 320px);">
+                <div class="card-header" style="flex-shrink:0;">
                     <h3><span class="material-icons-round">dns</span> Device Inventory</h3>
                     <button class="btn outline small" onclick="loadDUTs()"><span
                             class="material-icons-round">refresh</span> Refresh</button>
                 </div>
-                <div class="card-body">
+                <div class="card-body" style="overflow-y:auto;flex:1;">
                     <table class="data-table" id="duts-table">
-                        <thead>
+                        <thead class="duts-thead">
                             <tr>
                                 <th>Name</th>
                                 <th>IP Address</th>
@@ -659,6 +661,16 @@
                 <div class="card-header">
                     <h3><span class="material-icons-round">bar_chart</span> Live Results</h3>
                     <div style="display:flex;gap:8px;align-items:center">
+                        <button class="btn small" id="btn-rerun-failed" onclick="rerunFailed()"
+                            style="display:none;background:var(--red,#ef4444);border-color:var(--red,#ef4444);color:#fff"
+                            title="Re-run only the scripts that failed in this batch">
+                            <span class="material-icons-round" style="font-size:15px">restart_alt</span>
+                            Rerun Failed<span id="rerun-failed-count"></span>
+                        </button>
+                        <button class="btn outline small" id="btn-rerun-all" onclick="rerunAll()"
+                            style="display:none" title="Re-run all scripts in this batch">
+                            <span class="material-icons-round" style="font-size:15px">replay</span> Rerun All
+                        </button>
                         <button class="btn outline small" id="btn-dl-html"
                             onclick="downloadReport(currentExecId,'html')" disabled>
                             <span class="material-icons-round">download</span> HTML
@@ -916,22 +928,26 @@
 
         <!-- ============ LOGS TAB ============ -->
         <section id="tab-logs" class="tab-content">
-            <div class="card glass">
-                <div class="card-header">
+            <div class="card glass" style="display:flex;flex-direction:column;max-height:calc(100vh - 230px);">
+                <div class="card-header" style="flex-shrink:0;">
                     <h3><span class="material-icons-round">history</span> Execution History</h3>
-                    <div style="display:flex;gap:8px">
+                    <div style="display:flex;gap:8px;align-items:center">
                         <button class="btn outline small" id="btn-compare-selected"
                             onclick="runComparison()" style="display:none">
-                            <span class="material-icons-round">compare</span> Compare Selected
+                            <span class="material-icons-round">compare</span> Compare
+                        </button>
+                        <button class="btn outline small" id="btn-delete-selected"
+                            onclick="deleteSelectedExecutions()" style="color:var(--red);opacity:0.35;pointer-events:none;cursor:not-allowed">
+                            <span class="material-icons-round">delete_sweep</span> Delete<span id="del-selected-count"></span>
                         </button>
                         <button class="btn outline small" onclick="loadExecutions()">
                             <span class="material-icons-round">refresh</span> Refresh
                         </button>
                     </div>
                 </div>
-                <div class="card-body">
+                <div class="card-body" style="overflow-y:auto;flex:1;padding:0;">
                     <table class="data-table">
-                        <thead>
+                        <thead class="exec-history-thead">
                             <tr>
                                 <th style="width:36px">
                                     <input type="checkbox" id="cmp-select-all"
@@ -972,8 +988,8 @@
                     <div class="modal-header">
                         <h3><span class="material-icons-round">description</span> Execution Logs — <span id="log-detail-title"></span></h3>
                         <div style="display: flex; gap: 8px;">
-                            <button class="btn outline small" onclick="deleteLogs()" title="Delete Logs" style="color: var(--red);">
-                                <span class="material-icons-round">delete</span>
+                            <button class="btn outline small" onclick="deleteLogs()" style="color:var(--red)">
+                                <span class="material-icons-round" style="font-size:15px">delete</span> Delete
                             </button>
                             <button class="btn icon" onclick="closeLogViewer()" title="Close">
                                 <span class="material-icons-round">close</span>
@@ -989,20 +1005,23 @@
 
         <!-- ============ TERMINAL TAB - PTY Mode ============ -->
         <section id="tab-terminal" class="tab-content">
-            <div class="card glass">
-                <div class="card-header">
+            <div class="card glass" style="display:flex;flex-direction:column;height:calc(100vh - 170px);">
+                <div class="card-header" style="flex-shrink:0;">
                     <h3><span class="material-icons-round">terminal</span> Terminal</h3>
-                    <select id="term-dut" class="select-full" style="max-width:300px" onchange="termDeviceChanged()">
-                        <option value="">-- Select Device --</option>
+                    <select id="term-dut" class="select-full" style="max-width:300px" onchange="termAddDevice()"
+                        title="Pick a device to open a new terminal session (each stays connected)">
+                        <option value="">+ Connect Device…</option>
                     </select>
                 </div>
-                <div class="card-body" style="padding:0; height:600px; overflow:hidden;">
-                    <!-- xterm.js will populate this container -->
-                    <div id="term-container" style="height: 100%; background: #1e1e1e; padding: 10px;">
-                        <div class="log-placeholder">
+                <!-- One tab per connected device; sessions stay alive in the background -->
+                <div id="term-tabs" class="term-tabs" style="flex-shrink:0; display:none;"></div>
+                <div class="card-body" style="padding:0; flex:1; min-height:0; overflow:hidden; position:relative;">
+                    <!-- Per-session xterm panes are injected here; only the active one shows -->
+                    <div id="term-panes" style="height:100%; position:relative; background:#1e1e1e;">
+                        <div id="term-empty" class="log-placeholder">
                             <span class="material-icons-round">terminal</span>
-                            <p>Select a device to open PTY terminal session.</p>
-                            <p style="font-size: 12px; color: #888;">Supports vi, nano, top, htop, screen, tmux</p>
+                            <p>Select a device to open a PTY terminal session.</p>
+                            <p style="font-size: 12px; color: #888;">Connect multiple devices at once — each opens its own tab. Supports vi, nano, top, htop, screen, tmux</p>
                         </div>
                     </div>
                 </div>
@@ -1258,7 +1277,7 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=73"></script>
+    <script src="/static/app.js?v=89"></script>
 </body>
 
 </html>

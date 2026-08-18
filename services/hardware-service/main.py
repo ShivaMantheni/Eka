@@ -261,6 +261,27 @@ def cancel_hardware_load_job(job_id: int, request: Request, db: Session = Depend
     return {"status": "cancelled", "job_id": job_id,
             "message": "Hardware load job has been cancelled"}
 
+# ── DELETE /api/hardware-load/job/{job_id} ────────────────────────────────────
+@app.delete("/api/hardware-load/job/{job_id}")
+def delete_hardware_load_job(job_id: int, request: Request, db: Session = Depends(get_db)):
+    """Permanently delete a completed/failed job record from history."""
+    session_id = request.headers.get("X-Session-ID", "default")
+    job = db.query(HardwareLoadJob).filter(
+        HardwareLoadJob.id == job_id,
+        HardwareLoadJob.session_id == session_id
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or access denied")
+    if job.status not in ("completed", "failed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete a job that is currently '{job.status}'. Cancel it first."
+        )
+    db.delete(job)
+    db.commit()
+    logger.info(f"Hardware load job {job_id} deleted by session {session_id}")
+    return {"status": "deleted", "job_id": job_id, "message": "Hardware load job record deleted"}
+
 # ── GET /api/hardware-load/jobs ───────────────────────────────────────────────
 @app.get("/api/hardware-load/jobs")
 def get_hardware_load_jobs(request: Request, db: Session = Depends(get_db)):
